@@ -69,7 +69,9 @@ USAGE:
                                               Nextcloud app grants, saves the shared document back to the
                                               file and closes the room when its editors leave. Secrets
                                               come from CRAFT_RELAY_SECRET and CRAFT_WORKER_SECRET (at
-                                              least 32 bytes each); --insecure-dev allows http:// URLs
+                                              least 32 bytes each); CRAFT_WORKER_MAX_ROOMS caps the
+                                              rooms served at once (default 64); --insecure-dev
+                                              allows http:// URLs
   wordcraft-cli [<command>] -h | --help       this help
   wordcraft-cli --version
 
@@ -840,6 +842,7 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
                 relay_secret.as_deref(),
                 worker_secret.as_deref(),
             )
+            .and_then(|cfg| cfg.with_max_rooms(std::env::var("CRAFT_WORKER_MAX_ROOMS").ok().as_deref()))
             .map_err(|e| format!("live-worker: {e}"))?;
             wordcraft_cli::live_worker::serve(cfg).map_err(|e| Failure::from(format!("live-worker: {e}")))
         }

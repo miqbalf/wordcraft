@@ -38,6 +38,10 @@ getrandom = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
 # The notify endpoint: one small HTTP/1 route, on the hyper and tokio already in the build.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# Served by hand on hyper's HTTP/1 connection builder, for its header-read timeout and no
+# keep-alive (axum::serve sets neither); both already in the build under axum and reqwest.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 # The Nextcloud file API. 0.12 with native-tls is what the socket client already builds.
 reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
 

@@ -7854,6 +7854,8 @@ dependencies = [
  "craft-zip",
  "getrandom 0.3.4",
  "hmac",
+ "hyper",
+ "hyper-util",
  "image",
  "log",
  "reqwest 0.12.28",

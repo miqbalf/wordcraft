@@ -25,7 +25,7 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use tokio::sync::watch;
 use wordcraft_cli::live_worker::{
-    Clock, Config, Flow, Grant, NOTICE_KIND, Nextcloud, QUIET_MS, Room, RoomFiles, Rooms, Secret, Spawn, router, service_ticket,
+    Clock, Config, Flow, Grant, NOTICE_KIND, Nextcloud, QUIET_MS, Room, RoomFiles, Rooms, Secret, Spawn, router, serve_grant, service_ticket,
 };
 use wordcraft_doc::{Document, Paragraph, Pos, para_block};
 use wordcraft_engine::io::{open_bytes, save_bytes};
@@ -242,6 +242,10 @@ struct Nc {
     calls: Vec<&'static str>,
     /// Calls refused for a bad signature.
     forbidden: usize,
+    /// Answer every copy with this status instead.
+    copy_status: Option<StatusCode>,
+    /// Answer every write with this status once a conflict copy was made.
+    put_status_after_copy: Option<StatusCode>,
 }
 
 type NcState = Arc<Mutex<Nc>>;
@@ -290,6 +294,10 @@ async fn nc_put(State(nc): State<NcState>, Path(room): Path<String>, h: HeaderMa
         n.calls.push("put412");
         return (StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response();
     }
+    if let Some(status) = n.put_status_after_copy.filter(|_| n.calls.contains(&"copy")) {
+        n.calls.push("putfail");
+        return (status, "no").into_response();
+    }
     n.calls.push("put");
     n.files.insert(FILE.into(), body.to_vec());
     json_response(json!({"etag": etag_of(&body)}))
@@ -301,6 +309,10 @@ async fn nc_copy(State(nc): State<NcState>, Path(room): Path<String>, h: HeaderM
     }
     let name = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["name"].as_str().map(str::to_owned)).unwrap_or_default();
     let mut n = nc.lock().unwrap();
+    if let Some(status) = n.copy_status {
+        n.calls.push("copyfail");
+        return (status, "no").into_response();
+    }
     if n.files.contains_key(&name) {
         n.calls.push("copy409");
         return (StatusCode::CONFLICT, "name exists").into_response();
@@ -572,21 +584,139 @@ async fn last_peer_leaving_still_saves() {
     assert!(put < calls.len() - 1, "saved before closing: {calls:?}");
 }
 
+/// The dev stack's seeds (craft-office-nextcloud `dev/seed/Plan.md` and `Spec.md`, our own
+/// text, copied here verbatim), which it converts to `.docx` and opens live.
+const SEEDS: [(&str, &str); 2] = [
+    ("Plan", "# Project Plan\n\nThis is the shared plan.\n\n- Item one\n- Item two\n"),
+    ("Spec", "# Spec\n\nA spec document with **bold** and *italic* text.\n"),
+];
+
 #[tokio::test]
 async fn saved_file_reopens_equal() {
-    let md = "# Project Plan\n\nThis is the shared plan with **bold** text.\n\n- Item one\n- Item two\n";
-    let bytes = save_bytes(FILE, &open_bytes("seed.md", md.as_bytes()).unwrap()).unwrap();
-    let mut w = world(bytes, 2).await;
-    w.eds[0].type_at_end(1, " Edited by one.");
-    w.eds[1].run_at_end(0, "text.newParagraph", json!({}));
-    w.eds[1].type_at_end(1, "Added by two.");
-    w.eds[1].type_at_end(0, " (draft)");
-    w.run_for(10_000, 1_000).await;
-    assert_eq!(w.count("put"), 1);
-    let saved = open_bytes(FILE, &w.file(FILE)).unwrap();
-    for e in &w.eds {
-        assert!(saved.same_content(&e.s.doc), "saved {:?} vs live {:?}", texts(&saved), texts(&e.s.doc));
+    for (seed, md) in SEEDS {
+        let bytes = save_bytes(FILE, &open_bytes("seed.md", md.as_bytes()).unwrap()).unwrap();
+        let mut w = world(bytes, 2).await;
+        w.eds[0].type_at_end(1, " Edited by one.");
+        w.eds[1].run_at_end(0, "text.newParagraph", json!({}));
+        w.eds[1].type_at_end(1, "Added by two.");
+        w.eds[1].type_at_end(0, " (draft)");
+        w.run_for(10_000, 1_000).await;
+        assert_eq!(w.count("put"), 1, "{seed}");
+        let saved = open_bytes(FILE, &w.file(FILE)).unwrap();
+        for e in &w.eds {
+            assert!(saved.same_content(&e.s.doc), "{seed}: saved {:?} vs live {:?}", texts(&saved), texts(&e.s.doc));
+        }
     }
+}
+
+#[tokio::test]
+async fn catch_up_edits_are_saved() {
+    // An editor typed while no worker was in the room (a worker restart). The next worker gets
+    // those edits only in its join's catch-up, handed over across several turns, and the
+    // catch-up ends with a resent copy of the last edit (the editor's link dropped before the
+    // relay confirmed it), which changes nothing. The editor types nothing more.
+    let bytes = file(&["One", "Two"]);
+    let (nc, base) = nextcloud(bytes.clone()).await;
+    let relay: Shared = Rc::default();
+    let ed_hub = Relay::connect(&relay, "editor0");
+    let at = ed_hub.at;
+    let mut s = Session::new(Document::new());
+    let le = LiveEditing::start(ed_hub, DOC, &bytes, FILE, &mut s).unwrap();
+    let mut ed = Ed { s, le, at };
+    ed.pump();
+    ed.type_at_end(0, " fish");
+    ed.type_at_end(1, " more");
+    ed.pump();
+    {
+        let mut r = relay.borrow_mut();
+        r.seq += 1;
+        let seq = r.seq;
+        let Some(ServerMsg::Op { doc, origin, local, command, params, scope, .. }) = r.log.last().cloned() else { panic!("no edit logged") };
+        r.log.push(ServerMsg::Op { doc, seq, origin, local, command, params, scope });
+    }
+
+    let clock = Arc::new(TestClock(AtomicU64::new(0)));
+    let files = RoomFiles::new(Arc::new(Nextcloud::new(&base, worker_secret()).unwrap()), ROOM.into(), watch::channel(TOKEN.to_owned()).1);
+    let hub = Relay::connect(&relay, SERVICE_UID);
+    let me = hub.at;
+    // The join's answer and replay, handed over one message a turn.
+    let mut catch_up = std::mem::take(&mut relay.borrow_mut().conns[me].inbox);
+    assert!(catch_up.len() > 2, "a replay to catch up on: {catch_up:?}");
+    let worker = Room::open(hub, files, clock.clone()).await.unwrap();
+    let mut w = World { relay, nc, clock, worker, eds: vec![ed] };
+    while let Some(m) = catch_up.pop_front() {
+        w.relay.borrow_mut().conns[me].inbox.push_back(m);
+        w.tick(100).await;
+    }
+    w.run_for(5_000, 1_000).await;
+    // The editor leaves; the room empties.
+    w.relay.borrow_mut().leave(at);
+    w.eds.clear();
+    assert_eq!(w.run_for(60_000, 1_000).await, Flow::Done);
+    assert_eq!(w.file_texts(), ["One fish", "Two more"], "the caught-up edits were saved before the close");
+}
+
+async fn conflicted(prepare: impl FnOnce(&mut Nc)) -> World {
+    let mut w = world(file(&["One"]), 1).await;
+    {
+        let mut n = w.nc.lock().unwrap();
+        n.files.insert(FILE.into(), file(&["Changed outside"]));
+        prepare(&mut n);
+    }
+    w.eds[0].type_at_end(0, " fish");
+    w.run_for(60_000, 1_000).await;
+    w
+}
+
+#[tokio::test]
+async fn failed_conflict_copy_stops_saving() {
+    let outside = file(&["Changed outside"]);
+    let cases: [(&str, Box<dyn FnOnce(&mut Nc)>, &str); 4] = [
+        (
+            "every name taken",
+            Box::new(|n: &mut Nc| {
+                for k in 1..=9 {
+                    let nth = if k > 1 { format!(" {k}") } else { String::new() };
+                    n.files.insert(format!("Plan (conflict 2026-11-21 1403){nth}.docx"), b"taken".to_vec());
+                }
+            }),
+            "conflict names are taken",
+        ),
+        ("the copy keeps failing", Box::new(|n: &mut Nc| n.copy_status = Some(StatusCode::SERVICE_UNAVAILABLE)), "503"),
+        ("no right to create the copy", Box::new(|n: &mut Nc| n.copy_status = Some(StatusCode::FORBIDDEN)), "may not create files"),
+        ("the write after the copy keeps failing", Box::new(|n: &mut Nc| n.put_status_after_copy = Some(StatusCode::INSUFFICIENT_STORAGE)), "507"),
+    ];
+    for (case, prepare, why) in cases {
+        let w = conflicted(prepare).await;
+        let stopped = w.worker.saving_stopped().map(str::to_owned);
+        assert!(stopped.as_deref().is_some_and(|s| s.contains("could not keep the outside version") && s.contains(why)), "{case}: {stopped:?}");
+        assert_eq!(w.file(FILE), outside, "{case}: the outside version was not written over");
+        assert_eq!(w.count("put"), 0, "{case}");
+        let tries = w.count("put412");
+        assert!((1..=3).contains(&tries), "{case}: it stopped trying ({tries} tries)");
+        let notices = w.relay.borrow().notices();
+        assert_eq!(notices.len(), 1, "{case}: one notice, the stop, no conflict notice: {notices:?}");
+        assert!(notices[0].starts_with("Saving has stopped"), "{case}: {notices:?}");
+        assert!(w.count("copy") <= 1, "{case}: the outside version is copied aside once, not per try");
+    }
+}
+
+#[tokio::test]
+async fn an_old_notify_never_reaches_the_relay() {
+    let (nc, base) = nextcloud(file(&["One"])).await;
+    let old = "e".repeat(64);
+    let files = RoomFiles::new(Arc::new(Nextcloud::new(&base, worker_secret()).unwrap()), ROOM.into(), watch::channel(old).1);
+    let relay_secret = Secret::new("CRAFT_RELAY_SECRET", Some(RELAY_SECRET)).unwrap();
+    let connects = Rc::new(RefCell::new(0));
+    let tried = connects.clone();
+    let connect = move |_ticket: String| {
+        *tried.borrow_mut() += 1;
+        async { Err::<TestHub, String>("the test never connects".into()) }
+    };
+    let clock: Arc<dyn Clock> = Arc::new(TestClock(AtomicU64::new(0)));
+    serve_grant(&relay_secret, files, clock, connect).await;
+    assert_eq!(*connects.borrow(), 0, "a grant that is not live never joins the relay");
+    assert!(nc.lock().unwrap().forbidden >= 1, "the app refused the old grant");
 }
 
 #[tokio::test]
@@ -700,4 +830,22 @@ fn config_refuses_weak_secrets_and_plain_http() {
     assert!(Config::new("0.0.0.0:9555", "http://relay:9444/craft", "http://nextcloud", true, ok, ok).is_ok(), "dev");
     let padded = format!("  {RELAY_SECRET}\n");
     assert!(Config::new("0.0.0.0:9555", "https://h/craft", "https://h", false, Some(&padded), ok).is_ok(), "trimmed");
+}
+
+#[tokio::test]
+async fn notify_past_the_room_cap_is_refused() {
+    let rooms = Arc::new(Rooms::with_cap(1));
+    let spawn: Spawn = Arc::new(|_| {});
+    let base = serve(router(worker_secret(), rooms.clone(), spawn)).await;
+    let http = reqwest::Client::new();
+    let post = |room: &'static str| {
+        http.post(format!("{base}/rooms"))
+            .header("X-Craft-Worker", notify_sig(room, TOKEN))
+            .body(json!({"room": room, "fileId": 1, "token": TOKEN}).to_string())
+            .send()
+    };
+    assert!(post("inst42:1:aaaaaaaaaaaa").await.unwrap().status().is_success());
+    assert_eq!(post("inst42:2:bbbbbbbbbbbb").await.unwrap().status(), 503, "a second room past the cap");
+    assert!(post("inst42:1:aaaaaaaaaaaa").await.unwrap().status().is_success(), "the served room still takes its notify");
+    assert_eq!(rooms.len(), 1);
 }
