@@ -30,7 +30,7 @@
 //!   join's catch-up has arrived whole (the ordered replay up to `Joined.replay_until`, or the
 //!   last `text_ops` piece of a fallback) and the replica is ready. No edits: the catch-up may
 //!   still replace the replica with the room's checkpoint. A catch-up still arriving after 10 s
-//!   is told to the user once.
+//!   is told to the user once; after 20 s it ends in [`LiveStatus::Broken`] (reopen).
 //! - [`LiveStatus::Live`] while connected, joined and ready: the only state that takes edits.
 //!   `saved_at` is the ETag of the newest file the document service saved (the `saved`
 //!   marker from the service uid [`SERVICE_UID`], `{seq, etag}`, `seq` never going back). It
@@ -101,7 +101,8 @@ const PARTIAL: &str = "Part of your last edit could not be shared and was taken 
 const BEHIND: &str = "This window fell too far behind the other editors. Reopen the file to catch up.";
 const UNSENT: &str = "Your last edit could not be sent to the other editors.";
 const CATCHING_UP: &str = "Still catching up with the other editors. Editing starts as soon as that is done.";
-/// How long a join's catch-up may take before the user is told.
+const CATCH_UP_FAILED: &str = "Catching up with the other editors is taking too long. Reopen the file to try again.";
+/// How long a join's catch-up may take before the user is told; twice that and it gives up.
 const CATCH_UP_LATE_MS: f64 = 10_000.0;
 /// The same without a clock, in frames.
 const CATCH_UP_LATE_FRAMES: u32 = 600;
@@ -701,6 +702,13 @@ impl<H: Hub> LiveEditing<H> {
             match step {
                 Ok(true) => done += 1,
                 Ok(false) => break,
+                Err(e @ (craft_collab::Error::Hub(_) | craft_collab::Error::Refused(_))) => {
+                    // The step landed in the replica, but the room will never see it.
+                    log::warn!("live: an undo step was not sent: {e}");
+                    done += 1;
+                    self.unsent();
+                    break;
+                }
                 Err(e) => {
                     log::warn!("live: undo did not go through: {e}");
                     break;
@@ -801,7 +809,8 @@ impl<H: Hub> LiveEditing<H> {
         if replaced {
             self.break_with(BEHIND);
         }
-        self.wait_for_catch_up(catching_up && !self.need_join);
+        let counting = catching_up && !self.need_join && self.broken.is_none() && self.refused.is_none();
+        self.wait_for_catch_up(counting);
         if self.broken.is_none() && !self.need_join && self.space != 0 && !self.live.ready_to_type() {
             // Joined with a space, yet the replica takes no edits: Live gave up on it.
             self.broken = Some(BROKEN.to_owned());
@@ -822,7 +831,8 @@ impl<H: Hub> LiveEditing<H> {
         };
     }
 
-    /// Count how long the join's catch-up has been arriving, and say so once when it is late.
+    /// Count how long the join's catch-up has been arriving: say so once when it is late, and
+    /// give up (reopen) when it is twice as late.
     fn wait_for_catch_up(&mut self, waiting: bool) {
         if !waiting {
             self.catch_up = None;
@@ -831,11 +841,15 @@ impl<H: Hub> LiveEditing<H> {
         let now = self.clock.as_mut().map(|c| c());
         let since = self.catch_up.get_or_insert(CatchUp { since: now, frames: 0, told: false });
         since.frames = since.frames.saturating_add(1);
-        let late = match (now, since.since) {
-            (Some(now), Some(t)) => now - t >= CATCH_UP_LATE_MS,
-            _ => since.frames >= CATCH_UP_LATE_FRAMES,
+        // How many late periods have passed.
+        let periods = match (now, since.since) {
+            (Some(now), Some(t)) => (now - t) / CATCH_UP_LATE_MS,
+            _ => f64::from(since.frames) / f64::from(CATCH_UP_LATE_FRAMES),
         };
-        if late && !std::mem::replace(&mut since.told, true) {
+        if periods >= 2.0 {
+            self.catch_up = None;
+            self.break_with(CATCH_UP_FAILED);
+        } else if periods >= 1.0 && !std::mem::replace(&mut since.told, true) {
             self.notices.push(CATCHING_UP.to_owned());
         }
     }
