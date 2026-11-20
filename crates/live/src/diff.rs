@@ -20,9 +20,26 @@ pub(crate) fn text_edit(have: &str, want: &str) -> Option<TextEdit> {
     let a: Vec<char> = have.chars().collect();
     let b: Vec<char> = want.chars().collect();
     let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-    let room = a.len().min(b.len()) - prefix;
+    let room = a.len().min(b.len()).saturating_sub(prefix);
     let suffix = a.iter().rev().zip(b.iter().rev()).take(room).take_while(|(x, y)| x == y).count();
-    Some(TextEdit { at: prefix, del: a.len() - prefix - suffix, ins: b[prefix..b.len() - suffix].iter().collect() })
+    let del = a.len().saturating_sub(prefix + suffix);
+    let ins = b.iter().skip(prefix).take(b.len().saturating_sub(prefix + suffix)).collect();
+    Some(TextEdit { at: prefix, del, ins })
+}
+
+/// Where char `at` of `old` is in `new`, the edit between them taken as [`text_edit`] finds it:
+/// before the edit it stays, after it it moves by what the edit added or removed, and inside
+/// replaced text it goes to the start of the edit.
+pub(crate) fn follow(old: &str, new: &str, at: usize) -> usize {
+    let Some(e) = text_edit(old, new) else { return at };
+    let ins = e.ins.chars().count();
+    if at <= e.at {
+        at
+    } else if at >= e.at + e.del {
+        (at + ins).saturating_sub(e.del)
+    } else {
+        e.at
+    }
 }
 
 /// Chars `a` and `b` share at the front.
@@ -102,21 +119,22 @@ pub(crate) fn format_edits(have: &[(usize, Attributes)], want: &[(usize, Attribu
 pub(crate) fn increasing(seq: &[usize]) -> Vec<bool> {
     // tails[k]: index in seq of the smallest tail of an increasing run of length k + 1.
     let mut tails: Vec<usize> = Vec::new();
-    let mut prev: Vec<Option<usize>> = vec![None; seq.len()];
+    let mut prev: Vec<Option<usize>> = Vec::with_capacity(seq.len());
     for (i, v) in seq.iter().enumerate() {
         let k = tails.partition_point(|t| seq.get(*t).is_some_and(|x| x < v));
-        prev[i] = k.checked_sub(1).and_then(|j| tails.get(j).copied());
-        if k == tails.len() {
-            tails.push(i);
-        } else {
-            tails[k] = i;
+        prev.push(k.checked_sub(1).and_then(|j| tails.get(j).copied()));
+        match tails.get_mut(k) {
+            Some(t) => *t = i,
+            None => tails.push(i),
         }
     }
     let mut keep = vec![false; seq.len()];
     let mut cur = tails.last().copied();
     while let Some(i) = cur {
-        keep[i] = true;
-        cur = prev[i];
+        if let Some(k) = keep.get_mut(i) {
+            *k = true;
+        }
+        cur = prev.get(i).copied().flatten();
     }
     keep
 }
@@ -131,6 +149,15 @@ mod tests {
         assert_eq!(text_edit("aaa", "aaaa"), Some(TextEdit { at: 3, del: 0, ins: "a".into() }));
         assert_eq!(text_edit("é😀x", "é😀"), Some(TextEdit { at: 2, del: 1, ins: String::new() }));
         assert_eq!(text_edit("same", "same"), None);
+    }
+
+    #[test]
+    fn follow_moves_with_the_text_around_it() {
+        // "abc|def": typing before the caret moves it, after it does not.
+        assert_eq!(follow("abcdef", "XYabcdef", 3), 5);
+        assert_eq!(follow("abcdef", "abcdefZ", 3), 3);
+        // Deleting around it puts it where the deletion was.
+        assert_eq!(follow("abcdef", "af", 3), 1);
     }
 
     #[test]

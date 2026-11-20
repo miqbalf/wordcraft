@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use wordcraft_doc::{Block, Document, Paragraph, Pos, para_block};
 use wordcraft_engine::io::{open_bytes, save_bytes};
 use wordcraft_engine::{EditObserver, Selection, Session};
-use wordcraft_live::{LiveMap, RECOVERED_STYLE, RECOVERED_STYLE_ID, assign_seed_pids, seed_blocks};
+use wordcraft_live::{LiveMap, LocalEdit, MapError, RECOVERED_STYLE, RECOVERED_STYLE_ID, assign_seed_pids, is_shareable, seed_blocks};
 
 /// The dev stack's seed files (craft-office-nextcloud `dev/seed/*.md`, our own text), which it
 /// converts to `.docx` with `wordcraft-cli convert`.
@@ -37,13 +37,13 @@ fn texts(doc: &Document) -> Vec<String> {
 }
 
 /// Every `edited` call, for the peer to turn into live updates after the command returns.
-type Edits = Arc<Mutex<Vec<(Document, Document)>>>;
+type Edits = Arc<Mutex<Vec<(Document, Document, String)>>>;
 
 struct Watch(Edits);
 
 impl EditObserver for Watch {
-    fn edited(&mut self, before: &Document, after: &Document, _command: &str) {
-        self.0.lock().unwrap().push((before.clone(), after.clone()));
+    fn edited(&mut self, before: &Document, after: &Document, command: &str) {
+        self.0.lock().unwrap().push((before.clone(), after.clone(), command.to_owned()));
     }
 }
 
@@ -54,6 +54,8 @@ struct Peer {
     live: LiveDoc,
     map: LiveMap,
     edits: Edits,
+    /// Commands refused as not shareable, and put back.
+    refused: usize,
 }
 
 impl Peer {
@@ -66,7 +68,7 @@ impl Peer {
         let map = LiveMap::new(&s.doc, space);
         let edits = Edits::default();
         s.set_observer(Some(Box::new(Watch(edits.clone()))));
-        Peer { s, live, map, edits }
+        Peer { s, live, map, edits, refused: 0 }
     }
 
     /// Run a command and return the updates it sends. A refused command sends nothing.
@@ -74,13 +76,27 @@ impl Peer {
         let _ = self.s.run(id, &params);
         let seen: Vec<_> = std::mem::take(&mut *self.edits.lock().unwrap());
         let mut out = Vec::new();
-        for (before, after) in seen {
-            let edit = self.map.local_updates(&mut self.live, &before, &after).unwrap();
-            assert!(edit.failed.is_empty(), "{id}: {:?}", edit.failed);
-            wordcraft_live::share_pids(&mut self.s, &edit).unwrap();
-            out.extend(edit.updates);
+        for (before, after, command) in seen {
+            match self.map.local_updates(&mut self.live, &before, &after, &command) {
+                Ok(edit) => out.extend(self.sent(edit)),
+                // Not shared: the app puts the document back.
+                Err(MapError::NotShareable(c)) => {
+                    assert_eq!(c, command);
+                    self.s.apply_remote(|d| *d = before.clone()).unwrap();
+                    self.refused += 1;
+                }
+                // Held until a space is granted.
+                Err(MapError::NoSpace) => {}
+                Err(e) => panic!("{id}: {e}"),
+            }
         }
         out
+    }
+
+    fn sent(&mut self, edit: LocalEdit) -> Vec<Vec<u8>> {
+        assert!(edit.failed.is_empty(), "{:?}", edit.failed);
+        wordcraft_live::share_pids(&mut self.s, &edit).unwrap();
+        edit.updates
     }
 
     /// Take one update from a peer; returns what this peer sends in answer (recovered text).
@@ -246,8 +262,9 @@ fn random_selection(p: &mut Peer, rng: &mut Rng) {
 /// One random command of the shareable set.
 fn random_command(rng: &mut Rng, styles: &[String]) -> (&'static str, Value) {
     const WORDS: [&str; 6] = ["a", "b ", "cd", "é", "😀", "xyz "];
-    match rng.below(7) {
+    match rng.below(8) {
         0 | 1 => ("text.insert", json!({"text": WORDS[rng.below(WORDS.len())]})),
+        6 => (if rng.below(2) == 0 { "para.moveUp" } else { "para.moveDown" }, json!({})),
         2 => ("text.delete", json!({})),
         3 => ("text.newParagraph", json!({})),
         4 => ("format.bold", json!({})),
@@ -259,50 +276,66 @@ fn random_command(rng: &mut Rng, styles: &[String]) -> (&'static str, Value) {
 /// Run one case: `steps` random commands on two peers (deliveries between them not counted), updates delivered in random order.
 /// Returns how many recovered paragraphs the result holds.
 fn converge_case(seed: u64, steps: usize) -> usize {
-    converge_on(&plain(&["Alpha beta", "Gamma", "Delta epsilon zeta", ""]), seed, steps)
+    converge_on(&plain(&["Alpha beta", "Gamma", "Delta epsilon zeta", ""]), seed, steps, 2)
 }
 
-fn converge_on(file: &Document, seed: u64, steps: usize) -> usize {
+/// Deliver up to `n` of peer `k`'s waiting updates, picked at random, and queue its answers for
+/// every other peer.
+fn deliver(peers: &mut [Peer], inbox: &mut [Vec<Vec<u8>>], k: usize, n: usize, rng: &mut Rng) {
+    for _ in 0..n {
+        if inbox[k].is_empty() {
+            return;
+        }
+        let u = inbox[k].swap_remove(rng.below(inbox[k].len()));
+        let answer = peers[k].receive(&u);
+        broadcast(inbox, k, answer);
+    }
+}
+
+fn broadcast(inbox: &mut [Vec<Vec<u8>>], from: usize, updates: Vec<Vec<u8>>) {
+    for (j, q) in inbox.iter_mut().enumerate() {
+        if j != from {
+            q.extend(updates.iter().cloned());
+        }
+    }
+}
+
+fn converge_on(file: &Document, seed: u64, steps: usize, n: usize) -> usize {
     let file = file.clone();
     // Styles the file already has, so applying one changes the paragraph only.
     let styles: Vec<String> =
         ["Normal", "Heading1", "Heading2", "Title", "Quote"].into_iter().filter(|id| file.styles.get(id).is_some()).map(String::from).collect();
     assert!(styles.len() >= 2, "the default sheet has paragraph styles");
     let mut rng = Rng(seed);
-    let mut peers = [Peer::join(&file, 1), Peer::join(&file, 2)];
+    let mut peers: Vec<Peer> = (1..=n as u32).map(|space| Peer::join(&file, space)).collect();
     // inbox[k] holds updates waiting for peer k.
-    let mut inbox: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+    let mut inbox: Vec<Vec<Vec<u8>>> = vec![Vec::new(); n];
     let mut commands = 0;
     while commands < steps {
-        let k = rng.below(2);
+        let k = rng.below(n);
         if !inbox[k].is_empty() && rng.below(3) == 0 {
             // Deliver some of what is waiting, in a random order.
-            for _ in 0..=rng.below(inbox[k].len()) {
-                let u = inbox[k].swap_remove(rng.below(inbox[k].len()));
-                let answer = peers[k].receive(&u);
-                inbox[1 - k].extend(answer);
-            }
+            let count = 1 + rng.below(inbox[k].len());
+            deliver(&mut peers, &mut inbox, k, count, &mut rng);
             continue;
         }
         random_selection(&mut peers[k], &mut rng);
         let (id, params) = random_command(&mut rng, &styles);
         let out = peers[k].run(id, params);
-        inbox[1 - k].extend(out);
+        broadcast(&mut inbox, k, out);
         commands += 1;
     }
     while inbox.iter().any(|q| !q.is_empty()) {
-        for k in 0..2 {
-            while !inbox[k].is_empty() {
-                let u = inbox[k].swap_remove(rng.below(inbox[k].len()));
-                let answer = peers[k].receive(&u);
-                inbox[1 - k].extend(answer);
-            }
+        for k in 0..n {
+            deliver(&mut peers, &mut inbox, k, usize::MAX, &mut rng);
         }
     }
-    let [a, b] = &peers;
-    assert_converged(a, b, &format!("seed {seed}"));
-    let bytes = |p: &Peer| save_bytes("x.docx", &p.s.doc).unwrap();
-    assert!(bytes(a) == bytes(b), "seed {seed}: both save the same file");
+    let a = &peers[0];
+    for (j, b) in peers.iter().enumerate().skip(1) {
+        assert_converged(a, b, &format!("seed {seed}, peer {j}"));
+        let bytes = |p: &Peer| save_bytes("x.docx", &p.s.doc).unwrap();
+        assert!(bytes(a) == bytes(b), "seed {seed}: peer {j} saves the same file");
+    }
     assert!(!a.s.doc.same_content(&file), "seed {seed}: the edits landed");
     a.s.doc.body.iter().filter_map(|b| b.as_para()).filter(|q| q.props.style.as_deref() == Some(RECOVERED_STYLE_ID)).count()
 }
@@ -332,6 +365,127 @@ fn a_document_without_ids_is_shared_whole() {
 #[test]
 fn two_sessions_converge_on_the_sample() {
     for seed in 0..8 {
-        converge_on(&wordcraft_engine::sample::sample_document(), seed, 300);
+        converge_on(&wordcraft_engine::sample::sample_document(), seed, 300, 2);
     }
+}
+
+#[test]
+fn three_sessions_converge() {
+    for seed in 100..108 {
+        converge_on(&plain(&["Alpha beta", "Gamma", "Delta epsilon zeta"]), seed, 200, 3);
+    }
+}
+
+#[test]
+fn bold_at_a_caret_then_typing_is_bold_everywhere() {
+    let file = plain(&["Hello world"]);
+    let (mut a, mut b) = (Peer::join(&file, 1), Peer::join(&file, 2));
+    a.caret(0, 5);
+    // Bold at a collapsed caret changes nothing yet; the next typing carries it.
+    assert!(a.run("format.bold", json!({})).is_empty());
+    let out = a.run("text.insert", json!({"text": "XY"}));
+    exchange(&mut a, &mut b, out, Vec::new());
+    assert_converged(&a, &b, "pending bold");
+    let p = b.s.doc.body[0].as_para().unwrap();
+    let mut at = 0;
+    let bold: Vec<&str> = p
+        .runs
+        .iter()
+        .filter_map(|r| {
+            let t = &p.text[at..at + r.len];
+            at += r.len;
+            (r.props.bold == Some(true)).then_some(t)
+        })
+        .collect();
+    assert_eq!(bold, ["XY"], "only the typed text is bold: {:?}", p.runs);
+}
+
+#[test]
+fn a_move_keeps_concurrent_typing_in_the_moved_paragraph() {
+    let file = plain(&["One", "Two", "Three"]);
+    let (mut a, mut b) = (Peer::join(&file, 1), Peer::join(&file, 2));
+    // A moves "Two" above "One" while B types into both.
+    a.caret(1, 1);
+    let from_a = a.run("para.moveUp", json!({}));
+    assert_eq!(texts(&a.s.doc), ["Two", "One", "Three"]);
+    b.caret(0, 3);
+    let mut from_b = b.run("text.insert", json!({"text": "!"}));
+    b.caret(1, 3);
+    from_b.extend(b.run("text.insert", json!({"text": "?"})));
+    exchange(&mut a, &mut b, from_a, from_b);
+    assert_converged(&a, &b, "move against typing");
+    assert_eq!(texts(&a.s.doc), ["Two?", "One!", "Three"], "both typings stay in their paragraphs");
+    assert!(a.s.doc.styles.get(RECOVERED_STYLE_ID).is_none(), "a move recovers nothing");
+}
+
+#[test]
+fn edits_before_the_space_is_granted_are_sent_after() {
+    // The sample has a table after the edited paragraphs, so the table ids must follow.
+    let file = wordcraft_engine::sample::sample_document();
+    let mut b = Peer::join(&file, 2);
+    let mut a = {
+        let mut s = Session::new(file.clone());
+        s.assign_pids(assign_seed_pids).unwrap();
+        let live = LiveDoc::seeded(&seed_blocks(&s.doc)).unwrap();
+        let map = LiveMap::new(&s.doc, 0);
+        let edits = Edits::default();
+        s.set_observer(Some(Box::new(Watch(edits.clone()))));
+        Peer { s, live, map, edits, refused: 0 }
+    };
+    a.caret(0, 0);
+    assert!(a.run("text.insert", json!({"text": "Early "})).is_empty(), "nothing goes out without a space");
+    assert!(a.run("text.newParagraph", json!({})).is_empty());
+    assert!(a.map.behind());
+    // B edits meanwhile; A takes it in.
+    let last = b.s.doc.body.len() - 1;
+    b.caret(last, 0);
+    let from_b = b.run("text.insert", json!({"text": "Late "}));
+    for u in &from_b {
+        a.receive(u);
+    }
+    a.live.set_client(1).unwrap();
+    let edit = a.map.grant(&mut a.live, &a.s.doc.clone(), 1).unwrap();
+    let out = a.sent(edit);
+    assert!(!out.is_empty() && !a.map.behind(), "the held edits go out once granted");
+    exchange(&mut a, &mut b, out, Vec::new());
+    assert_converged(&a, &b, "edits before the space");
+    let all = texts(&a.s.doc).join("|");
+    assert!(all.contains("Early ") && all.contains("Late "), "{all}");
+    let tables = |d: &Document| d.body.iter().filter(|x| x.as_table().is_some()).count();
+    assert_eq!(tables(&a.s.doc), tables(&file), "the tables are still there, once each");
+    // Both keep editing the table's neighbours afterwards without trouble.
+    let t = a.s.doc.body.iter().position(|x| x.as_table().is_some()).unwrap();
+    a.caret(t + 1, 0);
+    let out = a.run("text.insert", json!({"text": "After "}));
+    exchange(&mut a, &mut b, out, Vec::new());
+    assert_converged(&a, &b, "after the grant");
+}
+
+#[test]
+fn objects_are_not_shared() {
+    assert!(!is_shareable("insert.picture"), "pictures are not shared");
+    assert!(!is_shareable("edit.paste"), "paste may carry objects");
+    assert!(is_shareable("text.insert") && is_shareable("para.moveUp"));
+    let commands = wordcraft_engine::cmd::registry();
+    for id in wordcraft_live::SHAREABLE {
+        assert!(commands.get(id).is_some(), "{id} is a command");
+    }
+
+    // The safety net: an edit that adds an inline object is refused and sends nothing.
+    let file = plain(&["Text"]);
+    let mut a = Peer::join(&file, 1);
+    let before = a.s.doc.clone();
+    let mut after = before.clone();
+    if let Block::Para(p) = std::sync::Arc::make_mut(&mut after.body[0]) {
+        p.text.push(wordcraft_doc::para::OBJ);
+        p.objects.push(wordcraft_doc::InlineObject::FieldEnd);
+        p.normalize();
+    }
+    let r = a.map.local_updates(&mut a.live, &before, &after, "insert.field");
+    assert_eq!(r.unwrap_err(), MapError::NotShareable("insert.field".into()));
+    assert_eq!(a.live.block(a.live.order()[0]).unwrap().text, "Text", "the replica is untouched");
+    // So is one that adds a style definition.
+    let mut after = before.clone();
+    std::sync::Arc::make_mut(&mut after.styles).styles.push(wordcraft_doc::Style { id: "Mine".into(), ..Default::default() });
+    assert!(matches!(a.map.local_updates(&mut a.live, &before, &after, "style.new"), Err(MapError::NotShareable(_))));
 }

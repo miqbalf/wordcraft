@@ -26,31 +26,68 @@ struct Anchor {
     pid: u64,
     index: usize,
     chars: usize,
+    /// The paragraph's text then, to follow the characters through the peer's edit.
+    text: String,
     pos: Pos,
+}
+
+/// Where char `at` of `old` is in `new`: the edit between them is taken as the part outside
+/// their common prefix and suffix. A position before it stays, one after it moves by what the
+/// edit added or removed, and one inside text the edit replaced goes to the start of the edit.
+fn follow(old: &str, new: &str, at: usize) -> usize {
+    if old == new {
+        return at;
+    }
+    let prefix = old.chars().zip(new.chars()).take_while(|(a, b)| a == b).count();
+    let (old_len, new_len) = (old.chars().count(), new.chars().count());
+    let room = old_len.min(new_len).saturating_sub(prefix);
+    let suffix = old.chars().rev().zip(new.chars().rev()).take(room).take_while(|(a, b)| a == b).count();
+    let old_end = old_len.saturating_sub(suffix);
+    if at <= prefix {
+        at
+    } else if at >= old_end {
+        (at + new_len).saturating_sub(old_len)
+    } else {
+        prefix
+    }
+}
+
+/// How alike two texts are: the length of their common prefix plus their common suffix.
+fn likeness(a: &str, b: &str) -> usize {
+    let prefix = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+    let suffix = a.chars().rev().zip(b.chars().rev()).take_while(|(x, y)| x == y).count();
+    prefix + suffix
 }
 
 impl Anchor {
     fn of(doc: &Document, pos: &Pos) -> Anchor {
         let index = doc.para_paths(pos.story).iter().position(|p| *p == pos.path).unwrap_or(0);
-        let (pid, chars) = match doc.para_at(pos) {
-            Some(p) => (p.pid, p.text.get(..pos.off).map_or(0, |t| t.chars().count())),
-            None => (0, 0),
+        let (pid, chars, text) = match doc.para_at(pos) {
+            Some(p) => (p.pid, p.text.get(..pos.off).map_or(0, |t| t.chars().count()), p.text.clone()),
+            None => (0, 0, String::new()),
         };
-        Anchor { story: pos.story, pid, index, chars, pos: pos.clone() }
+        Anchor { story: pos.story, pid, index, chars, text, pos: pos.clone() }
     }
 
-    /// The same place in `doc`: the same character of the paragraph with the same shared id;
-    /// when that paragraph is gone, the start of the paragraph now at the same index. An
-    /// unshared paragraph (id 0) keeps its path. The result is clamped to the document.
+    /// The same place in `doc`: the same character of the paragraph with the same shared id
+    /// (followed through the edit to its text, see [`follow`]); when two paragraphs have that
+    /// id, the one whose text is most like the old one; when that paragraph is gone, the start
+    /// of the paragraph now at the same index. An unshared paragraph (id 0) keeps its path. The
+    /// result is clamped to the document.
     fn find(&self, doc: &Document) -> Pos {
         if self.pid == 0 {
             return doc.clamp(&self.pos);
         }
         let paths = doc.para_paths(self.story);
-        let found = paths.iter().find_map(|path| doc.para(self.story, path).filter(|p| p.pid == self.pid).map(|p| (path, p)));
+        let found = paths
+            .iter()
+            .filter_map(|path| doc.para(self.story, path).filter(|p| p.pid == self.pid).map(|p| (path, p)))
+            .rev()
+            .max_by_key(|(_, p)| likeness(&p.text, &self.text));
         let pos = match found {
             Some((path, p)) => {
-                let off = p.text.char_indices().nth(self.chars).map_or(p.text.len(), |(i, _)| i);
+                let chars = follow(&self.text, &p.text, self.chars);
+                let off = p.text.char_indices().nth(chars).map_or(p.text.len(), |(i, _)| i);
                 Pos::new(self.story, path.clone(), off)
             }
             None => match paths.get(self.index.min(paths.len().saturating_sub(1))) {

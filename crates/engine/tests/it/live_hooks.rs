@@ -241,6 +241,41 @@ fn apply_remote_keeps_caret_on_same_pid() {
 }
 
 #[test]
+fn apply_remote_keeps_caret_on_same_character() {
+    let mut s = Session::new(Document::from_text("Alpha\nBravo\n"));
+    share(&mut s);
+    let bravo = s.doc.para_paths(StoryRef::Body)[1].clone();
+    // The caret sits before the "v" of "Bravo".
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, bravo.clone(), 3));
+    let edit = |s: &mut Session, f: fn(&mut Paragraph)| {
+        s.apply_remote(|d| {
+            if let Ok(p) = d.para_mut(StoryRef::Body, &bravo) {
+                f(p);
+            }
+        })
+        .unwrap();
+    };
+    // A peer types before the caret: the caret moves with its character.
+    edit(&mut s, |p| {
+        p.insert_text(0, "é😀", &Default::default()).unwrap();
+    });
+    let at = s.sel.focus.clone();
+    let text = &s.doc.para_at(&at).unwrap().text;
+    assert_eq!(&text[at.off..], "vo", "still before the same character: {text:?} at {}", at.off);
+    // A peer types after the caret: it stays.
+    edit(&mut s, |p| {
+        let end = p.text.len();
+        p.insert_text(end, "zz", &Default::default()).unwrap();
+    });
+    let at = s.sel.focus.clone();
+    assert_eq!(&s.doc.para_at(&at).unwrap().text[at.off..], "vozz");
+    // A peer deletes text around the caret: it goes to where the deletion was.
+    edit(&mut s, |p| p.delete(6, 10).unwrap());
+    let at = s.sel.focus.clone();
+    assert_eq!(&s.doc.para_at(&at).unwrap().text[at.off..], "ozz", "at the start of the deletion");
+}
+
+#[test]
 fn live_undo_hook_owns_undo_while_live() {
     let mut s = Session::new(Document::new());
     s.run("text.insert", &json!({"text": "Kept"})).unwrap();
