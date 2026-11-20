@@ -24,6 +24,9 @@ wordcraft-layout = { workspace = true }
 wordcraft-render = { workspace = true }
 wordcraft-engine = { workspace = true }
 wordcraft-zotero = { workspace = true }
+# Live co-editing: the session pump and its hub trait; the host connects the transport.
+wordcraft-live = { workspace = true }
+craft-collab = { workspace = true }
 egui = { workspace = true, features = ["default_fonts", "monochrome_emoji_fonts"] }
 egui_extras = { workspace = true }
 serde = { workspace = true }
@@ -52,6 +55,8 @@ craft-update = { workspace = true }
 js-sys = "0.3"
 
 [dev-dependencies]
+# The in-memory relay the live interface tests join through.
+wordcraft-live = { workspace = true, features = ["test-util"] }
 cfb = { workspace = true }
 # Producer tests simulate a globally exhausted IME revision allocator through the engine's
 # explicit test-support feature; production builds of this crate never enable it.

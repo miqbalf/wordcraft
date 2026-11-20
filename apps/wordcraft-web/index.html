@@ -6,6 +6,8 @@
   <title>WordCraft</title>
   <link data-trunk rel="icon" href="../../assets/app-icon/wordcraft.ico" />
   <link data-trunk rel="rust" data-bin="wordcraft-web" data-wasm-opt="z" data-weak-refs />
+  <!-- socket.io-client 4.8.1 for live editing, served by the relay's web root (same origin). -->
+  <script src="/craft/vendor/socket.io.min.js"></script>
   <style>
     html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #e6e6e6; }
     #wordcraft_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }

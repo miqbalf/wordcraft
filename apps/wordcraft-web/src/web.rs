@@ -73,8 +73,10 @@ pub fn start() {
                     session.system_region = region;
                     let messages = Rc::new(RefCell::new(Vec::new()));
                     let mut services = services(inbox.clone(), cc.egui_ctx.clone(), dirty, saves.clone(), messages.clone());
+                    let live_events = crate::host::LiveEvents::default();
                     if let Some(bridge) = &app_bridge {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
+                        bridge.listen_live(live_events.clone(), cc.egui_ctx.clone());
                     }
                     let control = crate::api::install(cc.egui_ctx.clone());
                     let mut app = WordApp::new(session, services).with_control(control);
@@ -105,7 +107,7 @@ pub fn start() {
                         crate::host::Bridge::set_author(&mut app, &author);
                         prefs.keep_own_author(&app.session.author, &own);
                     }
-                    Ok(Box::new(WebShell { app, inbox, messages, prefs }))
+                    Ok(Box::new(WebShell { app, inbox, messages, prefs, live: crate::host::Live::default(), live_events }))
                 }),
             )
             .await;
@@ -140,6 +142,9 @@ struct WebShell {
     inbox: Inbox,
     messages: Rc<RefCell<Vec<String>>>,
     prefs: crate::prefs::PrefsSync,
+    /// Live editing: the parent page's `live` messages and the session's tickets (`host`).
+    live: crate::host::Live,
+    live_events: crate::host::LiveEvents,
 }
 
 fn local_storage() -> Option<web_sys::Storage> {
@@ -160,6 +165,7 @@ impl eframe::App for WebShell {
         for msg in msgs {
             self.app.status(msg);
         }
+        self.live.frame(&mut self.app, &self.live_events);
         self.app.logic(ctx);
         // Store changed preferences straight away: a reload or closed tab runs no exit code (#2132).
         if let Some(json) = self.prefs.changed(&self.app) {

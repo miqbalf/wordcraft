@@ -927,6 +927,14 @@ pub fn status_bar(app: &mut WordApp, ui: &mut Ui) {
                     if app.session.doc.settings.track_changes {
                         let _ = st(ui, tl!("Track Changes: On"));
                     }
+                    // Live editing: where the session stands, then who else is here.
+                    if let Some((state, detail)) = app.live_status_line()
+                        && let Some(resp) = st(ui, &state)
+                        && let Some(detail) = detail
+                    {
+                        let _ = resp.on_hover_text(detail);
+                    }
+                    app.live_presence_bar(ui);
                     // Fonts the document uses that aren't installed: they're drawn in other fonts, so
                     // the text can wrap and paginate unlike where the document was made.
                     let missing = app.cached_missing_fonts(&l).0;

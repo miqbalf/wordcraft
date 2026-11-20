@@ -29,6 +29,12 @@ pub(crate) fn comment_time(c: &wordcraft_doc::Comment) -> String {
     stamp(&c.date, c.date_utc.as_deref(), offset_minutes)
 }
 
+/// The local time of day at Unix time `secs`, `HH:MM` (the live status line's last save).
+pub(crate) fn clock_time(secs: i64) -> String {
+    let local = secs.saturating_add(i64::from(offset_minutes(secs)) * 60).rem_euclid(86_400);
+    format!("{:02}:{:02}", local / 3600, local / 60 % 60)
+}
+
 fn stamp(date: &str, date_utc: Option<&str>, offset: impl Fn(i64) -> i32) -> String {
     let utc = date_utc.and_then(parse).filter(|t| t.timed).map(|t| Time { zone: Some(t.zone.unwrap_or(0)), ..t });
     let local_date = || parse(date).map(|t| if date.trim_end().ends_with(['Z', 'z']) { Time { zone: None, ..t } } else { t });
