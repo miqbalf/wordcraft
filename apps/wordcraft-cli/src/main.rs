@@ -64,6 +64,12 @@ USAGE:
                                               running): addEditCitation, addEditBibliography,
                                               addNote, refresh, removeCodes, setDocPrefs
                                               (--cmd runs first, e.g. --cmd caret.docEnd)
+  wordcraft-cli live-worker --listen HOST:PORT --relay URL --nextcloud URL [--insecure-dev]
+                                              the live co-editing document service: joins each room the
+                                              Nextcloud app grants, saves the shared document back to the
+                                              file and closes the room when its editors leave. Secrets
+                                              come from CRAFT_RELAY_SECRET and CRAFT_WORKER_SECRET (at
+                                              least 32 bytes each); --insecure-dev allows http:// URLs
   wordcraft-cli [<command>] -h | --help       this help
   wordcraft-cli --version
 
@@ -79,7 +85,7 @@ same output on every machine.
 ";
 
 /// The subcommands, in `USAGE` order; `--help` or `-h` after any of them prints `USAGE` (#968).
-const SUBCOMMANDS: &[&str] = &["convert", "info", "text", "inspect", "render", "run", "commands", "parity", "mcp", "zotero"];
+const SUBCOMMANDS: &[&str] = &["convert", "info", "text", "inspect", "render", "run", "commands", "parity", "mcp", "zotero", "live-worker"];
 
 fn wants_help(cmd: &str, rest: &[String]) -> bool {
     SUBCOMMANDS.contains(&cmd) && rest.iter().any(|a| a == "--help" || a == "-h")
@@ -353,6 +359,12 @@ const RUN_OPTIONS: &[OptionSpec] = &[
 const COMMANDS_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--json", takes_value: false }];
 const PARITY_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--markdown", takes_value: false }];
 const MCP_OPTIONS: &[OptionSpec] = &[OptionSpec { name: "--connect", takes_value: true }, OptionSpec { name: "--author", takes_value: true }];
+const LIVE_WORKER_OPTIONS: &[OptionSpec] = &[
+    OptionSpec { name: "--listen", takes_value: true },
+    OptionSpec { name: "--relay", takes_value: true },
+    OptionSpec { name: "--nextcloud", takes_value: true },
+    OptionSpec { name: "--insecure-dev", takes_value: false },
+];
 const ZOTERO_OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--cmd", takes_value: true },
     OptionSpec { name: "--save", takes_value: true },
@@ -815,6 +827,21 @@ fn run<S: AsRef<OsStr>>(args: &[S]) -> Result<(), Failure> {
                 eprintln!("wrote {o}");
             }
             Ok(())
+        }
+        "live-worker" => {
+            validate_options("live-worker", &rest, LIVE_WORKER_OPTIONS)?;
+            let need = |name: &str| arg_value(&rest, name).ok_or_else(|| format!("live-worker: {name} is required\n\n{USAGE}"));
+            let (relay_secret, worker_secret) = (std::env::var("CRAFT_RELAY_SECRET").ok(), std::env::var("CRAFT_WORKER_SECRET").ok());
+            let cfg = wordcraft_cli::live_worker::Config::new(
+                &need("--listen")?,
+                &need("--relay")?,
+                &need("--nextcloud")?,
+                rest.iter().any(|a| a == "--insecure-dev"),
+                relay_secret.as_deref(),
+                worker_secret.as_deref(),
+            )
+            .map_err(|e| format!("live-worker: {e}"))?;
+            wordcraft_cli::live_worker::serve(cfg).map_err(|e| Failure::from(format!("live-worker: {e}")))
         }
         "--version" | "-V" => write_stdout(|o| writeln!(o, "wordcraft-cli {}", env!("CARGO_PKG_VERSION"))),
         "" | "help" | "--help" | "-h" => write_stdout(|o| write!(o, "{USAGE}")),
