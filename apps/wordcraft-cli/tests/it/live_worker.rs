@@ -25,7 +25,7 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use tokio::sync::watch;
 use wordcraft_cli::live_worker::{
-    Clock, Config, Flow, Grant, NOTICE_KIND, Nextcloud, QUIET_MS, Room, RoomFiles, Rooms, Secret, Spawn, router, serve_grant, service_ticket,
+    Clock, Config, Flow, Grant, NOTICE_KIND, Nextcloud, QUIET_MS, Room, RoomFiles, Rooms, Secret, Spawn, listen, router, serve_grant, service_ticket,
 };
 use wordcraft_doc::{Document, Paragraph, Pos, para_block};
 use wordcraft_engine::io::{open_bytes, save_bytes};
@@ -413,6 +413,8 @@ struct World {
     clock: Arc<TestClock>,
     worker: Room<TestHub>,
     eds: Vec<Ed>,
+    /// The fake Nextcloud's base URL.
+    base: String,
 }
 
 fn worker_secret() -> Arc<Secret> {
@@ -434,7 +436,7 @@ async fn world(bytes: Vec<u8>, editors: usize) -> World {
             Ed { s, le, at }
         })
         .collect();
-    let mut w = World { relay, nc, clock, worker, eds };
+    let mut w = World { relay, nc, clock, worker, eds, base };
     for _ in 0..3 {
         w.tick(0).await;
     }
@@ -643,7 +645,7 @@ async fn catch_up_edits_are_saved() {
     let mut catch_up = std::mem::take(&mut relay.borrow_mut().conns[me].inbox);
     assert!(catch_up.len() > 2, "a replay to catch up on: {catch_up:?}");
     let worker = Room::open(hub, files, clock.clone()).await.unwrap();
-    let mut w = World { relay, nc, clock, worker, eds: vec![ed] };
+    let mut w = World { relay, nc, clock, worker, eds: vec![ed], base };
     while let Some(m) = catch_up.pop_front() {
         w.relay.borrow_mut().conns[me].inbox.push_back(m);
         w.tick(100).await;
@@ -656,7 +658,9 @@ async fn catch_up_edits_are_saved() {
     assert_eq!(w.file_texts(), ["One fish", "Two more"], "the caught-up edits were saved before the close");
 }
 
-async fn conflicted(prepare: impl FnOnce(&mut Nc)) -> World {
+/// A save over an outside change, with `prepare` making keeping that version fail. Returns the
+/// world after five minutes, and whether saving had stopped after the first minute.
+async fn conflicted(prepare: impl FnOnce(&mut Nc)) -> (World, bool) {
     let mut w = world(file(&["One"]), 1).await;
     {
         let mut n = w.nc.lock().unwrap();
@@ -665,13 +669,16 @@ async fn conflicted(prepare: impl FnOnce(&mut Nc)) -> World {
     }
     w.eds[0].type_at_end(0, " fish");
     w.run_for(60_000, 1_000).await;
-    w
+    let early = w.worker.saving_stopped().is_some();
+    w.run_for(240_000, 1_000).await;
+    (w, early)
 }
 
 #[tokio::test]
 async fn failed_conflict_copy_stops_saving() {
     let outside = file(&["Changed outside"]);
-    let cases: [(&str, Box<dyn FnOnce(&mut Nc)>, &str); 4] = [
+    // (case, prepare, the reason given, whether it may pass: retried over minutes first)
+    let cases: [(&str, Box<dyn FnOnce(&mut Nc)>, &str, bool); 6] = [
         (
             "every name taken",
             Box::new(|n: &mut Nc| {
@@ -680,25 +687,71 @@ async fn failed_conflict_copy_stops_saving() {
                     n.files.insert(format!("Plan (conflict 2026-11-21 1403){nth}.docx"), b"taken".to_vec());
                 }
             }),
-            "conflict names are taken",
+            "could not keep the outside version: all 9 conflict names are taken",
+            false,
         ),
-        ("the copy keeps failing", Box::new(|n: &mut Nc| n.copy_status = Some(StatusCode::SERVICE_UNAVAILABLE)), "503"),
-        ("no right to create the copy", Box::new(|n: &mut Nc| n.copy_status = Some(StatusCode::FORBIDDEN)), "may not create files"),
-        ("the write after the copy keeps failing", Box::new(|n: &mut Nc| n.put_status_after_copy = Some(StatusCode::INSUFFICIENT_STORAGE)), "507"),
+        (
+            "the copy keeps failing",
+            Box::new(|n: &mut Nc| n.copy_status = Some(StatusCode::SERVICE_UNAVAILABLE)),
+            "could not keep the outside version: the server answered 503",
+            true,
+        ),
+        ("no right to create the copy", Box::new(|n: &mut Nc| n.copy_status = Some(StatusCode::FORBIDDEN)), "may not create files", false),
+        (
+            "the write after the copy keeps failing",
+            Box::new(|n: &mut Nc| n.put_status_after_copy = Some(StatusCode::INSUFFICIENT_STORAGE)),
+            "could not keep the outside version: the server answered 507",
+            true,
+        ),
+        (
+            "the write after the copy is refused",
+            Box::new(|n: &mut Nc| n.put_status_after_copy = Some(StatusCode::FORBIDDEN)),
+            "no longer lets this session write",
+            false,
+        ),
+        (
+            "the file keeps changing",
+            Box::new(|n: &mut Nc| n.put_status_after_copy = Some(StatusCode::PRECONDITION_FAILED)),
+            "could not keep the outside version",
+            true,
+        ),
     ];
-    for (case, prepare, why) in cases {
-        let w = conflicted(prepare).await;
-        let stopped = w.worker.saving_stopped().map(str::to_owned);
-        assert!(stopped.as_deref().is_some_and(|s| s.contains("could not keep the outside version") && s.contains(why)), "{case}: {stopped:?}");
+    for (case, prepare, why, may_pass) in cases {
+        let (w, early) = conflicted(prepare).await;
+        let stopped = w.worker.saving_stopped().map(str::to_owned).unwrap_or_default();
+        assert!(stopped.contains(why), "{case}: {stopped:?}");
+        assert_eq!(early, !may_pass, "{case}: a failure that may pass is retried for minutes; one that cannot stops at once");
         assert_eq!(w.file(FILE), outside, "{case}: the outside version was not written over");
         assert_eq!(w.count("put"), 0, "{case}");
-        let tries = w.count("put412");
-        assert!((1..=3).contains(&tries), "{case}: it stopped trying ({tries} tries)");
         let notices = w.relay.borrow().notices();
         assert_eq!(notices.len(), 1, "{case}: one notice, the stop, no conflict notice: {notices:?}");
         assert!(notices[0].starts_with("Saving has stopped"), "{case}: {notices:?}");
-        assert!(w.count("copy") <= 1, "{case}: the outside version is copied aside once, not per try");
+        // Every outside version copied aside is named in the stop notice, since no conflict
+        // notice told of it.
+        let copies: Vec<String> =
+            w.nc.lock().unwrap().files.iter().filter(|(k, v)| *k != FILE && v.as_slice() != b"taken").map(|(k, _)| k.clone()).collect();
+        for copy in &copies {
+            assert!(notices[0].contains(copy.as_str()), "{case}: {copy} named in {notices:?}");
+        }
     }
+}
+
+#[tokio::test]
+async fn restart_rejoins_and_saves_on_renotify() {
+    // The worker ends (a restart) after the editors typed and before it saved. The app's stale
+    // job re-notifies the same grant; the new worker joins the same room, and the relay's replay
+    // since the last save brings it the edits, which it saves.
+    let mut w = world(file(&["One", "Two"]), 1).await;
+    w.eds[0].type_at_end(0, " fish");
+    w.tick(1_000).await;
+    let gone = w.relay.borrow().conns.iter().position(|c| c.service && c.connected).unwrap();
+    w.relay.borrow_mut().leave(gone);
+    assert_eq!(w.count("put"), 0, "nothing saved before the restart");
+
+    let files = RoomFiles::new(Arc::new(Nextcloud::new(&w.base, worker_secret()).unwrap()), ROOM.into(), watch::channel(TOKEN.to_owned()).1);
+    w.worker = Room::open(Relay::connect(&w.relay, SERVICE_UID), files, w.clock.clone()).await.unwrap();
+    w.run_for(10_000, 1_000).await;
+    assert_eq!(w.file_texts(), ["One fish", "Two"], "the edits made before the restart are saved");
 }
 
 #[tokio::test]
@@ -848,4 +901,21 @@ async fn notify_past_the_room_cap_is_refused() {
     assert_eq!(post("inst42:2:bbbbbbbbbbbb").await.unwrap().status(), 503, "a second room past the cap");
     assert!(post("inst42:1:aaaaaaaaaaaa").await.unwrap().status().is_success(), "the served room still takes its notify");
     assert_eq!(rooms.len(), 1);
+}
+
+#[tokio::test]
+async fn slow_header_client_is_dropped() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let spawn: Spawn = Arc::new(|_| {});
+    tokio::spawn(listen(listener, router(worker_secret(), Arc::new(Rooms::default()), spawn)));
+    let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // A request line and one header, then nothing: the headers never end.
+    client.write_all(b"POST /rooms HTTP/1.1\r\nHost: worker\r\n").await.unwrap();
+    let began = std::time::Instant::now();
+    let mut answer = Vec::new();
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(10), client.read_to_end(&mut answer)).await;
+    assert!(closed.is_ok(), "the server drops a client whose headers never end");
+    assert!(began.elapsed() >= std::time::Duration::from_secs(2), "but gives it time to send them");
 }

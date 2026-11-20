@@ -79,8 +79,15 @@ const PUT_RETRY_MS: u64 = 5_000;
 /// room ends with the close (the worker logs it).
 const CLOSE_GIVE_UP_MS: u64 = 60_000;
 /// After this many saves in a row whose conflict handling failed (the outside version could not
-/// be read or copied aside, or the write after it failed), saving stops.
+/// be read or copied aside, or the write after it failed), and at least [`CONFLICT_GIVE_UP_MS`]
+/// after the first, saving stops.
 const CONFLICT_TRIES: u32 = 3;
+const CONFLICT_GIVE_UP_MS: u64 = 120_000;
+/// The wait before the next try after the first, second and later failed conflict, so the
+/// tries spread over minutes, not seconds.
+const CONFLICT_RETRY_MS: [u64; 3] = [5_000, 30_000, 120_000];
+/// Why saving stops when the server refuses this session (403).
+const FORBIDDEN_WHY: &str = "the server no longer lets this session write the file";
 /// Between first-connection attempts, and the least wait between two fresh-ticket relinks.
 const RELINK_MS: u64 = 5_000;
 /// The hub reconnects on its own, but always with the ticket it was given. Once that ticket is
@@ -524,10 +531,12 @@ pub struct Room<H: Hub> {
     /// The body the file holds: as seeded, then as last written. Anything else is unsaved,
     /// whether it came as an edit, in a join's catch-up or a rejoin's.
     saved_body: Blocks,
-    /// Saves in a row whose conflict handling failed.
+    /// Saves in a row whose conflict handling failed, and when the first of them was.
     conflict_failures: u32,
-    /// A conflict copy made whose notice waits for the write after it to succeed.
-    untold_copy: Option<String>,
+    conflict_since: u64,
+    /// Conflict copies made whose notice waits for a write over them to succeed (one per
+    /// outside version, oldest first).
+    untold_copies: Vec<String>,
     /// When the oldest edit not yet in a save request arrived.
     dirty_since: Option<u64>,
     last_edit: u64,
@@ -560,7 +569,8 @@ impl<H: Hub> Room<H> {
             seen_body: session.doc.body.clone(),
             saved_body: session.doc.body.clone(),
             conflict_failures: 0,
-            untold_copy: None,
+            conflict_since: 0,
+            untold_copies: Vec::new(),
             le,
             session,
             files,
@@ -744,7 +754,10 @@ impl<H: Hub> Room<H> {
                 say(&self.doc_id, format_args!("saving failed: {e}"));
                 self.unsaved(inflight.dirty_since);
                 if e == FileError::Forbidden {
-                    self.stop("the server no longer lets this session write the file");
+                    self.stop(FORBIDDEN_WHY);
+                } else if self.conflict_failures > 0 {
+                    let at = (self.conflict_failures as usize).min(CONFLICT_RETRY_MS.len()) - 1;
+                    self.retry_at = now + CONFLICT_RETRY_MS[at];
                 } else {
                     self.retry_at = now + PUT_RETRY_MS;
                 }
@@ -758,40 +771,47 @@ impl<H: Hub> Room<H> {
         let outcome = match self.files.put(bytes.clone(), &self.etag).await {
             Err(FileError::Stale) => self.keep_outside(bytes).await,
             // The write that follows a conflict copy is part of keeping the outside version.
-            Err(e) if self.untold_copy.is_some() => Err(ConflictFail::Again(e)),
+            Err(e) if !self.untold_copies.is_empty() => Err(ConflictFail::from(e)),
             Err(e) => return Err(WriteFail::Retry(e)),
             Ok(etag) => Ok(etag),
         };
-        match outcome {
+        let why = match outcome {
             Ok(etag) => {
                 self.conflict_failures = 0;
-                Ok(self.written(etag))
+                return Ok(self.written(etag));
             }
-            Err(ConflictFail::Stop(why)) => Err(WriteFail::Stop(format!("could not keep the outside version: {why}"))),
+            Err(ConflictFail::Stop(why)) => format!("could not keep the outside version: {why}"),
+            Err(ConflictFail::Forbidden) => FORBIDDEN_WHY.to_owned(),
             Err(ConflictFail::Again(e)) => {
-                self.conflict_failures += 1;
-                if self.conflict_failures >= CONFLICT_TRIES {
-                    Err(WriteFail::Stop(format!("could not keep the outside version: {e}")))
-                } else {
-                    Err(WriteFail::Retry(e))
+                let now = self.clock.now_ms();
+                if self.conflict_failures == 0 {
+                    self.conflict_since = now;
                 }
+                self.conflict_failures += 1;
+                if self.conflict_failures < CONFLICT_TRIES || now.saturating_sub(self.conflict_since) < CONFLICT_GIVE_UP_MS {
+                    return Err(WriteFail::Retry(e));
+                }
+                format!("could not keep the outside version: {e}")
             }
-        }
+        };
+        // Saving stops: say where the outside versions already copied aside are.
+        let copies = std::mem::take(&mut self.untold_copies);
+        Err(WriteFail::Stop(if copies.is_empty() { why } else { format!("{why}; the outside version was kept as {}", copies.join(", ")) }))
     }
 
     /// The outside version copied aside and the session written over it: the new ETag.
     async fn keep_outside(&mut self, bytes: Vec<u8>) -> Result<String, ConflictFail> {
-        let outside = self.files.get().await.map_err(ConflictFail::Again)?;
+        let outside = self.files.get().await.map_err(ConflictFail::from)?;
         let name = copy_aside(&self.files, &self.file_name, self.clock.unix_ms()).await?;
         say(&self.doc_id, "the file changed outside the session; that version was copied aside");
-        self.untold_copy = Some(name);
+        self.untold_copies.push(name);
         self.etag = outside.etag;
-        self.files.put(bytes, &self.etag).await.map_err(ConflictFail::Again)
+        self.files.put(bytes, &self.etag).await.map_err(ConflictFail::from)
     }
 
-    /// A write went through: tell the editors of a conflict copy made for it.
+    /// A write went through: tell the editors of the conflict copies made for it.
     fn written(&mut self, etag: String) -> String {
-        if let Some(name) = self.untold_copy.take() {
+        for name in std::mem::take(&mut self.untold_copies) {
             self.tell(&format!("{CONFLICT_TEXT} {name}."));
         }
         etag
@@ -834,10 +854,18 @@ async fn copy_aside(files: &RoomFiles, file_name: &str, unix_ms: i64) -> Result<
 
 /// Why the outside version could not be kept.
 enum ConflictFail {
+    /// `403`: this session may no longer write the file; stops at once.
+    Forbidden,
     /// May pass (counts towards [`CONFLICT_TRIES`]).
     Again(FileError),
     /// Will not pass.
     Stop(String),
+}
+
+impl From<FileError> for ConflictFail {
+    fn from(e: FileError) -> ConflictFail {
+        if e == FileError::Forbidden { ConflictFail::Forbidden } else { ConflictFail::Again(e) }
+    }
 }
 
 /// Whether two bodies hold the very same blocks (by address: copy-on-write blocks that were
