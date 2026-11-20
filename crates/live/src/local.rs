@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use craft_collab::LiveDoc;
-use wordcraft_doc::{Block, Blocks, Document, InlineObject, Paragraph};
+use wordcraft_doc::{Block, Document, InlineObject, Paragraph};
 
 use crate::ops::Ops;
-use crate::{LiveMap, LocalEdit, MapError, Moved, diff, map};
+use crate::{LiveMap, LocalEdit, MapError, Moved, Refusal, diff, map};
 
 /// The ids of the blocks of a body: paragraphs by pid, tables by the side list.
 struct Ids<'a> {
@@ -32,24 +32,10 @@ pub(crate) fn same_body(a: &Document, b: &Document) -> bool {
     a.body.len() == b.body.len() && a.body.iter().zip(&b.body).all(|(x, y)| Arc::ptr_eq(x, y))
 }
 
-fn same_blocks(a: &Blocks, b: &Blocks) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y) || x == y)
-}
-
-fn same_arc<T: PartialEq>(a: &Arc<T>, b: &Arc<T>) -> bool {
-    Arc::ptr_eq(a, b) || a == b
-}
-
-/// Whether what live editing does not share is unchanged: styles, numbering, media, comments,
-/// revisions and the other stories (headers, notes, text boxes).
-pub(crate) fn same_outside_body(a: &Document, b: &Document) -> bool {
-    same_arc(&a.styles, &b.styles)
-        && same_arc(&a.numbering, &b.numbering)
-        && a.media == b.media
-        && a.comments == b.comments
-        && a.revisions == b.revisions
-        && a.parts.len() == b.parts.len()
-        && a.parts.iter().zip(&b.parts).all(|((ka, pa), (kb, pb))| ka == kb && pa.kind == pb.kind && same_blocks(&pa.blocks, &pb.blocks))
+/// The first part of the document outside the body that differs, by name: live editing shares
+/// only the body ([`Document::changed_outside_body`] lists every field).
+pub(crate) fn outside_body_change(a: &Document, b: &Document) -> Option<&'static str> {
+    a.changed_outside_body(b)
 }
 
 /// The inline objects of the body blocks not in `other`, in order.
@@ -65,10 +51,11 @@ pub(crate) fn check_shareable(before: &Document, after: &Document, command: &str
         Some(changed) => changed.iter().all(|i| objects_at(before, *i) == objects_at(after, *i)),
         None => objects_off(before, after) == objects_off(after, before),
     };
-    if !objects_kept || !same_outside_body(before, after) {
-        return Err(MapError::NotShareable(command.to_owned()));
+    let reason = if objects_kept { outside_body_change(before, after).map(Refusal::OutsideBody) } else { Some(Refusal::InlineObject) };
+    match reason {
+        Some(reason) => Err(MapError::NotShareable { command: command.to_owned(), reason }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn objects_at(d: &Document, i: usize) -> Option<&[InlineObject]> {

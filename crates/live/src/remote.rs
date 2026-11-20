@@ -144,21 +144,6 @@ impl LiveMap {
         true
     }
 
-    /// The paragraphs of `doc` not shared yet (id 0), by the id of the shared block before them.
-    fn unshared(&self, doc: &Document) -> HashMap<Option<u64>, Vec<Arc<Block>>> {
-        let mut tables = self.tables.iter();
-        let mut prev = None;
-        let mut out: HashMap<Option<u64>, Vec<Arc<Block>>> = HashMap::new();
-        for b in &doc.body {
-            match &**b {
-                Block::Para(p) if p.pid == 0 => out.entry(prev).or_default().push(b.clone()),
-                Block::Para(p) => prev = Some(p.pid),
-                Block::Table(_) => prev = tables.next().copied().or(prev),
-            }
-        }
-        out
-    }
-
     /// Where the nearest block before removed block `gone` that survives is now.
     fn neighbour(&self, ops: &Ops, gone: u64) -> Option<usize> {
         let mut cur = self.removed.get(&gone).copied().flatten();
@@ -177,8 +162,7 @@ impl LiveMap {
     ///
     /// Paragraphs are found by id, so `doc`'s new paragraphs must have theirs (see
     /// [`LocalEdit::pids`](crate::LocalEdit::pids)); a paragraph without one is not in `live`
-    /// and is dropped, except while edits wait for a space ([`LiveMap::behind`]): then it stays
-    /// after the block it followed, to be sent with them.
+    /// and is dropped.
     pub fn apply_changes(&mut self, doc: &mut Document, live: &LiveDoc, changes: &[BlockChange]) {
         if changes.is_empty() {
             return;
@@ -196,8 +180,7 @@ impl LiveMap {
         let mut kept: HashMap<u64, Arc<Block>> =
             doc.body.iter().filter_map(|b| Some((b.as_para().map(|p| p.pid).filter(|pid| *pid != 0)?, b.clone()))).collect();
         kept.extend(self.tables.iter().copied().zip(doc.body.iter().filter(|b| b.as_table().is_some()).cloned()));
-        let mut waiting = if self.stale { self.unshared(doc) } else { HashMap::new() };
-        let mut body: Vec<Arc<Block>> = waiting.remove(&None).unwrap_or_default();
+        let mut body: Vec<Arc<Block>> = Vec::with_capacity(doc.body.len());
         let mut tables = Vec::new();
         let mut recovered = false;
         for id in live.order() {
@@ -214,9 +197,7 @@ impl LiveMap {
                 tables.push(id);
             }
             body.push(block);
-            body.extend(waiting.remove(&Some(id)).unwrap_or_default());
         }
-        body.extend(waiting.into_values().flatten());
         doc.body = body;
         self.tables = tables;
         if recovered {

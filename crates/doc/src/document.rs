@@ -199,6 +199,54 @@ impl Document {
             && same_glossary(glossary, other_glossary)
     }
 
+    /// The first part of the document outside the body that differs from `other`'s, by field
+    /// name, or `None` when nothing but the body differs. It compares what
+    /// [`Document::same_content`] compares, with the same address checks first, and lists every
+    /// field the same way, so a new one does not build until someone decides whether it counts.
+    /// Live co-editing shares only the body and refuses an edit this finds.
+    pub fn changed_outside_body(&self, other: &Document) -> Option<&'static str> {
+        let Document {
+            body: _,
+            last_section,
+            parts,
+            styles,
+            numbering,
+            comments,
+            revisions,
+            settings,
+            core,
+            sources,
+            custom_props,
+            footnote_separators,
+            endnote_separators,
+            media,
+            passthrough,
+            glossary,
+            media_index: _,
+            kept: _,
+            missing_pictures: _,
+            fit_state: _,
+        } = self;
+        let checks: [(&'static str, bool); 15] = [
+            ("styles", *styles == other.styles),
+            ("numbering", *numbering == other.numbering),
+            ("last_section", *last_section == other.last_section),
+            ("parts", same_parts(parts, &other.parts)),
+            ("comments", *comments == other.comments),
+            ("revisions", *revisions == other.revisions),
+            ("settings", *settings == other.settings),
+            ("core", *core == other.core),
+            ("sources", *sources == other.sources),
+            ("custom_props", *custom_props == other.custom_props),
+            ("footnote_separators", *footnote_separators == other.footnote_separators),
+            ("endnote_separators", *endnote_separators == other.endnote_separators),
+            ("media", same_bytes(media, &other.media)),
+            ("passthrough", same_bytes(passthrough, &other.passthrough)),
+            ("glossary", same_glossary(glossary, &other.glossary)),
+        ];
+        checks.into_iter().find(|(_, same)| !same).map(|(name, _)| name)
+    }
+
     pub fn story(&self, s: StoryRef) -> Option<&Blocks> {
         match s {
             StoryRef::Body => Some(&self.body),

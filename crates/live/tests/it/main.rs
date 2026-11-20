@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use wordcraft_doc::{Block, Document, Paragraph, Pos, para_block};
 use wordcraft_engine::io::{open_bytes, save_bytes};
 use wordcraft_engine::{EditObserver, Selection, Session};
-use wordcraft_live::{LiveMap, LocalEdit, MapError, RECOVERED_STYLE, RECOVERED_STYLE_ID, assign_seed_pids, is_shareable, seed_blocks};
+use wordcraft_live::{LiveMap, LocalEdit, MapError, RECOVERED_STYLE, RECOVERED_STYLE_ID, Refusal, assign_seed_pids, is_shareable, seed_blocks};
 
 /// The dev stack's seed files (craft-office-nextcloud `dev/seed/*.md`, our own text), which it
 /// converts to `.docx` with `wordcraft-cli convert`.
@@ -79,14 +79,12 @@ impl Peer {
         for (before, after, command) in seen {
             match self.map.local_updates(&mut self.live, &before, &after, &command) {
                 Ok(edit) => out.extend(self.sent(edit)),
-                // Not shared: the app puts the document back.
-                Err(MapError::NotShareable(c)) => {
-                    assert_eq!(c, command);
+                // Refused (not shared, or no space yet): the app puts the document back.
+                Err(e) if e.refused().is_some() => {
+                    assert_eq!(e.refused(), Some(command.as_str()));
                     self.s.apply_remote(|d| *d = before.clone()).unwrap();
                     self.refused += 1;
                 }
-                // Held until a space is granted.
-                Err(MapError::NoSpace) => {}
                 Err(e) => panic!("{id}: {e}"),
             }
         }
@@ -337,6 +335,8 @@ fn converge_on(file: &Document, seed: u64, steps: usize, n: usize) -> usize {
         assert!(bytes(a) == bytes(b), "seed {seed}: peer {j} saves the same file");
     }
     assert!(!a.s.doc.same_content(&file), "seed {seed}: the edits landed");
+    let refused: usize = peers.iter().map(|p| p.refused).sum();
+    assert!(refused * 2 < steps, "seed {seed}: most commands were shared ({refused} of {steps} refused)");
     a.s.doc.body.iter().filter_map(|b| b.as_para()).filter(|q| q.props.style.as_deref() == Some(RECOVERED_STYLE_ID)).count()
 }
 
@@ -419,8 +419,8 @@ fn a_move_keeps_concurrent_typing_in_the_moved_paragraph() {
 }
 
 #[test]
-fn edits_before_the_space_is_granted_are_sent_after() {
-    // The sample has a table after the edited paragraphs, so the table ids must follow.
+fn an_edit_before_the_space_is_granted_is_refused_and_put_back() {
+    // The sample has a table after the edited paragraphs, so the table ids must stay paired.
     let file = wordcraft_engine::sample::sample_document();
     let mut b = Peer::join(&file, 2);
     let mut a = {
@@ -432,10 +432,12 @@ fn edits_before_the_space_is_granted_are_sent_after() {
         s.set_observer(Some(Box::new(Watch(edits.clone()))));
         Peer { s, live, map, edits, refused: 0 }
     };
+    let opened = a.s.doc.clone();
     a.caret(0, 0);
     assert!(a.run("text.insert", json!({"text": "Early "})).is_empty(), "nothing goes out without a space");
     assert!(a.run("text.newParagraph", json!({})).is_empty());
-    assert!(a.map.behind());
+    assert_eq!(a.refused, 2, "both were refused");
+    assert!(a.s.doc.same_content(&opened), "and put back");
     // B edits meanwhile; A takes it in.
     let last = b.s.doc.body.len() - 1;
     b.caret(last, 0);
@@ -444,21 +446,39 @@ fn edits_before_the_space_is_granted_are_sent_after() {
         a.receive(u);
     }
     a.live.set_client(1).unwrap();
-    let edit = a.map.grant(&mut a.live, &a.s.doc.clone(), 1).unwrap();
-    let out = a.sent(edit);
-    assert!(!out.is_empty() && !a.map.behind(), "the held edits go out once granted");
-    exchange(&mut a, &mut b, out, Vec::new());
-    assert_converged(&a, &b, "edits before the space");
-    let all = texts(&a.s.doc).join("|");
-    assert!(all.contains("Early ") && all.contains("Late "), "{all}");
-    let tables = |d: &Document| d.body.iter().filter(|x| x.as_table().is_some()).count();
-    assert_eq!(tables(&a.s.doc), tables(&file), "the tables are still there, once each");
-    // Both keep editing the table's neighbours afterwards without trouble.
+    assert!(a.map.grant(&a.live, &a.s.doc, 1), "the session and the replica agree at the grant");
+    // From now on A's edits go out, the tables included.
+    a.caret(0, 0);
+    let mut out = a.run("text.insert", json!({"text": "Now "}));
     let t = a.s.doc.body.iter().position(|x| x.as_table().is_some()).unwrap();
     a.caret(t + 1, 0);
-    let out = a.run("text.insert", json!({"text": "After "}));
+    out.extend(a.run("text.insert", json!({"text": "After "})));
     exchange(&mut a, &mut b, out, Vec::new());
     assert_converged(&a, &b, "after the grant");
+    let all = texts(&a.s.doc).join("|");
+    assert!(all.contains("Now ") && all.contains("Late ") && all.contains("After ") && !all.contains("Early "), "{all}");
+    let tables = |d: &Document| d.body.iter().filter(|x| x.as_table().is_some()).count();
+    assert_eq!(tables(&a.s.doc), tables(&file), "the tables are still there, once each");
+}
+
+#[test]
+fn a_command_is_reported_once_and_put_back_whole() {
+    let file = plain(&["Hello"]);
+    let mut a = Peer::join(&file, 1);
+    // A macro runs its steps inside one command: one edit, whose `before` is from before it.
+    a.s.macros.insert("mark".into(), vec![("text.insert".into(), json!({"text": "typed "})), ("insert.bookmark".into(), json!({"name": "here"}))]);
+    a.caret(0, 0);
+    let out = a.run("tools.macros", json!({"run": "mark"}));
+    assert!(out.is_empty() && a.refused == 1, "refused once, nothing sent");
+    assert!(
+        a.s.doc.same_content(&{
+            let mut d = file.clone();
+            assign_seed_pids(&mut d);
+            d
+        }),
+        "the typing inside the macro is put back too: {:?}",
+        texts(&a.s.doc)
+    );
 }
 
 #[test]
@@ -482,10 +502,24 @@ fn objects_are_not_shared() {
         p.normalize();
     }
     let r = a.map.local_updates(&mut a.live, &before, &after, "insert.field");
-    assert_eq!(r.unwrap_err(), MapError::NotShareable("insert.field".into()));
+    assert_eq!(r.unwrap_err(), MapError::NotShareable { command: "insert.field".into(), reason: Refusal::InlineObject });
     assert_eq!(a.live.block(a.live.order()[0]).unwrap().text, "Text", "the replica is untouched");
     // So is one that adds a style definition.
     let mut after = before.clone();
     std::sync::Arc::make_mut(&mut after.styles).styles.push(wordcraft_doc::Style { id: "Mine".into(), ..Default::default() });
-    assert!(matches!(a.map.local_updates(&mut a.live, &before, &after, "style.new"), Err(MapError::NotShareable(_))));
+    let r = a.map.local_updates(&mut a.live, &before, &after, "style.new");
+    assert!(matches!(r, Err(MapError::NotShareable { reason: Refusal::OutsideBody("styles"), .. })), "{r:?}");
+
+    // Real commands that change only the settings or the last section's setup.
+    for (id, params, part) in
+        [("review.trackChanges", json!({"value": true}), "settings"), ("layout.orientation", json!({"value": "landscape"}), "last_section")]
+    {
+        let kept = a.s.doc.clone();
+        a.s.run(id, &params).unwrap();
+        let (before, after, command) = a.edits.lock().unwrap().pop().unwrap();
+        let r = a.map.local_updates(&mut a.live, &before, &after, &command);
+        assert!(matches!(&r, Err(MapError::NotShareable { reason: Refusal::OutsideBody(p), .. }) if *p == part), "{id}: {r:?}");
+        a.s.apply_remote(|d| *d = before.clone()).unwrap();
+        assert!(a.s.doc.same_content(&kept));
+    }
 }

@@ -10,7 +10,10 @@
 //! editing inside a table is not either: a table edit replaces the whole table, and the last
 //! writer wins. Commands that would change what is not shared are listed by [`is_shareable`];
 //! [`LiveMap::local_updates`] refuses such an edit with [`MapError::NotShareable`] as a safety
-//! net.
+//! net. A delete across a section break whose following section is the last one changes the
+//! document's last section setup (`last_section`), which is outside the body, so it is refused;
+//! one whose following section ends at a paragraph changes that paragraph's `"s"` attribute,
+//! which is shared.
 //!
 //! # The flow
 //!
@@ -19,22 +22,24 @@
 //!    its client space with `set_client`, and makes a [`LiveMap::new`].
 //! 2. Each local command the session's observer reports goes through
 //!    [`LiveMap::local_updates`]. The updates go to the relay; the new paragraph ids go back into
-//!    the session with [`share_pids`] before the next command or remote edit. On
-//!    [`MapError::NotShareable`] nothing was sent: put the session back to `before` with
-//!    `session.apply_remote(|d| *d = before.clone())` and tell the user the command is not
-//!    available while editing live.
+//!    the session with [`share_pids`] before the next command or remote edit. When it is
+//!    refused ([`MapError::refused`]: [`MapError::NotShareable`] or [`MapError::NoSpace`])
+//!    nothing was sent: put the session back to `before` with
+//!    `session.apply_remote(|d| *d = before.clone())` and tell the user why ([`Refusal`]).
+//!
+//!    The engine reports one edit per top-level command, however many steps it runs inside
+//!    (a macro, Repeat), so restoring that edit's `before` restores the state before the
+//!    command.
 //! 3. Each update from the relay goes through [`LiveMap::receive`], and the changes it reports
 //!    into the session with `session.apply_remote(|d| map.apply_changes(d, &live, &changes))`.
 //!    The updates `receive` returns (recovered and forwarded text) go to the relay too.
 //!
 //! # Before the relay grants a space
 //!
-//! Without a client space no paragraph id can be minted, so the app should not take typing
-//! until the space is granted (Task 8 blocks it). If an edit is reported anyway,
-//! [`LiveMap::local_updates`] returns [`MapError::NoSpace`] and remembers that the session ran
-//! ahead of the replica; [`LiveMap::grant`] (or the next `local_updates` once a space is set)
-//! then sends everything at once, by diffing the replica's content against the session's
-//! document. Remote edits applied in between replace the blocks they touch.
+//! Without a client space no paragraph id can be minted, so the app takes no input until the
+//! space is granted (Task 8 blocks it). That is the rule; the backstop is that an edit reported
+//! anyway is refused with [`MapError::NoSpace`], nothing is held, and the caller puts `before`
+//! back like any other refusal. [`LiveMap::grant`] then only sets the space.
 //!
 //! # A peer joining late
 //!
@@ -80,20 +85,41 @@ pub use shareable::{SHAREABLE, is_shareable};
 /// How many removals and moves a peer remembers for recovering and forwarding text.
 pub const REMEMBERED: usize = 4096;
 
+/// Why live editing refused a command's edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// It added, removed or changed an inline object (a picture, field, bookmark, note or
+    /// comment mark…). Moving one between paragraphs, as Enter and Delete do, is fine.
+    InlineObject,
+    /// It changed a part of the document outside the body, named here: `styles`, `numbering`,
+    /// `last_section`, `settings`… Only the body is shared.
+    OutsideBody(&'static str),
+}
+
 /// Why a mapping call was refused. Nothing was sent when one is returned.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MapError {
     /// The replica refused the call.
     #[error("shared document: {0}")]
     Live(#[from] LiveError),
-    /// No client space yet, so no new paragraph id can be minted. The edit is sent once a space
-    /// is granted ([`LiveMap::grant`]).
-    #[error("no client space yet")]
-    NoSpace,
-    /// The command changed something live editing does not share (an inline object, media,
-    /// styles, numbering, notes, comments, revisions). Nothing was sent.
-    #[error("{0} is not available while editing live")]
-    NotShareable(String),
+    /// No client space yet, so no new paragraph id can be minted. The edit is refused for good
+    /// and nothing is held: put `before` back.
+    #[error("{command} was made before the relay granted a client space")]
+    NoSpace { command: String },
+    /// The command changed something live editing does not share. Put `before` back.
+    #[error("{command} is not available while editing live: {reason:?}")]
+    NotShareable { command: String, reason: Refusal },
+}
+
+impl MapError {
+    /// The command whose edit was refused, when the caller must put the document back to the
+    /// edit's `before`.
+    pub fn refused(&self) -> Option<&str> {
+        match self {
+            MapError::NoSpace { command } | MapError::NotShareable { command, .. } => Some(command),
+            MapError::Live(_) => None,
+        }
+    }
 }
 
 /// What one local command sends.
@@ -183,8 +209,6 @@ pub struct LiveMap {
     next: u32,
     /// The ids of the body's tables, in body order.
     tables: Vec<u64>,
-    /// An edit came while there was no space: the session is ahead of the replica.
-    stale: bool,
     /// Blocks this peer took out of the order, with the block before each then.
     removed: Bounded<Option<u64>>,
     /// Blocks this peer moved.
@@ -199,11 +223,10 @@ impl LiveMap {
     pub fn new(doc: &Document, space: u32) -> LiveMap {
         let ids = seed_ids(doc);
         let tables = doc.body.iter().zip(ids).filter(|(b, _)| b.as_table().is_some()).map(|(_, id)| id).collect();
-        LiveMap { space, next: 0, tables, stale: false, removed: Bounded::default(), moved: Bounded::default(), recovered: Bounded::default() }
+        LiveMap { space, next: 0, tables, removed: Bounded::default(), moved: Bounded::default(), recovered: Bounded::default() }
     }
 
-    /// Mint new ids in `space` from now on. An edit held back for want of a space is sent by the
-    /// next [`LiveMap::local_updates`]; [`LiveMap::grant`] sends it at once.
+    /// Mint new ids in `space` from now on.
     pub fn set_space(&mut self, space: u32) {
         if space != self.space {
             self.space = space;
@@ -211,31 +234,25 @@ impl LiveMap {
         }
     }
 
-    /// The relay granted `space` (`live` already has it as its client): send what the session
-    /// `doc` holds that the replica does not, if edits came before the space did.
-    pub fn grant(&mut self, live: &mut LiveDoc, doc: &Document, space: u32) -> Result<LocalEdit, MapError> {
+    /// The relay granted `space` (`live` already has it as its client). Edits made before
+    /// were refused, so there is nothing to send. Returns whether the session's `doc` and the
+    /// replica hold the same body, a check made in debug builds only (release says `true`);
+    /// a `false` is logged and means the app let an edit through without putting it back.
+    pub fn grant(&mut self, live: &LiveDoc, doc: &Document, space: u32) -> bool {
         self.set_space(space);
-        if !self.stale {
-            return Ok(LocalEdit::default());
+        if !cfg!(debug_assertions) {
+            return true;
         }
-        self.resync(live, doc, "live.resync")
-    }
-
-    /// Whether an edit is waiting for a space.
-    pub fn behind(&self) -> bool {
-        self.stale
-    }
-
-    /// Diff the replica's whole content against `doc`.
-    fn resync(&mut self, live: &mut LiveDoc, doc: &Document, command: &str) -> Result<LocalEdit, MapError> {
         let mut base = doc.clone();
         base.body.clear();
-        self.tables.clear();
+        let mut probe = LiveMap { tables: Vec::new(), ..self.clone() };
         let all: Vec<BlockChange> = live.order().into_iter().enumerate().map(|(at, id)| BlockChange::Inserted { at, id }).collect();
-        self.apply_changes(&mut base, live, &all);
-        let out = self.diff(live, &base, doc, command)?;
-        self.stale = false;
-        Ok(out)
+        probe.apply_changes(&mut base, live, &all);
+        let same = base.body.len() == doc.body.len() && base.body.iter().zip(&doc.body).all(|(x, y)| x == y);
+        if !same {
+            log::warn!("live: the session and the shared document differ at the space grant");
+        }
+        same
     }
 
     /// The updates that take `live` from `before` to `after`: one reported command, `command`
@@ -251,21 +268,14 @@ impl LiveMap {
     ///
     /// `live` must hold what `before` holds: the ids of the last edit written back, every remote
     /// change applied. An edit that changes what is not shared is refused with
-    /// [`MapError::NotShareable`]; one without a space with [`MapError::NoSpace`], and sent later.
+    /// [`MapError::NotShareable`], one made without a space with [`MapError::NoSpace`]; either
+    /// way nothing is sent and the caller puts `before` back.
     pub fn local_updates(&mut self, live: &mut LiveDoc, before: &Document, after: &Document, command: &str) -> Result<LocalEdit, MapError> {
-        if self.stale {
-            if self.space == 0 {
-                return Err(MapError::NoSpace);
-            }
-            return self.resync(live, after, command);
-        }
-        if local::same_body(before, after) && local::same_outside_body(before, after) {
+        if local::same_body(before, after) && local::outside_body_change(before, after).is_none() {
             return Ok(LocalEdit::default());
         }
         if self.space == 0 {
-            local::check_shareable(before, after, command)?;
-            self.stale = true;
-            return Err(MapError::NoSpace);
+            return Err(MapError::NoSpace { command: command.to_owned() });
         }
         self.diff(live, before, after, command)
     }
