@@ -559,6 +559,13 @@ impl<H: Hub> LiveEditing<H> {
             Work::SeedWanted { .. } => log::debug!("live: the shared document was seeded at the start"),
             Work::Command { command, .. } => log::warn!("live: ignoring the locked command {command} from another editor"),
             Work::Frame { .. } => {}
+            // The relay refused the ticket or the protocol and closed the link, and the hub has
+            // stopped reconnecting until the host gives it a new ticket (`Hub::set_token`
+            // through `live().hub_mut()`). Refused until a later join is granted a space.
+            Work::ConnectionRefused { code, reason } => {
+                log::warn!("live: the relay refused the connection ({code})");
+                self.refused = Some(reason);
+            }
         }
     }
 

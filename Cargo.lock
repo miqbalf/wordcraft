@@ -1138,7 +1138,7 @@ source = "git+https://github.com/storytold/craft-libs?rev=93dac78c93a7f1fd66e202
 [[package]]
 name = "craft-collab"
 version = "0.1.0"
-source = "git+https://github.com/miqbalf/collab-craft?rev=671d662#671d6627cd8c7912bb6e1427b4d96d9d7c0df1af"
+source = "git+https://github.com/miqbalf/collab-craft?rev=fa5012b#fa5012bd096c0f90e55c28613defc8b3bfc900ef"
 dependencies = [
  "base64 0.23.1",
  "log",
