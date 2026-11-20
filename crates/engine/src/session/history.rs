@@ -182,6 +182,10 @@ impl Session {
     /// the redo snapshot, replaces the body identity, refreshes equation editing and touches layout.
     pub fn undo(&mut self) -> bool {
         self.typing_open = false;
+        // While live, the co-editing layer owns undo.
+        if let Some(undone) = self.run_live_undo(false) {
+            return undone;
+        }
         // Undoing the automatic capitalisation's own step makes its word an exception; any
         // other Undo forgets the capital.
         let steps = self.history.len() as u64 + self.undo_evicted;
@@ -214,6 +218,9 @@ impl Session {
     /// refreshing equation editing and touching layout.
     pub fn redo(&mut self) -> bool {
         self.typing_open = false;
+        if let Some(redone) = self.run_live_undo(true) {
+            return redone;
+        }
         let Some(u) = self.redo.pop().map(Arc::unwrap_or_clone) else { return false };
         let cur = Undo {
             label: u.label.clone(),

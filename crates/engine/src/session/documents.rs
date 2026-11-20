@@ -293,6 +293,10 @@ impl Session {
             others: _,
             order: _,
             untitled_count: _,
+            // The live co-editing layer's hooks belong to the session, not a document or a
+            // snapshot.
+            observer: _,
+            live_undo: _,
             #[cfg(not(target_arch = "wasm32"))]
                 recovery: _,
         } = self;

@@ -16,4 +16,5 @@ mod rtf_sections;
 mod safe_save;
 mod three_column_headers;
 
+mod live_hooks;
 mod ref_paragraph_numbers;

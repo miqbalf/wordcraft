@@ -818,3 +818,31 @@ fn missing_pictures_are_capped_deduplicated_and_not_content() {
     assert!(!serde_json::to_string(&d).unwrap().contains("p0"));
     assert_eq!(MissingPictureReason::ExternalTarget.label(), "external target");
 }
+
+/// A paragraph's collaboration id is identity, not content: it survives the
+/// native snapshot, is never written when the paragraph was never shared, does
+/// not make two otherwise identical paragraphs unequal, and a split tail starts
+/// unshared.
+#[test]
+fn a_paragraphs_shared_id_is_not_content() {
+    let mut d = Document::from_text("First\nSecond\n");
+    let path = d.para_paths(StoryRef::Body)[0].clone();
+    // Minted by the collaboration layer: (author tag << 32) | counter.
+    d.para_mut(StoryRef::Body, &path).expect("a paragraph").pid = (0x9f9f9f << 32) | 7;
+
+    let json = serde_json::to_string(&d).expect("the native snapshot serializes");
+    let back: Document = serde_json::from_str(&json).expect("and reads back");
+    assert_eq!(back.para(StoryRef::Body, &path).expect("still there").pid, (0x9f9f9f << 32) | 7);
+
+    let plain = Document::from_text("Unshared\n");
+    let plain_json = serde_json::to_string(&plain).expect("serializes");
+    assert!(!plain_json.contains("\"pid\""), "an unshared paragraph carries no id in the snapshot");
+
+    let mut a = Paragraph::with_text("Same", CharProps::default());
+    let b = Paragraph::with_text("Same", CharProps::default());
+    a.pid = 42;
+    assert_eq!(a, b);
+
+    let tail = a.split_off(2).expect("split inside the text");
+    assert_ne!(a.pid, tail.pid, "a split tail does not inherit the head's id");
+}

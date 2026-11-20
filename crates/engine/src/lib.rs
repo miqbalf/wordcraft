@@ -37,8 +37,8 @@ pub use keymap::KeyMap;
 pub use locale::{set_bookmark_error, set_reference_error};
 pub use ribbon::RibbonLayout;
 pub use session::{
-    CellRange, ColumnBlock, DocInfo, DocState, EditSnapshot, FindState, MathEdit, Prefs, Selection, Session, StylesPaneDock, UNDO_LIST_MAX,
-    ViewState, WindowView, blank_document, next_math_session, set_system_locale,
+    CellRange, ColumnBlock, DocInfo, DocState, EditObserver, EditSnapshot, FindState, MathEdit, Prefs, Selection, Session, StylesPaneDock,
+    UNDO_LIST_MAX, ViewState, WindowView, blank_document, next_math_session, set_system_locale,
 };
 /// The outcome a command reports for IME receipt classification.
 ///

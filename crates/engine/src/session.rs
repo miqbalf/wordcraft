@@ -14,11 +14,13 @@ mod documents;
 mod views;
 pub use documents::{DocInfo, DocState};
 use documents::{document_id_mark, next_document_id, untitled_name};
+pub use live::EditObserver;
 pub use views::WindowView;
 mod history;
 mod ime;
 mod layout;
 mod lifecycle;
+mod live;
 mod query;
 mod run;
 mod snapshot;
@@ -255,6 +257,10 @@ pub struct Session {
     order: Vec<u64>,
     /// Untitled documents made so far, for the next one's name (`Document3`).
     untitled_count: u32,
+    /// The live co-editing layer's watcher of local edits ([`Session::set_observer`]).
+    observer: Option<Box<dyn EditObserver>>,
+    /// The live co-editing layer's Undo and Redo ([`Session::live_undo_hook`]).
+    live_undo: Option<live::LiveUndo>,
 }
 
 impl Session {

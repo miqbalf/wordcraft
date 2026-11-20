@@ -1,7 +1,7 @@
 use super::doc_state::{ColumnBlock, Selection};
 use super::ime_state::ImeCaretState;
 use super::snapshot_types::RunSnapshot;
-use super::{CharProps, CmdError, Document, Fragment, ImeEditOutcome, Pos, Session, StoryRef, Value, document_id_mark};
+use super::{CharProps, CmdError, Document, EditObserver, Fragment, ImeEditOutcome, Pos, Session, StoryRef, Value, document_id_mark};
 use crate::CommandSpec;
 
 struct SuccessContext<'a> {
@@ -18,6 +18,7 @@ struct SuccessContext<'a> {
     ime_caret_before: ImeCaretState,
     rev_before: u64,
     sel_before: &'a Selection,
+    observer: Option<&'a mut (dyn EditObserver + 'static)>,
 }
 
 struct ElsewhereContext {
@@ -70,12 +71,19 @@ impl Session {
         {
             crate::cmd::md_source::before_command(self, id, mutates)?;
         }
-        self.run_command(id, params)
+        // The observer is out of the session while the command runs, so the commands it runs
+        // inside it are not reported: the observer sees the top-level command once.
+        let mut observer = self.observer.take();
+        let result = self.run_command(id, params, observer.as_deref_mut());
+        if self.observer.is_none() {
+            self.observer = observer;
+        }
+        result
     }
 
     /// Dispatches `id` through the command registry with transactional rollback on failure,
     /// tracking history, undo checkpoints, and IME outcomes.
-    fn run_command(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
+    fn run_command(&mut self, id: &str, params: &Value, observer: Option<&mut (dyn EditObserver + 'static)>) -> Result<Value, CmdError> {
         // The document the command starts in, and the first id a document it opens can have.
         let home = self.document_id;
         let mark = document_id_mark();
@@ -249,6 +257,7 @@ impl Session {
                 ime_caret_before,
                 rev_before,
                 sel_before: &sel_before,
+                observer,
             }),
             Err(e) => {
                 self.ime_edit_outcome = ImeEditOutcome::default();
@@ -317,6 +326,7 @@ impl Session {
             ime_caret_before,
             rev_before,
             sel_before,
+            observer,
         } = context;
         let mut no_op = false;
         if spec.mutates {
@@ -428,6 +438,14 @@ impl Session {
             self.member = None;
         }
         self.note_typing(id, before_doc.as_ref().map(|b| &b.0), sel_before);
+        // The document the command started from is the one its undo step was taken from, so
+        // the observer costs no copy of its own.
+        if spec.mutates
+            && !no_op
+            && let (Some(o), Some((before, ..))) = (observer, before_doc)
+        {
+            o.edited(before, &self.doc, id);
+        }
     }
 
     /// The end of [`Session::run`] for a command that ended up in another document than it

@@ -135,6 +135,10 @@ impl Session {
             others: _,
             order: _,
             untitled_count: _,
+            // The live co-editing layer's hooks belong to the session, not a document or a
+            // snapshot.
+            observer: _,
+            live_undo: _,
             ime_body_epoch,
             // The IME revision and its caret token are process-global evidence, not document
             // state: a rollback must not reuse a revision.
