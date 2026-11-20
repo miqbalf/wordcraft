@@ -17,7 +17,14 @@ impl LiveMap {
     /// [crate documentation](crate)); those steps are in the changes and in
     /// [`Remote::updates`], which go to the relay.
     pub fn receive(&mut self, live: &mut LiveDoc, update: &[u8]) -> Result<Remote, MapError> {
-        let mut changes = live.apply(update)?;
+        let changes = live.apply(update)?;
+        Ok(self.received(live, changes))
+    }
+
+    /// [`LiveMap::receive`] for updates already merged into `live` (as `craft_collab::Live`
+    /// merges them and reports `Work::Doc`): `changes` is what they changed. Recovers and
+    /// forwards orphaned typing the same way.
+    pub fn received(&mut self, live: &mut LiveDoc, mut changes: Vec<BlockChange>) -> Remote {
         // Only blocks this peer removed or moved can be orphans; the order is read only then.
         let mut orphans: BTreeSet<u64> = changes
             .iter()
@@ -38,7 +45,7 @@ impl LiveMap {
                 self.recover(live, id, &mut changes, &mut updates);
             }
         }
-        Ok(Remote { changes, updates })
+        Remote { changes, updates }
     }
 
     /// Put tombstone `gone`'s text in a recovered paragraph, or bring the one made for it

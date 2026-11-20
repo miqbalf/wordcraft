@@ -1087,7 +1087,7 @@ source = "git+https://github.com/storytold/craft-libs?rev=93dac78c93a7f1fd66e202
 [[package]]
 name = "craft-collab"
 version = "0.1.0"
-source = "git+https://github.com/miqbalf/collab-craft?rev=d1d57e2#d1d57e272d97ecdf8043313ac8f7a705ab7409e8"
+source = "git+https://github.com/miqbalf/collab-craft?rev=751c48a#751c48a42d69e2a99653b220e7d955d03648779b"
 dependencies = [
  "base64 0.23.1",
  "log",
@@ -5980,7 +5980,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.52.0",

@@ -34,10 +34,15 @@
 //!    into the session with `session.apply_remote(|d| map.apply_changes(d, &live, &changes))`.
 //!    The updates `receive` returns (recovered and forwarded text) go to the relay too.
 //!
+//! # The session pump
+//!
+//! [`LiveEditing`] does all of the above over a `craft_collab::Live` link, once per frame, and
+//! tracks the live status, the other editors and their carets; see the [`session`] module.
+//!
 //! # Before the relay grants a space
 //!
 //! Without a client space no paragraph id can be minted, so the app takes no input until the
-//! space is granted (Task 8 blocks it). That is the rule; the backstop is that an edit reported
+//! space is granted ([`LiveEditing::editable`] says when). That is the rule; the backstop is that an edit reported
 //! anyway is refused with [`MapError::NoSpace`], nothing is held, and the caller puts `before`
 //! back like any other refusal. [`LiveMap::grant`] then only sets the space.
 //!
@@ -71,6 +76,7 @@ mod local;
 pub mod map;
 mod ops;
 mod remote;
+pub mod session;
 mod shareable;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -80,6 +86,7 @@ use wordcraft_doc::Document;
 use wordcraft_engine::{CmdError, Session};
 
 pub use map::{RECOVERED_STYLE, RECOVERED_STYLE_ID, assign_seed_pids, seed_blocks, seed_ids, write_pids};
+pub use session::{Access, LiveEditing, LiveFail, LiveStatus, Peer, SERVICE_UID, SaveEvent, Tap, document_from_state};
 pub use shareable::{SHAREABLE, is_shareable};
 
 /// How many removals and moves a peer remembers for recovering and forwarding text.
