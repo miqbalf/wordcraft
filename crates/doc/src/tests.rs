@@ -844,5 +844,60 @@ fn a_paragraphs_shared_id_is_not_content() {
     assert_eq!(a, b);
 
     let tail = a.split_off(2).expect("split inside the text");
-    assert_ne!(a.pid, tail.pid, "a split tail does not inherit the head's id");
+    assert_eq!(tail.pid, 0, "a split tail is a new paragraph, never shared yet");
+
+    // A snapshot written before the field existed (no `pid` key) reads as never shared.
+    let old = serde_json::to_string(&Paragraph::with_text("Old", CharProps::default())).expect("serializes");
+    let p: Paragraph = serde_json::from_str(&old).expect("an old snapshot reads");
+    assert_eq!(p.pid, 0);
+}
+
+/// The ids of every nonzero-shared paragraph in a document's body, in order.
+fn body_pids(d: &Document) -> Vec<u64> {
+    d.para_paths(StoryRef::Body).iter().filter_map(|p| d.para(StoryRef::Body, p)).map(|p| p.pid).collect()
+}
+
+fn shared(text: &str) -> Document {
+    let mut d = Document::from_text(text);
+    for (i, path) in d.para_paths(StoryRef::Body).into_iter().enumerate() {
+        d.para_mut(StoryRef::Body, &path).expect("a paragraph").pid = i as u64 + 1;
+    }
+    d
+}
+
+/// Pasted paragraphs are new ones: a paste of shared paragraphs (one or several) never brings
+/// their ids along, so no id appears twice.
+#[test]
+fn pasted_paragraphs_are_never_shared() {
+    for copied in ["One\nTwo", "One\nTwo\nThree"] {
+        let mut d = shared("Alpha\nBravo\n");
+        let mut frag = edit::Fragment::from_text(copied);
+        for (i, b) in frag.blocks.iter_mut().enumerate() {
+            if let Block::Para(p) = b {
+                // The ids of the paragraphs the copy was taken from.
+                p.pid = i as u64 + 1;
+            }
+        }
+        let at = Pos::new(StoryRef::Body, d.para_paths(StoryRef::Body)[1].clone(), 2);
+        d.insert_fragment(&at, &frag).expect("pasted");
+        let pids: Vec<u64> = body_pids(&d).into_iter().filter(|p| *p != 0).collect();
+        let mut unique = pids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(pids.len(), unique.len(), "no shared id twice after pasting {copied:?}: {pids:?}");
+        assert_eq!(pids, [1, 2, 3], "the document's own ids, each once, in order");
+    }
+}
+
+/// When an edit copies a shared paragraph, the copy loses the id and the paragraph that had it
+/// where it was keeps it.
+#[test]
+fn a_copied_shared_id_stays_with_the_original() {
+    let before = shared("Alpha\nBravo\n");
+    let mut d = before.clone();
+    // A copy of "Bravo" (id 2) goes in front of everything.
+    let copy = d.para(StoryRef::Body, &d.para_paths(StoryRef::Body)[1]).expect("Bravo").clone();
+    d.body.insert(0, Arc::new(Block::Para(copy)));
+    assert_eq!(d.unshare_duplicate_pids(&before), 1);
+    assert_eq!(body_pids(&d)[..3], [0, 1, 2], "the copy is unshared; Alpha and Bravo keep theirs");
 }

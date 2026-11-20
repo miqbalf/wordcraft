@@ -261,6 +261,9 @@ pub struct Session {
     observer: Option<Box<dyn EditObserver>>,
     /// The live co-editing layer's Undo and Redo ([`Session::live_undo_hook`]).
     live_undo: Option<live::LiveUndo>,
+    /// The document the live hooks are bound to ([`Session::set_observer`]): they act only
+    /// while it is the active one.
+    live_doc: Option<u64>,
 }
 
 impl Session {

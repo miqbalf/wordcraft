@@ -21,7 +21,10 @@ fn undo_to(s: &mut Session, v: &Value) -> CmdResult {
     if n == 0 {
         return Err(CmdError::Params("`count` must be 1 or more".into()));
     }
-    let n = usize::try_from(n).unwrap_or(usize::MAX).min(s.undo_depth());
+    // While the live undo hook owns undo, it decides how far back it can go; the count is
+    // still bounded like the session's own history.
+    let most = if s.live_undo_active() { crate::doc_state::MAX_UNDO } else { s.undo_depth() };
+    let n = usize::try_from(n).unwrap_or(usize::MAX).min(most);
     if s.step_lifts_protection(false) {
         return Err(CmdError::Disabled("edit.undoTo: use Stop Protection to lift the document's protection".into()));
     }

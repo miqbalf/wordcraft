@@ -18,7 +18,6 @@ struct SuccessContext<'a> {
     ime_caret_before: ImeCaretState,
     rev_before: u64,
     sel_before: &'a Selection,
-    observer: Option<&'a mut (dyn EditObserver + 'static)>,
 }
 
 struct ElsewhereContext {
@@ -66,24 +65,55 @@ impl Session {
     /// control channel). Mutating commands are undoable; a failed command leaves the document as
     /// it was; a panic inside a command becomes an error.
     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
+        match self.observer.take() {
+            Some(observer) => self.run_observed(id, params, observer),
+            None => self.run_unobserved(id, params),
+        }
+    }
+
+    fn run_unobserved(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
         if self.md_source.is_some()
             && let Some(mutates) = self.registry.get(id).map(|spec| spec.mutates)
         {
             crate::cmd::md_source::before_command(self, id, mutates)?;
         }
-        // The observer is out of the session while the command runs, so the commands it runs
-        // inside it are not reported: the observer sees the top-level command once.
-        let mut observer = self.observer.take();
-        let result = self.run_command(id, params, observer.as_deref_mut());
-        if self.observer.is_none() {
-            self.observer = observer;
+        self.run_command(id, params)
+    }
+
+    /// The outermost [`Session::run`] while an [`EditObserver`] is installed. The observer is
+    /// out of the session while the command runs, so the commands run inside it (Repeat, a
+    /// macro's steps…) are not reported: it hears once, when the content changed, whatever the
+    /// command is. `before` is a copy (a pointer per block) taken before anything ran, the
+    /// Markdown source view's sync included. The observer is put back even when the command
+    /// or the observer panics.
+    fn run_observed(&mut self, id: &str, params: &Value, mut observer: Box<dyn EditObserver>) -> Result<Value, CmdError> {
+        let home = self.document_id;
+        let before = (self.live_doc == Some(home)).then(|| self.doc.clone());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_unobserved(id, params)));
+        if let Some(before) = &before
+            && self.document_id == home
+            && !before.same_content(&self.doc)
+        {
+            // A copy (an edit that cloned a paragraph) is a new paragraph, not a second one
+            // with the same identity.
+            self.doc.unshare_duplicate_pids(before);
+            let after = &self.doc;
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.edited(before, after, id))).is_err() {
+                log::warn!("edit observer panicked on {id}");
+            }
         }
-        result
+        if self.observer.is_none() {
+            self.observer = Some(observer);
+        }
+        match result {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        }
     }
 
     /// Dispatches `id` through the command registry with transactional rollback on failure,
     /// tracking history, undo checkpoints, and IME outcomes.
-    fn run_command(&mut self, id: &str, params: &Value, observer: Option<&mut (dyn EditObserver + 'static)>) -> Result<Value, CmdError> {
+    fn run_command(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
         // The document the command starts in, and the first id a document it opens can have.
         let home = self.document_id;
         let mark = document_id_mark();
@@ -257,7 +287,6 @@ impl Session {
                 ime_caret_before,
                 rev_before,
                 sel_before: &sel_before,
-                observer,
             }),
             Err(e) => {
                 self.ime_edit_outcome = ImeEditOutcome::default();
@@ -326,7 +355,6 @@ impl Session {
             ime_caret_before,
             rev_before,
             sel_before,
-            observer,
         } = context;
         let mut no_op = false;
         if spec.mutates {
@@ -438,14 +466,6 @@ impl Session {
             self.member = None;
         }
         self.note_typing(id, before_doc.as_ref().map(|b| &b.0), sel_before);
-        // The document the command started from is the one its undo step was taken from, so
-        // the observer costs no copy of its own.
-        if spec.mutates
-            && !no_op
-            && let (Some(o), Some((before, ..))) = (observer, before_doc)
-        {
-            o.edited(before, &self.doc, id);
-        }
     }
 
     /// The end of [`Session::run`] for a command that ended up in another document than it

@@ -79,6 +79,7 @@ mod document;
 mod error;
 mod missing;
 mod parts;
+mod pid;
 mod position;
 mod settings;
 mod text_walk;

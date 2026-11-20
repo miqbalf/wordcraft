@@ -179,6 +179,7 @@ impl Session {
             untitled_count: 1,
             observer: None,
             live_undo: None,
+            live_doc: None,
         }
     }
 }

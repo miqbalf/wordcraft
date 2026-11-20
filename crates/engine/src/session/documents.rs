@@ -297,6 +297,7 @@ impl Session {
             // snapshot.
             observer: _,
             live_undo: _,
+            live_doc: _,
             #[cfg(not(target_arch = "wasm32"))]
                 recovery: _,
         } = self;

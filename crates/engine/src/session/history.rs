@@ -118,12 +118,15 @@ impl Session {
         self.typing_open = false;
     }
 
+    /// Whether there is something to undo; always while the live undo hook owns undo
+    /// ([`Session::live_undo_hook`]), which decides for itself.
     pub fn can_undo(&self) -> bool {
-        !self.history.is_empty()
+        !self.history.is_empty() || self.live_undo_active()
     }
 
+    /// Whether there is something to redo; always while the live undo hook owns undo.
     pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
+        !self.redo.is_empty() || self.live_undo_active()
     }
 
     pub fn undo_label(&self) -> Option<&str> {
@@ -210,6 +213,10 @@ impl Session {
 
     /// Would Undo (or Redo) take the document's protection away? Only Stop Protection lifts it.
     pub fn step_lifts_protection(&self, redo: bool) -> bool {
+        // The live layer's undo does not put back a snapshot of the session's.
+        if self.live_undo_active() {
+            return false;
+        }
         let next = if redo { self.redo.last() } else { self.history.last() };
         next.is_some_and(|u| crate::cmd::protect::protection_lifted(&self.doc, &u.doc))
     }

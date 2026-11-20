@@ -17,7 +17,7 @@ pub trait EditObserver: Send {
 }
 
 /// The live undo hook: called with `redo` false for Undo and true for Redo.
-pub(crate) type LiveUndo = Box<dyn FnMut(bool) -> bool>;
+pub(crate) type LiveUndo = Box<dyn FnMut(bool) -> bool + Send>;
 
 /// Where a selection end is, by what a peer's edit keeps: the paragraph's shared id, its
 /// index among the story's paragraphs and the offset in characters.
@@ -63,36 +63,63 @@ impl Anchor {
 }
 
 impl Session {
+    /// Bind the live hooks to the active document, or unbind them once none is installed.
+    fn bind_live(&mut self) {
+        self.live_doc = (self.observer.is_some() || self.live_undo.is_some()).then_some(self.document_id);
+    }
+
+    /// Whether the live hooks are bound to the active document.
+    fn live_here(&self) -> bool {
+        self.live_doc == Some(self.document_id)
+    }
+
     /// Install (or with `None`, remove) the observer that sees every local edit
-    /// ([`EditObserver`]). Without one, a command pays one branch for it.
+    /// ([`EditObserver`]). It is bound to the active document: while another document is
+    /// active, or after [`Session::set_document`] replaced this one, it hears nothing. Without
+    /// one, a command pays one branch for it.
     pub fn set_observer(&mut self, o: Option<Box<dyn EditObserver>>) {
         self.observer = o;
+        self.bind_live();
     }
 
-    /// Install (or remove) the live undo hook. While it is set, Undo and Redo call it (with
+    /// Install (or remove) the live undo hook, bound to the active document like the observer.
+    /// While it is set and that document is active, Undo, Redo and Undo Actions call it (with
     /// `true` for Redo) instead of putting back the session's own snapshots: the live layer
     /// owns undo. What it returns is whether it undid something; either way the snapshot undo
-    /// does not run.
-    pub fn live_undo_hook(&mut self, h: Option<Box<dyn FnMut(bool) -> bool>>) {
+    /// does not run. Undo and Redo are then always enabled, and the snapshot stack's depth and
+    /// protection check do not apply: the hook decides.
+    pub fn live_undo_hook(&mut self, h: Option<Box<dyn FnMut(bool) -> bool + Send>>) {
         self.live_undo = h;
+        self.bind_live();
     }
 
-    /// Whether the live undo hook took this Undo (or Redo): `Some` with its answer when set.
+    /// Whether the live undo hook owns Undo and Redo now.
+    pub(crate) fn live_undo_active(&self) -> bool {
+        self.live_undo.is_some() && self.live_here()
+    }
+
+    /// Whether the live undo hook took this Undo (or Redo): `Some` with its answer when it owns
+    /// undo now.
     pub(super) fn run_live_undo(&mut self, redo: bool) -> Option<bool> {
+        if !self.live_here() {
+            return None;
+        }
         self.live_undo.as_mut().map(|h| h(redo))
     }
 
-    /// Apply a peer's edit to the document. It adds no undo step and is not reported to the
-    /// observer. The selection stays on the same characters of the same shared paragraphs
-    /// (see [`Paragraph::pid`](wordcraft_doc::Paragraph::pid)); a selection end whose
-    /// paragraph is gone goes to the start of the paragraph now at its index. The layout
-    /// follows on the next query, as after a command. A remote edit alone does not set
-    /// [`Session::dirty`]: the document has no unsaved local changes because of it.
-    ///
-    /// `f` should change paragraphs through their own methods (or call
-    /// [`Paragraph::touch`](wordcraft_doc::Paragraph::touch)) so the layout cache sees them. If
-    /// `f` panics the document is left as it was and the panic is returned as an error.
+    /// Apply a peer's edit to the document the live hooks are bound to (an error while another
+    /// document is active). It is not reported to the observer, and it adds no undo step: it
+    /// clears the session's own undo and redo snapshots instead, since putting one of them back
+    /// would erase the peer's edit. The selection stays on the same characters of the same
+    /// shared paragraphs (see [`Paragraph::pid`](wordcraft_doc::Paragraph::pid)); a selection
+    /// end whose paragraph is gone goes to the start of the paragraph now at its index. Every
+    /// block `f` replaced has its paragraphs touched, so the layout follows on the next query.
+    /// A remote edit alone does not set [`Session::dirty`]. If `f` panics the document is left
+    /// as it was and the panic is returned as an error.
     pub fn apply_remote(&mut self, f: impl FnOnce(&mut Document)) -> Result<(), CmdError> {
+        if self.live_doc.is_some() && !self.live_here() {
+            return Err(CmdError::Disabled("remote edit: the shared document is not the active one".into()));
+        }
         let anchor = Anchor::of(&self.doc, &self.sel.anchor);
         let focus = Anchor::of(&self.doc, &self.sel.focus);
         // Cheap: the document's blocks are shared, so this copies a pointer per block.
@@ -103,6 +130,8 @@ impl Session {
             let msg = p.downcast_ref::<&str>().map(ToString::to_string).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
             return Err(CmdError::Failed(format!("remote edit panicked: {msg}")));
         }
+        self.doc.touch_changed_since(&before);
+        drop(before);
         self.doc.ensure_nonempty();
         self.sel = Selection { anchor: anchor.find(&self.doc), focus: focus.find(&self.doc) };
         // Selections that name places the peer's edit may have moved are dropped.
@@ -110,9 +139,8 @@ impl Session {
         self.widened = None;
         self.also_selected.clear();
         self.member = None;
-        // The next local keystroke starts its own undo step rather than one that spans the
-        // peer's edit.
-        self.typing_open = false;
+        // An old snapshot put back by Undo or Redo would erase the peer's edit.
+        self.reset_history();
         self.clamp_selection();
         let dirty = self.dirty;
         self.touch();

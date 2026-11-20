@@ -139,6 +139,7 @@ impl Session {
             // snapshot.
             observer: _,
             live_undo: _,
+            live_doc: _,
             ime_body_epoch,
             // The IME revision and its caret token are process-global evidence, not document
             // state: a rollback must not reuse a revision.

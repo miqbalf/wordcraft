@@ -1512,7 +1512,16 @@ impl Document {
         if self.para_at(pos).is_none() {
             return Err(DocError::BadPath(pos.path.to_string()));
         }
+        // What is pasted is new content: it is not the shared paragraphs it was copied from.
+        for b in &mut blocks {
+            crate::pid::unshare_block(b);
+        }
         let mut parts = frag.parts.clone();
+        for part in parts.values_mut() {
+            for b in &mut part.blocks {
+                crate::pid::unshare_shared(b);
+            }
+        }
         if !media_remap.is_empty() {
             for b in &mut blocks {
                 remap_media_block(b, &media_remap);
