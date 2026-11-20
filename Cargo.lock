@@ -253,6 +253,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84a22b5d51209f6de83d37a0b33d320acb8da88823e42a94c075140708f032a5"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1076,6 +1085,19 @@ version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=93dac78c93a7f1fd66e2022edeb089233b1dc45a#93dac78c93a7f1fd66e2022edeb089233b1dc45a"
 
 [[package]]
+name = "craft-collab"
+version = "0.1.0"
+source = "git+https://github.com/miqbalf/collab-craft?rev=c9f65ba#c9f65ba945b662475c337be5153909fd7d4c3b39"
+dependencies = [
+ "base64 0.23.1",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "yrs",
+]
+
+[[package]]
 name = "craft-dds"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=93dac78c93a7f1fd66e2022edeb089233b1dc45a#93dac78c93a7f1fd66e2022edeb089233b1dc45a"
@@ -1696,6 +1718,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "dashmap"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2157,6 +2193,9 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+dependencies = [
+ "getrandom 0.4.3",
+]
 
 [[package]]
 name = "fax"
@@ -2726,6 +2765,12 @@ dependencies = [
  "read-fonts 0.43.3",
  "smallvec",
 ]
+
+[[package]]
+name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
@@ -5651,6 +5696,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "smallstr"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "862077b1e764f04c251fe82a2ef562fd78d7cadaeb072ca7c2bcaf7217b1ff3b"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7552,6 +7606,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wordcraft-live"
+version = "0.18.1"
+dependencies = [
+ "craft-collab",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "wordcraft-doc",
+ "wordcraft-engine",
+]
+
+[[package]]
 name = "wordcraft-mcp"
 version = "0.18.1"
 dependencies = [
@@ -7855,6 +7922,24 @@ dependencies = [
  "quote",
  "syn 3.0.6",
  "synstructure",
+]
+
+[[package]]
+name = "yrs"
+version = "0.28.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66d201de14c6b37b866118d07877abb471f07959c2c6a5cfb0f94235944804d3"
+dependencies = [
+ "arc-swap",
+ "async-lock",
+ "async-trait",
+ "dashmap",
+ "fastrand",
+ "serde",
+ "serde_json",
+ "smallstr",
+ "smallvec",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

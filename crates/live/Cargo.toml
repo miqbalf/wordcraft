@@ -1,0 +1,18 @@
+[package]
+name = "wordcraft-live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WordCraft live co-editing: maps a Document's body to and from craft-collab's shared block document, so sessions editing the same file converge"
+
+[lints]
+workspace = true
+
+[dependencies]
+craft-collab = { workspace = true }
+wordcraft-doc = { workspace = true }
+wordcraft-engine = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

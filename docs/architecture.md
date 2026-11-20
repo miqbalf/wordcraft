@@ -32,6 +32,7 @@ crate name links to its source tree.
 | L4 | [`engine`](../crates/engine/src) | 72,851 | `Session` and editing state; command registry in `cmd/`; file dispatch in `io`; catalog, keymap, recovery, ribbon model, speech and view state |
 | L5 | [`mcp`](../crates/mcp/src) | 1,822 | MCP server exposing commands as tools; headless or bridged to the running app |
 | L5 | [`zotero`](../crates/zotero/src) | 2,372 | Zotero word-processor integration protocol answered against a `Session` |
+| L5 | [`live`](../crates/live/src) | 930 | Live co-editing: the body mapped to and from craft-collab's shared block document (yrs), local edits diffed into updates, remote updates applied, text typed into a removed paragraph recovered |
 | L6 | [`ui-egui`](../crates/ui-egui/src) | 81,759 | Front end: ribbon, keytips, mini-toolbar, Backstage, canvas, rulers, panes, dialogs, i18n, themes, control channel and headless `ui_shot` example |
 | apps | [`wordcraft`](../apps/wordcraft/src) | 3,740 | Desktop app (eframe + wgpu; logging, window geometry and file associations) |
 | apps | [`wordcraft-cli`](../apps/wordcraft-cli/src) | 1,901 | `convert`, `text`, `inspect`, `run`, `commands`, `parity`, `mcp` and `zotero` |
