@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -88,12 +88,12 @@ const CONFLICT_GIVE_UP_MS: u64 = 120_000;
 const CONFLICT_RETRY_MS: [u64; 3] = [5_000, 30_000, 120_000];
 /// Why saving stops when the server refuses this session (403).
 const FORBIDDEN_WHY: &str = "the server no longer lets this session write the file";
-/// Between first-connection attempts, and the least wait between two fresh-ticket relinks.
+/// Between first-connection attempts.
 const RELINK_MS: u64 = 5_000;
-/// The hub reconnects on its own, but always with the ticket it was given. Once that ticket is
-/// this old (it expires at [`TICKET_SECS`]) and the link has been down [`RELINK_MS`], the hub is
-/// replaced by one connected with a fresh ticket, since its own retries can no longer get in.
-const HUB_TICKET_STALE_SECS: i64 = TICKET_SECS - 60;
+/// While the relay refuses the room's connection, a fresh ticket is handed to the hub at most
+/// this often. `LiveEditing` reports a refusal without its code; a refused protocol (which a
+/// new ticket cannot fix) so costs one connection attempt a minute.
+const REFUSED_RETRY_MS: u64 = 60_000;
 /// The first connection to the relay is given up after this long.
 const CONNECT_GIVE_UP_MS: u64 = 120_000;
 const TICK: Duration = Duration::from_millis(100);
@@ -355,6 +355,7 @@ pub struct FileGot {
 }
 
 /// One room's file and room calls, signed with the newest grant token.
+#[derive(Clone)]
 pub struct RoomFiles {
     nc: Arc<Nextcloud>,
     room: String,
@@ -544,7 +545,7 @@ pub struct Room<H: Hub> {
     retry_at: u64,
     /// Saving stopped for good, and why.
     stopped: Option<String>,
-    next_heartbeat: u64,
+    beat: Beat,
     opened_at: u64,
     seen_editor: bool,
     empty_since: Option<u64>,
@@ -562,6 +563,7 @@ impl<H: Hub> Room<H> {
         let doc_id = format!("doc:{}", files.room());
         let mut session = Session::new(Document::new());
         let mut le = LiveEditing::start(hub, &doc_id, &got.bytes, &got.name, &mut session).map_err(|e| OpenError::Live(e.to_string()))?;
+        let beat = Beat::start(&files, Duration::from_millis(HEARTBEAT_MS))?;
         let c = clock.clone();
         le.set_clock(Box::new(move || c.now_ms() as f64));
         let now = clock.now_ms();
@@ -583,11 +585,23 @@ impl<H: Hub> Room<H> {
             inflight: None,
             retry_at: 0,
             stopped: None,
-            next_heartbeat: now + HEARTBEAT_MS,
+            beat,
             opened_at: now,
             seen_editor: false,
             empty_since: None,
         })
+    }
+
+    /// Heartbeat the room every `every` from now on (its own task, [`HEARTBEAT_MS`] unless
+    /// set here).
+    pub fn heartbeat_every(&mut self, every: Duration) -> Result<(), OpenError> {
+        self.beat = Beat::start(&self.files, every)?;
+        Ok(())
+    }
+
+    /// The live session's status.
+    pub fn status(&self) -> &LiveStatus {
+        self.le.status()
     }
 
     /// The ETag of the file as last read or written.
@@ -622,17 +636,10 @@ impl<H: Hub> Room<H> {
         }
         self.answers(now).await;
 
-        if now >= self.next_heartbeat {
-            self.next_heartbeat = now + HEARTBEAT_MS;
-            match self.files.heartbeat().await {
-                Ok(()) => {}
-                Err(FileError::Forbidden) => {
-                    say(&self.doc_id, "the app ended this room's grant; leaving");
-                    self.tell("This live session was ended on the server. Changes from now on are not saved; reopen the file.");
-                    return Flow::Done;
-                }
-                Err(e) => say(&self.doc_id, format_args!("heartbeat failed: {e}")),
-            }
+        if self.beat.refused() {
+            say(&self.doc_id, "the app ended this room's grant; leaving");
+            self.tell("This live session was ended on the server. Changes from now on are not saved; reopen the file.");
+            return Flow::Done;
         }
 
         if editors.is_empty() {
@@ -652,6 +659,9 @@ impl<H: Hub> Room<H> {
             if settled || d >= EMPTY_GRACE_MS + CLOSE_GIVE_UP_MS {
                 if !settled {
                     say(&self.doc_id, "the last save did not get through; closing anyway");
+                    if !self.untold_copies.is_empty() {
+                        say(&self.doc_id, format_args!("outside versions copied aside but never announced: {}", self.untold_copies.join(", ")));
+                    }
                 }
                 if let Err(e) = self.files.close().await {
                     say(&self.doc_id, format_args!("closing the room failed: {e}"));
@@ -835,6 +845,50 @@ impl<H: Hub> Room<H> {
         if let Err(e) = self.le.hub_mut().send(msg) {
             say(&self.doc_id, format_args!("a notice did not go out: {e}"));
         }
+    }
+}
+
+/// A room's heartbeat to the app, on its own task, so a step that waits long (a conflict's
+/// copies and writes, a slow server) never makes the app take the room for stale. Ends, and
+/// says so, when the app refuses it (the grant is over). Stops when dropped.
+struct Beat {
+    refused: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Beat {
+    fn start(files: &RoomFiles, every: Duration) -> Result<Beat, OpenError> {
+        let rt = tokio::runtime::Handle::try_current().map_err(|e| OpenError::Live(format!("no async runtime for the heartbeat: {e}")))?;
+        let refused = Arc::new(AtomicBool::new(false));
+        let flag = refused.clone();
+        let files = files.clone();
+        let task = rt.spawn(async move {
+            let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                match files.heartbeat().await {
+                    Ok(()) => {}
+                    Err(FileError::Forbidden) => {
+                        flag.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(e) => say(files.room(), format_args!("heartbeat failed: {e}")),
+                }
+            }
+        });
+        Ok(Beat { refused, task })
+    }
+
+    /// Whether the app refused a heartbeat: the grant is over.
+    fn refused(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Beat {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -1026,12 +1080,62 @@ impl Ticket {
         Ok(Ticket { ticket: service_ticket(secret, room, now)?, minted: now })
     }
 
-    fn refresh(&mut self, secret: &Secret, room: &str, clock: &dyn Clock) {
-        if clock.unix_ms() / 1000 - self.minted >= TICKET_REFRESH_SECS {
-            match Ticket::fresh(secret, room, clock) {
-                Ok(t) => *self = t,
-                Err(e) => say(room, format_args!("ticket: {e}")),
+    /// Re-mint once the ticket is [`TICKET_REFRESH_SECS`] old: whether it was.
+    fn refresh(&mut self, secret: &Secret, room: &str, clock: &dyn Clock) -> bool {
+        if clock.unix_ms() / 1000 - self.minted < TICKET_REFRESH_SECS {
+            return false;
+        }
+        self.remint(secret, room, clock)
+    }
+
+    fn remint(&mut self, secret: &Secret, room: &str, clock: &dyn Clock) -> bool {
+        match Ticket::fresh(secret, room, clock) {
+            Ok(t) => {
+                *self = t;
+                true
             }
+            Err(e) => {
+                say(room, format_args!("ticket: {e}"));
+                false
+            }
+        }
+    }
+}
+
+/// Keeps a room's hub on a valid service ticket: every re-mint (each [`TICKET_REFRESH_SECS`])
+/// goes to the hub with [`Hub::set_token`], for its next reconnect; and while the relay refuses
+/// the connection (an expired or bad ticket), a freshly minted one does, at most every
+/// [`REFUSED_RETRY_MS`], which also restarts a hub the refusal stopped.
+pub struct HubTicket {
+    ticket: Ticket,
+    refused_try: Option<u64>,
+}
+
+impl HubTicket {
+    pub fn new(relay_secret: &Secret, room: &str, clock: &dyn Clock) -> Result<HubTicket, String> {
+        Ok(HubTicket { ticket: Ticket::fresh(relay_secret, room, clock)?, refused_try: None })
+    }
+
+    /// The ticket to connect with now.
+    pub fn current(&self) -> &str {
+        &self.ticket.ticket
+    }
+
+    /// After a step: re-mint when due, and hand `hub` the ticket it should reconnect with.
+    pub fn keep<H: Hub>(&mut self, hub: &mut H, status: &LiveStatus, relay_secret: &Secret, room: &str, clock: &dyn Clock) {
+        let mut renewed = self.ticket.refresh(relay_secret, room, clock);
+        if matches!(status, LiveStatus::Refused(_)) {
+            let now = clock.now_ms();
+            if self.refused_try.is_none_or(|t| now.saturating_sub(t) >= REFUSED_RETRY_MS) {
+                self.refused_try = Some(now);
+                say(room, "the relay refused the connection; reconnecting with a fresh ticket");
+                renewed |= self.ticket.remint(relay_secret, room, clock);
+            }
+        } else {
+            self.refused_try = None;
+        }
+        if renewed {
+            hub.set_token(self.ticket.ticket.clone());
         }
     }
 }
@@ -1054,15 +1158,15 @@ where
     if let Err(e) = files.heartbeat().await {
         return say(&room, format_args!("not served: the room did not take a heartbeat ({e})"));
     }
-    let mut ticket = match Ticket::fresh(relay_secret, &room, clock.as_ref()) {
+    let mut ticket = match HubTicket::new(relay_secret, &room, clock.as_ref()) {
         Ok(t) => t,
         Err(e) => return say(&room, format_args!("ticket: {e}")),
     };
     let start = clock.now_ms();
     let mut next_heartbeat = start + HEARTBEAT_MS;
     let hub = loop {
-        ticket.refresh(relay_secret, &room, clock.as_ref());
-        match tokio::time::timeout(CONNECT_TIMEOUT, connect(ticket.ticket.clone())).await {
+        ticket.ticket.refresh(relay_secret, &room, clock.as_ref());
+        match tokio::time::timeout(CONNECT_TIMEOUT, connect(ticket.current().to_owned())).await {
             Ok(Ok(h)) => break h,
             Ok(Err(e)) => say(&room, format_args!("relay connection failed: {e}")),
             Err(_) => say(&room, "relay connection timed out"),
@@ -1085,36 +1189,12 @@ where
         Ok(w) => w,
         Err(e) => return say(&room, e),
     };
-    // When the hub's own ticket was minted.
-    let mut hub_ticket = ticket.minted;
-    let mut down_since: Option<u64> = None;
-    let mut next_try = 0;
     loop {
         if w.step().await == Flow::Done {
             return;
         }
-        ticket.refresh(relay_secret, &room, clock.as_ref());
-        let now = clock.now_ms();
-        if w.hub().connected() {
-            down_since = None;
-        } else {
-            let down = now.saturating_sub(*down_since.get_or_insert(now));
-            let expired = clock.unix_ms() / 1000 - hub_ticket >= HUB_TICKET_STALE_SECS;
-            // A short drop is the hub's own to recover (craft-collab reconnects with backoff and
-            // resends what was not confirmed); only a link it cannot get back in on is replaced.
-            if expired && down >= RELINK_MS && now >= next_try {
-                next_try = now + RELINK_MS;
-                match tokio::time::timeout(CONNECT_TIMEOUT, connect(ticket.ticket.clone())).await {
-                    Ok(Ok(h)) => {
-                        *w.hub_mut() = h;
-                        hub_ticket = ticket.minted;
-                        down_since = None;
-                    }
-                    Ok(Err(e)) => say(&room, format_args!("relay connection failed: {e}")),
-                    Err(_) => say(&room, "relay connection timed out"),
-                }
-            }
-        }
+        let status = w.status().clone();
+        ticket.keep(w.hub_mut(), &status, relay_secret, &room, clock.as_ref());
         tokio::time::sleep(TICK).await;
     }
 }

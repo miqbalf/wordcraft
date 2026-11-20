@@ -25,7 +25,8 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use tokio::sync::watch;
 use wordcraft_cli::live_worker::{
-    Clock, Config, Flow, Grant, NOTICE_KIND, Nextcloud, QUIET_MS, Room, RoomFiles, Rooms, Secret, Spawn, listen, router, serve_grant, service_ticket,
+    Clock, Config, Flow, Grant, HubTicket, NOTICE_KIND, Nextcloud, QUIET_MS, Room, RoomFiles, Rooms, Secret, Spawn, listen, router, serve_grant,
+    service_ticket,
 };
 use wordcraft_doc::{Document, Paragraph, Pos, para_block};
 use wordcraft_engine::io::{open_bytes, save_bytes};
@@ -68,6 +69,8 @@ struct Relay {
     held: Vec<(usize, ServerMsg)>,
     /// Refuse every snapshot submit with these words.
     refuse_snapshots: Option<&'static str>,
+    /// Every `Hub::set_token`: `(connection, ticket)`.
+    tokens: Vec<(usize, String)>,
 }
 
 type Shared = Rc<RefCell<Relay>>;
@@ -87,6 +90,10 @@ impl Hub for TestHub {
         let mut r = self.relay.borrow_mut();
         let c = &mut r.conns[self.at];
         if !c.connected || c.paused { Vec::new() } else { c.inbox.drain(..).collect() }
+    }
+    fn set_token(&mut self, token: String) {
+        let at = self.at;
+        self.relay.borrow_mut().tokens.push((at, token));
     }
     fn connected(&self) -> bool {
         self.relay.borrow().conns[self.at].connected
@@ -140,6 +147,7 @@ impl Relay {
             replay_until: Some(until),
             fallback: false,
             text_cap: None,
+            heartbeat: false,
         };
         self.conns[at].inbox.push_back(joined);
         self.conns[at].inbox.extend(replay);
@@ -167,7 +175,7 @@ impl Relay {
                     _ => None,
                 };
                 if let Some(detail) = refusal {
-                    self.conns[at].inbox.push_back(ServerMsg::Error { doc: DOC.into(), detail: detail.into(), local: Some(local) });
+                    self.conns[at].inbox.push_back(ServerMsg::Error { doc: DOC.into(), detail: detail.into(), local: Some(local), code: None });
                     return;
                 }
                 self.seq += 1;
@@ -244,6 +252,8 @@ struct Nc {
     forbidden: usize,
     /// Answer every copy with this status instead.
     copy_status: Option<StatusCode>,
+    /// Take this long over every write.
+    put_delay: Option<std::time::Duration>,
     /// Answer every write with this status once a conflict copy was made.
     put_status_after_copy: Option<StatusCode>,
 }
@@ -287,6 +297,10 @@ async fn nc_get(State(nc): State<NcState>, Path(room): Path<String>, h: HeaderMa
 async fn nc_put(State(nc): State<NcState>, Path(room): Path<String>, h: HeaderMap, body: Bytes) -> Response {
     if !signed(&h, &room) {
         return deny(&nc);
+    }
+    let slow = nc.lock().unwrap().put_delay;
+    if let Some(d) = slow {
+        tokio::time::sleep(d).await;
     }
     let mut n = nc.lock().unwrap();
     let if_match = h.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).unwrap_or("").trim_matches('"').to_owned();
@@ -918,4 +932,62 @@ async fn slow_header_client_is_dropped() {
     let closed = tokio::time::timeout(std::time::Duration::from_secs(10), client.read_to_end(&mut answer)).await;
     assert!(closed.is_ok(), "the server drops a client whose headers never end");
     assert!(began.elapsed() >= std::time::Duration::from_secs(2), "but gives it time to send them");
+}
+
+#[tokio::test]
+async fn hub_gets_every_reminted_ticket() {
+    let relay: Shared = Rc::default();
+    let mut hub = Relay::connect(&relay, SERVICE_UID);
+    let clock = TestClock(AtomicU64::new(0));
+    let secret = Secret::new("CRAFT_RELAY_SECRET", Some(RELAY_SECRET)).unwrap();
+    let mut ticket = HubTicket::new(&secret, ROOM, &clock).unwrap();
+    let first = ticket.current().to_owned();
+    let live = LiveStatus::Live { saved_at: None };
+    let given = |relay: &Shared| relay.borrow().tokens.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
+
+    ticket.keep(&mut hub, &live, &secret, ROOM, &clock);
+    assert!(given(&relay).is_empty(), "a young ticket stays");
+    // Each re-mint goes to the hub, for its next reconnect: no new connection.
+    clock.0.fetch_add(480_000, Ordering::Relaxed);
+    ticket.keep(&mut hub, &live, &secret, ROOM, &clock);
+    assert_eq!(given(&relay), [ticket.current().to_owned()]);
+    assert_ne!(ticket.current(), first, "a new ticket");
+    clock.0.fetch_add(480_000, Ordering::Relaxed);
+    ticket.keep(&mut hub, &live, &secret, ROOM, &clock);
+    assert_eq!(given(&relay).len(), 2);
+
+    // The relay refused the connection: a fresh ticket at once, then no more than one a minute.
+    let refused = LiveStatus::Refused("the ticket expired".into());
+    clock.0.fetch_add(1_000, Ordering::Relaxed);
+    ticket.keep(&mut hub, &refused, &secret, ROOM, &clock);
+    assert_eq!(given(&relay).len(), 3);
+    assert_eq!(given(&relay)[2], ticket.current());
+    for _ in 0..10 {
+        clock.0.fetch_add(1_000, Ordering::Relaxed);
+        ticket.keep(&mut hub, &refused, &secret, ROOM, &clock);
+    }
+    assert_eq!(given(&relay).len(), 3, "not a ticket a step");
+    clock.0.fetch_add(60_000, Ordering::Relaxed);
+    ticket.keep(&mut hub, &refused, &secret, ROOM, &clock);
+    assert_eq!(given(&relay).len(), 4);
+    assert_eq!(relay.borrow().conns.len(), 1, "the hub is kept, never replaced");
+}
+
+#[tokio::test]
+async fn heartbeats_while_a_step_is_blocked() {
+    // A step that waits far past the app's stale limit (a write that hangs) still heartbeats.
+    // Scaled down: heartbeats every 100 ms, a write that takes 2 s.
+    let mut w = world(file(&["One"]), 1).await;
+    w.worker.heartbeat_every(std::time::Duration::from_millis(100)).unwrap();
+    w.nc.lock().unwrap().put_delay = Some(std::time::Duration::from_secs(2));
+    w.eds[0].type_at_end(0, " fish");
+    w.run_for(QUIET_MS - 1_000, 1_000).await;
+    let before = w.count("heartbeat");
+    let began = std::time::Instant::now();
+    while w.count("put") == 0 {
+        w.tick(1_000).await;
+    }
+    assert!(began.elapsed() >= std::time::Duration::from_secs(2), "the step was blocked on the write");
+    let during = w.count("heartbeat") - before;
+    assert!(during >= 10, "heartbeats went on while the step was blocked ({during})");
 }
