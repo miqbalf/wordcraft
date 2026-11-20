@@ -26,21 +26,27 @@
 //!
 //! # The status
 //!
-//! - [`LiveStatus::Connecting`] from the start until the relay has granted a client space and
-//!   the replica is ready. No edits.
+//! - [`LiveStatus::Connecting`] from the start until the relay has granted a client space, the
+//!   join's catch-up has arrived whole (the ordered replay up to `Joined.replay_until`, or the
+//!   last `text_ops` piece of a fallback) and the replica is ready. No edits: the catch-up may
+//!   still replace the replica with the room's checkpoint. A catch-up still arriving after 10 s
+//!   is told to the user once.
 //! - [`LiveStatus::Live`] while connected, joined and ready: the only state that takes edits.
 //!   `saved_at` is the ETag of the newest file the document service saved (the `saved`
 //!   marker from the service uid [`SERVICE_UID`], `{seq, etag}`, `seq` never going back). It
 //!   is kept across reconnects and peers leaving.
 //! - [`LiveStatus::Reconnecting`] when the link drops after it had been live, until the hub's
-//!   rejoin is answered. No edits.
+//!   rejoin is answered and its catch-up has arrived. No edits.
 //! - [`LiveStatus::ReadOnly`] for a read-only ticket, from the start and for good (it follows
 //!   the other editors and shows its caret, and never sends an edit).
 //! - [`LiveStatus::Refused`] when the relay grants no client space, so nothing can be shared.
 //! - [`LiveStatus::Broken`] when the replica can no longer be trusted: the relay refused an
-//!   edit this replica already holds, the catch-up could not be rebuilt
-//!   (`Work::TextIncomplete`), a checkpoint did not restore, or yrs failed on an update. It is
-//!   final: the message tells the user to reopen the file.
+//!   edit this replica already holds, an update this replica holds could not be sent, the
+//!   catch-up could not be rebuilt (`Work::TextIncomplete`), the relay could no longer catch
+//!   this link up (it fell too far behind), a checkpoint did not restore, or yrs failed on an
+//!   update. It is final: the message tells the user to reopen the file. A read-only ticket
+//!   started for editing ends here too, when the relay refuses its first edit ("read-only
+//!   access"): start a read-only ticket with [`Access::Read`].
 //!
 //! # For the document service (the saver)
 //!
@@ -48,8 +54,19 @@
 //! To save: [`LiveEditing::checkpoint`] returns the state it snapshotted; wait for
 //! [`SaveEvent::Checkpointed`] from [`LiveEditing::take_save_events`], build the document from
 //! those bytes with [`document_from_state`], write the file, then [`LiveEditing::announce_saved`]
-//! with the sequence and the file's new ETag. [`SaveEvent::Raced`] means try again,
-//! [`SaveEvent::Refused`] means a retry will not help.
+//! with the sequence and the file's new ETag.
+//!
+//! - One checkpoint at a time: drain [`LiveEditing::take_save_events`] (pumping) until its
+//!   outcome arrives before calling [`LiveEditing::checkpoint`] again.
+//! - [`SaveEvent::Raced`]: throw the state bytes of that checkpoint away (they may miss a
+//!   remote edit) and checkpoint again.
+//! - [`SaveEvent::Refused`], or `checkpoint()` failing with `craft_collab::Error::Refused`: a
+//!   retry will not help (read-only, too large); stop until something changes.
+//! - `checkpoint()` failing with any other error (not ready, still catching up, one in flight,
+//!   the hub failed): nothing was sent; keep pumping and try again later.
+//!
+//! Recovered and forwarded text (see the crate documentation) is made outside the replica's
+//! undo history, so the user's Undo never takes it back.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -81,6 +98,13 @@ const CONNECTING: &str = "Still connecting to the other editors. You can edit in
 const RECONNECTING: &str = "Reconnecting to the other editors. Editing is paused until then.";
 const READ_ONLY: &str = "This file is read-only for you.";
 const PARTIAL: &str = "Part of your last edit could not be shared and was taken back.";
+const BEHIND: &str = "This window fell too far behind the other editors. Reopen the file to catch up.";
+const UNSENT: &str = "Your last edit could not be sent to the other editors.";
+const CATCHING_UP: &str = "Still catching up with the other editors. Editing starts as soon as that is done.";
+/// How long a join's catch-up may take before the user is told.
+const CATCH_UP_LATE_MS: f64 = 10_000.0;
+/// The same without a clock, in frames.
+const CATCH_UP_LATE_FRAMES: u32 = 600;
 const AFTER_UNDO: &str = "An edit made right after Undo was not kept. Please make it again.";
 
 /// What live editing is doing now; see the [module documentation](self).
@@ -140,9 +164,40 @@ pub enum LiveFail {
 struct Seen {
     joins: u64,
     space: Option<u32>,
+    /// The join's ordered replay ends at this sequence, not yet seen.
+    replay_until: Option<u64>,
+    /// The join's catch-up comes as text ops, whose last piece has not arrived.
+    text_ops_owed: bool,
+    /// The relay could not catch this link up (`snapshot`: fell too far behind).
+    replaced: bool,
 }
 
-/// The host's hub, watched for the relay's join answer (the granted space), which [`Live`]
+impl Seen {
+    /// Whether the last join's catch-up is still arriving. Until it has, the replica may
+    /// still be replaced by the room's snapshot, and an edit made meanwhile would break it.
+    fn catching_up(&self) -> bool {
+        self.replay_until.is_some() || self.text_ops_owed
+    }
+
+    fn saw(&mut self, m: &ServerMsg) {
+        match m {
+            ServerMsg::Joined { seq, space, replay_until, fallback, .. } => {
+                self.joins += 1;
+                self.space = Some(*space);
+                // An older relay does not mark its replay; there nothing can be waited for.
+                self.replay_until = replay_until.filter(|until| until > seq);
+                self.text_ops_owed = *fallback;
+            }
+            ServerMsg::Op { seq, .. } if self.replay_until.is_some_and(|until| *seq >= until) => self.replay_until = None,
+            ServerMsg::TextOps { more: false, .. } => self.text_ops_owed = false,
+            ServerMsg::Snapshot { .. } => self.replaced = true,
+            _ => {}
+        }
+    }
+}
+
+/// The host's hub, watched for the relay's join answer (the granted space, where the catch-up
+/// ends) and for a relay that gave up catching it up, which [`Live`]
 /// keeps to itself.
 pub struct Tap<H> {
     hub: H,
@@ -157,10 +212,7 @@ impl<H: Hub> Hub for Tap<H> {
         let msgs = self.hub.poll();
         let mut seen = lock(&self.seen);
         for m in &msgs {
-            if let ServerMsg::Joined { space, .. } = m {
-                seen.joins += 1;
-                seen.space = Some(*space);
-            }
+            seen.saw(m);
         }
         msgs
     }
@@ -223,6 +275,13 @@ struct Caret {
     text: String,
 }
 
+/// A join's catch-up that has not finished arriving.
+struct CatchUp {
+    since: Option<f64>,
+    frames: u32,
+    told: bool,
+}
+
 #[derive(Default)]
 struct CursorOut {
     pending: Option<Value>,
@@ -267,6 +326,7 @@ pub struct LiveEditing<H: Hub> {
     save_events: Vec<SaveEvent>,
     cursor: CursorOut,
     clock: Option<Clock>,
+    catch_up: Option<CatchUp>,
 }
 
 impl<H: Hub> LiveEditing<H> {
@@ -313,6 +373,7 @@ impl<H: Hub> LiveEditing<H> {
             save_events: Vec::new(),
             cursor: CursorOut::default(),
             clock: default_clock(),
+            catch_up: None,
         })
     }
 
@@ -443,6 +504,16 @@ impl<H: Hub> LiveEditing<H> {
         &self.live
     }
 
+    /// The host's hub.
+    pub fn hub(&self) -> &H {
+        &self.live.hub().hub
+    }
+
+    /// The host's hub, to steer its transport (a fresh ticket, for one).
+    pub fn hub_mut(&mut self) -> &mut H {
+        &mut self.live.hub_mut().hub
+    }
+
     /// Stop editing live: the session keeps the document and takes back its own undo.
     pub fn stop(self, session: &mut Session) {
         session.set_observer(None);
@@ -495,11 +566,18 @@ impl<H: Hub> LiveEditing<H> {
         let fallback = changes.clone();
         let map = &mut self.map;
         let remote = match edit_live(&mut self.live, |d| {
-            let r = map.received(d, changes);
+            // Recovered and forwarded text is the room's, not an edit of this user's: their
+            // Undo must never take it back.
+            let r = d.untracked(|d| map.received(d, changes));
             let updates = r.updates.clone();
             (r, updates)
         }) {
-            Some((remote, _)) => remote,
+            Some((remote, sent)) => {
+                if !sent {
+                    self.unsent();
+                }
+                remote
+            }
             None => Remote { changes: fallback, updates: Vec::new() },
         };
         self.apply_to_session(session, &remote.changes);
@@ -555,7 +633,10 @@ impl<H: Hub> LiveEditing<H> {
             Err(e) => (Err(e), Vec::new()),
         });
         match result {
-            Some((Ok(edit), _)) => {
+            Some((Ok(edit), sent)) => {
+                if !sent {
+                    self.unsent();
+                }
                 if !edit.updates.is_empty() {
                     let mut s = lock(&self.shared);
                     s.undo.push(edit.updates.len());
@@ -584,6 +665,13 @@ impl<H: Hub> LiveEditing<H> {
                 self.break_with(BROKEN);
             }
         }
+    }
+
+    /// An update this replica holds never reached the relay, so the room will not have it:
+    /// carrying on would let this window drift from the others for good.
+    fn unsent(&mut self) {
+        self.notices.push(UNSENT.to_owned());
+        self.break_with(BROKEN);
     }
 
     fn put_back(&mut self, session: &mut Session, before: Document) {
@@ -706,6 +794,14 @@ impl<H: Hub> LiveEditing<H> {
         if !connected {
             self.need_join = true;
         }
+        let (catching_up, replaced) = {
+            let s = lock(&self.seen);
+            (s.catching_up(), s.replaced)
+        };
+        if replaced {
+            self.break_with(BEHIND);
+        }
+        self.wait_for_catch_up(catching_up && !self.need_join);
         if self.broken.is_none() && !self.need_join && self.space != 0 && !self.live.ready_to_type() {
             // Joined with a space, yet the replica takes no edits: Live gave up on it.
             self.broken = Some(BROKEN.to_owned());
@@ -716,7 +812,7 @@ impl<H: Hub> LiveEditing<H> {
             LiveStatus::Refused(m.clone())
         } else if self.access == Access::Read {
             LiveStatus::ReadOnly
-        } else if connected && !self.need_join && self.space != 0 {
+        } else if connected && !self.need_join && self.space != 0 && !catching_up {
             self.been_live = true;
             LiveStatus::Live { saved_at: self.saved.as_ref().map(|(_, e)| e.clone()) }
         } else if self.been_live {
@@ -724,6 +820,24 @@ impl<H: Hub> LiveEditing<H> {
         } else {
             LiveStatus::Connecting
         };
+    }
+
+    /// Count how long the join's catch-up has been arriving, and say so once when it is late.
+    fn wait_for_catch_up(&mut self, waiting: bool) {
+        if !waiting {
+            self.catch_up = None;
+            return;
+        }
+        let now = self.clock.as_mut().map(|c| c());
+        let since = self.catch_up.get_or_insert(CatchUp { since: now, frames: 0, told: false });
+        since.frames = since.frames.saturating_add(1);
+        let late = match (now, since.since) {
+            (Some(now), Some(t)) => now - t >= CATCH_UP_LATE_MS,
+            _ => since.frames >= CATCH_UP_LATE_FRAMES,
+        };
+        if late && !std::mem::replace(&mut since.told, true) {
+            self.notices.push(CATCHING_UP.to_owned());
+        }
     }
 
     fn break_with(&mut self, msg: &str) {

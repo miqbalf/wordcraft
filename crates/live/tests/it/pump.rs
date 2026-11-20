@@ -25,6 +25,8 @@ struct Conn {
     connected: bool,
     /// Refuse this peer's edits, as a relay that could not order them.
     refuse_edits: bool,
+    /// The hub fails to send, as a transport that lost the message.
+    fail_sends: bool,
     inbox: VecDeque<ServerMsg>,
     /// Document submits this connection made, snapshots included.
     submits: usize,
@@ -43,12 +45,23 @@ struct Relay {
     ephemeral: Vec<(String, String, Value)>,
     /// Deliver a random prefix of each inbox per poll instead of all of it.
     rng: Option<Rng>,
+    /// Deliver one message per poll.
+    one_per_poll: bool,
 }
 
 type Shared = Rc<RefCell<Relay>>;
 
 fn relay(rng: Option<u64>) -> Shared {
-    Rc::new(RefCell::new(Relay { seq: 0, saved: 0, log: Vec::new(), conns: Vec::new(), next_space: 1, ephemeral: Vec::new(), rng: rng.map(Rng) }))
+    Rc::new(RefCell::new(Relay {
+        seq: 0,
+        saved: 0,
+        log: Vec::new(),
+        conns: Vec::new(),
+        next_space: 1,
+        ephemeral: Vec::new(),
+        rng: rng.map(Rng),
+        one_per_poll: false,
+    }))
 }
 
 #[derive(Clone)]
@@ -59,6 +72,9 @@ struct TestHub {
 
 impl Hub for TestHub {
     fn send(&mut self, msg: ClientMsg) -> craft_collab::Result<()> {
+        if self.relay.borrow().conns[self.at].fail_sends {
+            return Err(craft_collab::Error::Hub("the link lost it".into()));
+        }
         self.relay.borrow_mut().handle(self.at, msg);
         Ok(())
     }
@@ -93,6 +109,7 @@ impl Relay {
                 service: uid == SERVICE_UID,
                 connected: true,
                 refuse_edits: false,
+                fail_sends: false,
                 inbox: VecDeque::new(),
                 submits: 0,
             });
@@ -162,7 +179,7 @@ impl Relay {
             ClientMsg::Submit { local, command, params, .. } => {
                 self.conns[at].submits += 1;
                 let refusal = if !self.conns[at].may_edit {
-                    Some("read-only access: this ticket may only read")
+                    Some("read-only access to this file")
                 } else if is_snap(&params) && !self.conns[at].service {
                     Some("only the document service may checkpoint; ask the saver")
                 } else if self.conns[at].refuse_edits {
@@ -214,6 +231,7 @@ impl Relay {
         }
         let len = self.conns[at].inbox.len();
         let n = match self.rng.as_mut() {
+            _ if self.one_per_poll => len.min(1),
             Some(rng) => rng.below(len + 1),
             None => len,
         };
@@ -276,6 +294,7 @@ fn file(paras: &[&str]) -> Vec<u8> {
 
 fn settle(relay: &Shared, eds: &mut [&mut Ed]) {
     relay.borrow_mut().rng = None;
+    relay.borrow_mut().one_per_poll = false;
     for _ in 0..50 {
         for e in eds.iter_mut() {
             e.pump();
@@ -661,4 +680,208 @@ fn typing_into_a_paragraph_joined_away_is_recovered_through_the_pump() {
     settle(&relay, &mut [&mut a, &mut b]);
     assert_same(&a, &b, "after the race");
     assert!(texts(&a.s.doc).iter().any(|t| t.contains("XYZ")), "the typing survives: {:?}", texts(&a.s.doc));
+}
+
+/// The saver checkpoints and announces the save: pumping every editor, retrying on a race.
+fn save(eds: &mut [&mut Ed], saver: usize, etag: &str) {
+    for _ in 0..200 {
+        if eds[saver].le.checkpoint().is_ok() {
+            for _ in 0..50 {
+                for e in eds.iter_mut() {
+                    e.pump();
+                }
+                let events = eds[saver].le.take_save_events();
+                if let Some(SaveEvent::Checkpointed { seq }) = events.first().cloned() {
+                    eds[saver].le.announce_saved(seq, etag).unwrap();
+                    return;
+                }
+                if !events.is_empty() {
+                    break;
+                }
+            }
+        }
+        for e in eds.iter_mut() {
+            e.pump();
+        }
+    }
+    panic!("the checkpoint never went through");
+}
+
+#[test]
+fn live_waits_for_the_whole_catch_up() {
+    let relay = relay(None);
+    let bytes = file(&["One", "Two"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut saver = Ed::open(&relay, SERVICE_UID, Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut saver]);
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": " fish"})));
+    settle(&relay, &mut [&mut a, &mut saver]);
+    save(&mut [&mut a, &mut saver], 1, "e1");
+    a.end_of(1);
+    assert!(a.run("text.insert", json!({"text": " more"})));
+    settle(&relay, &mut [&mut a, &mut saver]);
+
+    // A late joiner whose catch-up (snapshot first) comes one message per poll.
+    relay.borrow_mut().one_per_poll = true;
+    let mut c = Ed::open(&relay, "carol", Access::Edit, &bytes);
+    c.pump();
+    assert_eq!(c.le.status(), &LiveStatus::Connecting, "joined, the catch-up not here yet");
+    c.end_of(0);
+    assert!(!c.run("text.insert", json!({"text": " early"})), "refused while catching up");
+    let _ = c.s.run("text.insert", &json!({"text": " early"}));
+    c.pump();
+    assert!(!texts(&c.s.doc).iter().any(|t| t.contains("early")), "put back: {:?}", texts(&c.s.doc));
+    for _ in 0..20 {
+        c.pump();
+    }
+    assert!(c.le.editable(), "live once the catch-up arrived: {:?}", c.le.status());
+    assert_same(&a, &c, "the joiner has the room's document");
+    c.end_of(0);
+    assert!(c.run("text.insert", json!({"text": "!"})));
+    settle(&relay, &mut [&mut a, &mut saver, &mut c]);
+    assert_same(&a, &c, "the joiner's edit lands");
+    assert_eq!(texts(&a.s.doc), ["One fish!", "Two more"]);
+}
+
+#[test]
+fn falling_too_far_behind_stops_editing() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a]);
+    relay.borrow_mut().conns[0].inbox.push_back(ServerMsg::Snapshot { doc: ROOM.into(), seq: 40, document: Value::Null });
+    a.pump();
+    let LiveStatus::Broken(msg) = a.le.status().clone() else { panic!("broken: {:?}", a.le.status()) };
+    assert!(msg.contains("Reopen"), "{msg}");
+    assert!(!a.le.editable());
+}
+
+#[test]
+fn an_incomplete_catch_up_stops_editing() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a]);
+    let lost = ServerMsg::TextOps { doc: ROOM.into(), scope: "doc".into(), ops: json!([]), complete: false, snap: false, more: false };
+    relay.borrow_mut().conns[0].inbox.push_back(lost);
+    a.pump();
+    let LiveStatus::Broken(msg) = a.le.status().clone() else { panic!("broken: {:?}", a.le.status()) };
+    assert!(msg.contains("Reopen"), "{msg}");
+}
+
+#[test]
+fn an_edit_that_cannot_be_sent_stops_editing() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    relay.borrow_mut().conns[0].fail_sends = true;
+    a.end_of(0);
+    let _ = a.run("text.insert", json!({"text": " lost"}));
+    a.pump();
+    assert!(matches!(a.le.status(), LiveStatus::Broken(_)), "{:?}", a.le.status());
+    assert!(a.le.take_notices().iter().any(|n| n.contains("could not be sent")));
+    assert!(!a.le.editable());
+}
+
+#[test]
+fn a_read_ticket_opened_for_editing_says_it_is_read_only() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let hub = Relay::connect(&relay, "bob", false);
+    let mut s = Session::new(Document::new());
+    let mut le = LiveEditing::start(hub, ROOM, &bytes, "plan.docx", &mut s).unwrap();
+    le.pump(&mut s);
+    assert!(le.editable(), "the relay has not said yet");
+    s.sel = Selection { anchor: Pos::body(0, 5), focus: Pos::body(0, 5) };
+    let _ = le.run(&mut s, "text.insert", &json!({"text": "!"}));
+    le.pump(&mut s);
+    let LiveStatus::Broken(msg) = le.status().clone() else { panic!("broken: {:?}", le.status()) };
+    assert!(msg.contains("only read"), "{msg}");
+}
+
+#[test]
+fn undo_after_recovery_keeps_the_recovered_text() {
+    let relay = relay(None);
+    let bytes = file(&["One", "Two", "Three"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    // Bob joins "Two" onto "One" while Alice types into "Two"; Bob recovers her typing.
+    b.end_of(0);
+    assert!(b.run("text.delete", json!({})));
+    a.caret(1, 2);
+    assert!(a.run("text.insert", json!({"text": "XYZ"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(texts(&b.s.doc).iter().any(|t| t.contains("XYZ")), "recovered: {:?}", texts(&b.s.doc));
+    // Bob's Undo takes back his join, never the recovered text.
+    assert!(b.run("edit.undo", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "after the undo");
+    assert!(texts(&a.s.doc).iter().any(|t| t.contains("XYZ")), "Alice's typing survives: {:?}", texts(&a.s.doc));
+    assert!(texts(&b.s.doc).iter().any(|t| t == "One"), "the join was undone: {:?}", texts(&b.s.doc));
+}
+
+#[test]
+fn undo_inside_text_another_editor_typed_into() {
+    let relay = relay(None);
+    let bytes = file(&["One"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": "abcd"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    b.caret(0, 5);
+    assert!(b.run("text.insert", json!({"text": "XY"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&a.s.doc), ["OneabXYcd"]);
+    assert!(a.run("edit.undo", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "after the undo");
+    assert_eq!(texts(&b.s.doc), ["OneXY"], "only Alice's characters went");
+}
+
+/// Random commands and pumps by every editor but the saver (index 2), which only pumps.
+fn random_phase(eds: &mut [Ed], rng: &mut Rng, steps: usize) {
+    let editors: Vec<usize> = (0..eds.len()).filter(|k| *k != 2).collect();
+    for _ in 0..steps * 3 {
+        let k = editors[rng.below(editors.len())];
+        if rng.below(3) == 0 || !eds[k].le.editable() {
+            eds[k].pump();
+            eds[2].pump();
+            continue;
+        }
+        random_selection(&mut eds[k].s, rng);
+        let (id, params) = random_command(rng);
+        let e = &mut eds[k];
+        let _ = e.le.run(&mut e.s, id, &params);
+    }
+}
+
+#[test]
+fn editors_converge_across_a_save_and_a_late_joiner() {
+    for seed in 200..204 {
+        let relay = relay(Some(seed));
+        let bytes = file(&["Alpha beta", "Gamma", "Delta epsilon zeta", ""]);
+        let mut eds: Vec<Ed> = ["u0", "u1", SERVICE_UID].iter().map(|u| Ed::open(&relay, u, Access::Edit, &bytes)).collect();
+        let mut rng = Rng(seed);
+        random_phase(&mut eds, &mut rng, 60);
+        {
+            let mut refs: Vec<&mut Ed> = eds.iter_mut().collect();
+            save(&mut refs, 2, "e1");
+        }
+        // Editing continues under the random relay while a late joiner comes in.
+        relay.borrow_mut().rng = Some(Rng(seed ^ 0xfeed));
+        eds.push(Ed::open(&relay, "late", Access::Edit, &bytes));
+        random_phase(&mut eds, &mut rng, 60);
+        let mut refs: Vec<&mut Ed> = eds.iter_mut().collect();
+        settle(&relay, &mut refs);
+        for e in &eds[1..] {
+            assert_same(&eds[0], e, &format!("seed {seed}"));
+        }
+        assert!(eds.iter().all(|e| matches!(e.le.status(), LiveStatus::Live { saved_at: Some(_) })), "seed {seed}: all live and saved");
+    }
 }
