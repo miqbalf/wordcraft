@@ -885,3 +885,52 @@ fn editors_converge_across_a_save_and_a_late_joiner() {
         assert!(eds.iter().all(|e| matches!(e.le.status(), LiveStatus::Live { saved_at: Some(_) })), "seed {seed}: all live and saved");
     }
 }
+
+#[test]
+fn an_undo_that_cannot_be_sent_stops_editing() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": " world"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    relay.borrow_mut().conns[0].fail_sends = true;
+    let _ = a.run("edit.undo", json!({}));
+    a.pump();
+    assert!(matches!(a.le.status(), LiveStatus::Broken(_)), "{:?}", a.le.status());
+    assert!(a.le.take_notices().iter().any(|n| n.contains("could not be sent")));
+    assert_eq!(texts(&b.s.doc), ["Hello world"], "the room never saw the undo");
+}
+
+#[test]
+fn a_catch_up_that_never_arrives_ends_in_reopen() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a]);
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": "!"})));
+    settle(&relay, &mut [&mut a]);
+    // A joiner gets its join, then the replay is lost.
+    let mut c = Ed::open(&relay, "carol", Access::Edit, &bytes);
+    let now = std::sync::Arc::new(std::sync::Mutex::new(0.0_f64));
+    let clock = now.clone();
+    c.le.set_clock(Box::new(move || *clock.lock().unwrap()));
+    relay.borrow_mut().one_per_poll = true;
+    c.pump();
+    relay.borrow_mut().conns[1].inbox.clear();
+    assert_eq!(c.le.status(), &LiveStatus::Connecting);
+    *now.lock().unwrap() = 11_000.0;
+    c.pump();
+    assert_eq!(c.le.status(), &LiveStatus::Connecting, "late, not given up yet");
+    assert!(c.le.take_notices().iter().any(|n| n.contains("catching up")));
+    *now.lock().unwrap() = 21_000.0;
+    c.pump();
+    let LiveStatus::Broken(msg) = c.le.status().clone() else { panic!("broken: {:?}", c.le.status()) };
+    assert!(msg.contains("Reopen"), "{msg}");
+    *now.lock().unwrap() = 60_000.0;
+    c.pump();
+    assert!(c.le.take_notices().is_empty(), "no more catch-up notices once broken");
+}
