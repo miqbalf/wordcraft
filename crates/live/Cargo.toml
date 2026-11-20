@@ -16,3 +16,14 @@ log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+# The native socket transport, for the tests that join a real craft-collab relay.
+native-hub = ["craft-collab/native-hub"]
+
+[dev-dependencies]
+# Mint relay tickets (HMAC-SHA256 over the base64url payload) and drive the native hub.
+base64 = "0.23"
+hmac = "0.13"
+sha2 = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
