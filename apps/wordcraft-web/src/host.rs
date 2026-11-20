@@ -37,15 +37,16 @@
 //! refuses another `proto`). WordCraft posts the unprefixed `{type:"ready"}` once it listens.
 //!
 //! - The first `live` fetches `fileUrl` with the user's cookies, only from this page's own
-//!   origin over HTTP(S) ([`crate::live_ticket::same_origin`]), then connects to the relay over
+//!   origin over HTTP(S) ([`crate::live_ticket::same_origin`]), then connects to the relay on
+//!   the page's own host only ([`crate::live_ticket::same_host`]; a relative `/craft` is) over
 //!   the page's `socket.io-client` (`craft-collab`'s `WebHub`, which derives the Socket.IO path
 //!   `/craft/socket.io/` from `relayUrl`) and opens the file live. A read ticket (`perm` without
-//!   the update bit) joins read-only and never sends an edit.
-//! - A later `live` for the same room is the page's ticket refresh (every 480 s). The hub keeps
-//!   the auth it connected with and has no way to change it, and reconnecting a working link
-//!   would rejoin for nothing, so the fresh ticket is kept. When the link has been down for
-//!   [`SWAP_AFTER_MS`] (the hub's own reconnect is still failing, as with an expired ticket),
-//!   a new connection with the fresh ticket replaces it: one rejoin, as a reconnect would be.
+//!   the update bit) joins read-only and never sends an edit. If the fetch, the connect or the
+//!   start fails, the window says why and the next `live` tries again
+//!   ([`crate::live_ticket::Joining`]).
+//! - A later `live` for the same room is the page's ticket refresh (every 480 s). It goes to the
+//!   hub (`Hub::set_token`) for its next reconnect; a hub the relay refused (an expired
+//!   ticket) connects again with it. One that comes while the file is fetched waits for the join.
 //! - Another `proto` shows "This file is being edited with a newer WordCraft. Update to join."
 //!   and nothing can be edited.
 //! - `live-state` `{state, reason, savedAt, peers}` goes to the parent on every change of
@@ -54,9 +55,10 @@
 //!
 //! Tickets are never logged.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::live_ticket::{Joining, Next};
 use craft_web_host::Mode;
 use craft_web_host::live::{LiveError, LiveMessage, LiveState, LiveStatus, Peer as HostPeer};
 use craft_web_host::web::{FileData, Host, Message};
@@ -113,8 +115,7 @@ impl Bridge {
 
     /// Hear the parent's `live` messages: the first fetches the file and joins, later ones are
     /// ticket refreshes. They wait in `events` for the next frame ([`Live::frame`]).
-    pub fn listen_live(&self, events: LiveEvents, ctx: egui::Context) {
-        let fetching = Rc::new(Cell::new(false));
+    pub fn listen_live(&self, events: LiveEvents, joining: Rc<RefCell<Joining>>, ctx: egui::Context) {
         self.host.listen_live(move |message| match message {
             Err(LiveError::UnsupportedProto(_)) => {
                 events.borrow_mut().push(LiveEvent::Newer);
@@ -122,24 +123,30 @@ impl Bridge {
             }
             // The error never quotes the message, so no ticket reaches the log.
             Err(e) => log::warn!("live message refused: {e}"),
-            Ok(message) if fetching.replace(true) => {
-                events.borrow_mut().push(LiveEvent::Ticket(message));
-                ctx.request_repaint();
-            }
             Ok(message) => {
-                let (events, ctx, fetching) = (events.clone(), ctx.clone(), fetching.clone());
-                wasm_bindgen_futures::spawn_local(async move {
-                    let event = match fetch_file(&message.file_url).await {
-                        Ok(bytes) => LiveEvent::Open(message, bytes),
-                        Err(e) => {
-                            // The page's next `live` (its refresh) tries again.
-                            fetching.set(false);
-                            LiveEvent::Failed(e)
-                        }
-                    };
-                    events.borrow_mut().push(event);
-                    ctx.request_repaint();
-                });
+                let next = joining.borrow_mut().message(&message.room);
+                match next {
+                    Next::Ignore => log::warn!("a live message for another room was ignored"),
+                    Next::Refresh => {
+                        events.borrow_mut().push(LiveEvent::Ticket(message.ticket().to_owned()));
+                        ctx.request_repaint();
+                    }
+                    Next::Open => {
+                        let (events, ctx, joining) = (events.clone(), ctx.clone(), joining.clone());
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let event = match fetch_file(&message.file_url).await {
+                                Ok(bytes) => LiveEvent::Open(message, bytes),
+                                Err(e) => {
+                                    // The page's next `live` (its refresh) tries again.
+                                    joining.borrow_mut().failed();
+                                    LiveEvent::Failed(e)
+                                }
+                            };
+                            events.borrow_mut().push(event);
+                            ctx.request_repaint();
+                        });
+                    }
+                }
             }
         });
     }
@@ -198,15 +205,12 @@ fn deliver_open(inbox: &Inbox, ctx: &egui::Context, name: &str, data: &FileData)
     ctx.request_repaint();
 }
 
-/// How long the link may be down before a fresh ticket's connection replaces it, in ms.
-pub const SWAP_AFTER_MS: f64 = 3000.0;
-
 /// What the parent's `live` messages brought, for the next frame.
 pub enum LiveEvent {
     /// The file, fetched: join with this message's ticket.
     Open(LiveMessage, Vec<u8>),
-    /// A later `live`: a fresh ticket.
-    Ticket(LiveMessage),
+    /// A later `live` for the room: a fresh ticket.
+    Ticket(String),
     /// The file could not be fetched.
     Failed(String),
     /// The room speaks a newer protocol.
@@ -215,26 +219,21 @@ pub enum LiveEvent {
 
 pub type LiveEvents = Rc<RefCell<Vec<LiveEvent>>>;
 
-/// The web app's side of a live session: the connection's ticket and a fresher one.
+/// The web app's side of a live session: when it joins, and a ticket that came during the join.
 #[derive(Default)]
 pub struct Live {
-    room: Option<String>,
-    relay_url: String,
-    /// A ticket newer than the connection's, from the page's refresh.
-    fresh: Option<String>,
-    /// When the link was last seen down, in ms (`performance.now()` via `web_time`).
-    down_since: Option<f64>,
-}
-
-fn now_ms() -> f64 {
-    use std::sync::OnceLock;
-    static START: OnceLock<web_time::Instant> = OnceLock::new();
-    START.get_or_init(web_time::Instant::now).elapsed().as_secs_f64() * 1000.0
+    joining: Rc<RefCell<Joining>>,
+    /// A fresh ticket that arrived while the file was fetched, for the hub once joined.
+    pending: Option<String>,
 }
 
 impl Live {
-    /// Act on what arrived since the last frame, and replace a connection that stays down when
-    /// a fresh ticket is waiting.
+    /// The join state the `live` listener shares ([`Bridge::listen_live`]).
+    pub fn joining(&self) -> Rc<RefCell<Joining>> {
+        Rc::clone(&self.joining)
+    }
+
+    /// Act on what arrived since the last frame.
     pub fn frame(&mut self, app: &mut WordApp, events: &LiveEvents) {
         let arrived = std::mem::take(&mut *events.borrow_mut());
         for event in arrived {
@@ -242,55 +241,56 @@ impl Live {
                 LiveEvent::Newer => app.live_newer(),
                 LiveEvent::Failed(e) => {
                     log::error!("live file not fetched: {e}");
-                    app.status_long(wordcraft_ui_egui::i18n::fmt(
-                        wordcraft_ui_egui::tl!("Couldn't open the file for live editing: {error}"),
-                        &[("error", &e)],
-                    ));
+                    not_opened(app, &e);
                 }
                 LiveEvent::Open(message, bytes) => self.open(app, &message, &bytes),
-                // The page also repeats `live` while the file is still being fetched.
-                LiveEvent::Ticket(message) if self.room.as_deref().is_none_or(|room| room == message.room) => {
-                    self.fresh = Some(message.ticket().to_owned());
+                // The hub uses it for its next connect, and starts again with it after the relay
+                // refused an expired one.
+                LiveEvent::Ticket(ticket) => {
+                    if !app.live_refresh_ticket(ticket.clone()) {
+                        self.pending = Some(ticket);
+                    }
                 }
-                LiveEvent::Ticket(_) => log::warn!("a live message for another room was ignored"),
             }
-        }
-        let Some(connected) = app.live_link().map(wordcraft_ui_egui::live::LiveLink::connected) else { return };
-        if connected {
-            self.down_since = None;
-            return;
-        }
-        let since = *self.down_since.get_or_insert_with(now_ms);
-        if now_ms() - since >= SWAP_AFTER_MS
-            && let Some(ticket) = self.fresh.take()
-        {
-            match craft_collab::web::WebHub::connect(&self.relay_url, &ticket, None) {
-                Ok(hub) => app.live_replace_hub(Box::new(hub)),
-                Err(e) => log::error!("live: could not reconnect with the fresh ticket: {e}"),
-            }
-            self.down_since = None;
         }
     }
 
     fn open(&mut self, app: &mut WordApp, message: &LiveMessage, bytes: &[u8]) {
         let access = crate::live_ticket::ticket_access(message.ticket());
-        let started = craft_collab::web::WebHub::connect(&message.relay_url, message.ticket(), None)
-            .map_err(|e| e.to_string())
+        let started = relay_on_page_host(&message.relay_url)
+            .and_then(|()| craft_collab::web::WebHub::connect(&message.relay_url, message.ticket(), None).map_err(|e| e.to_string()))
             .and_then(|hub| app.start_live(Box::new(hub), &message.room, bytes, &message.file_name, access));
         match started {
             Ok(()) => {
-                self.room = Some(message.room.clone());
-                self.relay_url = message.relay_url.clone();
+                self.joining.borrow_mut().joined(&message.room);
+                if let Some(ticket) = self.pending.take() {
+                    app.live_refresh_ticket(ticket);
+                }
             }
             Err(e) => {
+                // The page's next `live` (its refresh) tries again.
+                self.joining.borrow_mut().failed();
+                self.pending = None;
                 log::error!("live editing did not start: {e}");
-                app.status_long(wordcraft_ui_egui::i18n::fmt(
-                    wordcraft_ui_egui::tl!("Couldn't open the file for live editing: {error}"),
-                    &[("error", &e)],
-                ));
+                not_opened(app, &e);
             }
         }
     }
+}
+
+fn not_opened(app: &mut WordApp, error: &str) {
+    app.status_long(wordcraft_ui_egui::i18n::fmt(wordcraft_ui_egui::tl!("Couldn't open the file for live editing: {error}"), &[("error", error)]));
+}
+
+/// The relay URL must be on the page's own host (a relative `/craft` is), so the ticket goes
+/// nowhere else.
+fn relay_on_page_host(relay_url: &str) -> Result<(), String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let location = window.location();
+    let page = location.href().map_err(|_| "no page address")?;
+    let page_host = location.host().map_err(|_| "no page host")?;
+    let url = web_sys::Url::new_with_base(relay_url, &page).map_err(|_| "the relay address is not a URL")?;
+    if crate::live_ticket::same_host(&url.protocol(), &url.host(), &page_host) { Ok(()) } else { Err("the relay is not on this site".into()) }
 }
 
 /// The file to edit live, fetched with the user's cookies from this page's own origin only.

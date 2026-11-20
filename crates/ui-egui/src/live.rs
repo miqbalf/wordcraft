@@ -31,6 +31,8 @@ use crate::{WordApp, i18n, now_ms};
 pub const NEWER: &str = "This file is being edited with a newer WordCraft. Update to join.";
 /// The status line once the link is broken for good ([`LiveStatus::Broken`]).
 pub const ENDED: &str = "Live editing ended. Reopen the file.";
+/// The notice when the link breaks: [`ENDED`] and why.
+pub const ENDED_BECAUSE: &str = "Live editing ended. Reopen the file. {reason}";
 /// Save and Save As while live: the document service writes the file for everyone.
 pub const SAVED_FOR_YOU: &str = "While the file is edited live, it is saved for everyone automatically.";
 /// How often the host hears the state when nothing changed, in milliseconds.
@@ -52,6 +54,10 @@ impl Hub for DynHub {
 
     fn connected(&self) -> bool {
         self.0.connected()
+    }
+
+    fn set_token(&mut self, token: String) {
+        self.0.set_token(token);
     }
 }
 
@@ -128,9 +134,16 @@ fn caret_of(doc: &wordcraft_doc::Document, pos: &Pos) -> Option<(u64, usize)> {
     (para.pid != 0).then_some((para.pid, chars))
 }
 
-/// A caret the link names, back as a body position (bytes), if its paragraph is here.
-fn pos_of(doc: &wordcraft_doc::Document, pid: u64, chars: usize) -> Option<Pos> {
-    let (block, para) = doc.body.iter().enumerate().find_map(|(i, b)| b.as_para().filter(|p| p.pid == pid).map(|p| (i, p)))?;
+/// The body's paragraphs by id: `pid` to block index.
+fn blocks_by_pid(doc: &wordcraft_doc::Document) -> std::collections::HashMap<u64, usize> {
+    doc.body.iter().enumerate().filter_map(|(i, b)| b.as_para().filter(|p| p.pid != 0).map(|p| (p.pid, i))).collect()
+}
+
+/// A caret the link names, back as a body position (bytes), if its paragraph is here. `blocks`
+/// is [`blocks_by_pid`] of `doc`.
+fn pos_of(doc: &wordcraft_doc::Document, blocks: &std::collections::HashMap<u64, usize>, pid: u64, chars: usize) -> Option<Pos> {
+    let block = *blocks.get(&pid)?;
+    let para = doc.body.get(block)?.as_para()?;
     let off = para.text.char_indices().nth(chars).map_or(para.text.len(), |(i, _)| i);
     Some(Pos::body(block, off))
 }
@@ -185,12 +198,22 @@ impl WordApp {
         }
     }
 
-    /// Put a fresh connection in place of the link's hub (a new ticket after the old one could
-    /// no longer reconnect). The link sees a drop and a rejoin.
-    pub fn live_replace_hub(&mut self, hub: Box<dyn Hub>) {
-        if let Some(LiveMode::Linked(link)) = &mut self.live {
-            *link.editing.hub_mut() = DynHub(hub);
+    /// A fresh ticket from the host: the hub uses it for its next (re)connect, and a hub the
+    /// relay refused (an expired ticket) connects again with it. False when nothing is linked.
+    pub fn live_refresh_ticket(&mut self, ticket: String) -> bool {
+        match &mut self.live {
+            Some(LiveMode::Linked(link)) => {
+                link.editing.hub_mut().set_token(ticket);
+                true
+            }
+            _ => false,
         }
+    }
+
+    /// Whether the document service saves this window's document (it is linked to a room), so
+    /// the window never has unsaved changes of its own.
+    pub(crate) fn live_saves(&self) -> bool {
+        matches!(self.live, Some(LiveMode::Linked(_)))
     }
 
     /// Whether live editing lets command `id` run now; true when not live.
@@ -217,7 +240,7 @@ impl WordApp {
             Some(LiveMode::Linked(_)) => tl!(SAVED_FOR_YOU),
             _ => tl!(NEWER),
         };
-        self.status(why);
+        self.status_long(why);
         let refusal = Err(why.to_string());
         Some(refusal)
     }
@@ -259,12 +282,15 @@ impl WordApp {
             && link.saved.as_ref().is_none_or(|(e, _)| e != etag)
         {
             link.saved = Some((etag.clone(), unix_secs()));
+            // The file now holds the room's document. Every local edit was shared when it ran
+            // (`live_session_run` flushes), so none waits to be saved by this window.
+            self.session.dirty = false;
         }
         if let LiveStatus::Broken(detail) = link.editing.status()
             && !link.told_broken
         {
             link.told_broken = true;
-            notices.push(format!("{} {}", tl!(ENDED), tl!(detail.as_str())));
+            notices.push(i18n::fmt(tl!(ENDED_BECAUSE), &[("reason", tl!(detail.as_str()))]));
         }
         // The caret, when it moved.
         let focus = caret_of(&self.session.doc, &self.session.sel.focus);
@@ -361,13 +387,14 @@ pub(crate) fn paint_carets(app: &mut WordApp, ui: &mut Ui, painter: &egui::Paint
     let Some(link) = app.live_link() else { return };
     let ids: Vec<String> = link.peers.iter().map(|p| p.id.clone()).collect();
     let colours = craft_ui::presence::colours_for(&ids);
+    let blocks = blocks_by_pid(&app.session.doc);
     let shown: Vec<(String, String, Color32, Pos)> = link
         .peers
         .iter()
         .zip(colours)
         .filter_map(|(p, colour)| {
             let (pid, at) = p.caret?;
-            Some((p.id.clone(), p.display.clone(), colour, pos_of(&app.session.doc, pid, at)?))
+            Some((p.id.clone(), p.display.clone(), colour, pos_of(&app.session.doc, &blocks, pid, at)?))
         })
         .collect();
     if shown.is_empty() {
@@ -408,6 +435,6 @@ mod tests {
         let pos = Pos::body(0, "hé".len());
         let at = caret_of(&doc, &pos);
         assert_eq!(at, Some((7, 2)), "two chars in, not three bytes");
-        assert_eq!(pos_of(&doc, 7, 2), Some(pos), "and back to the same byte");
+        assert_eq!(pos_of(&doc, &blocks_by_pid(&doc), 7, 2), Some(pos), "and back to the same byte");
     }
 }

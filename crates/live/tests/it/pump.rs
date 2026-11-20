@@ -138,6 +138,7 @@ impl Relay {
             replay_until: Some(until),
             fallback: false,
             text_cap: None,
+            heartbeat: false,
         };
         let pid = self.conns[at].pid.clone();
         let others: Vec<ServerMsg> = self
@@ -188,7 +189,7 @@ impl Relay {
                     None
                 };
                 if let Some(detail) = refusal {
-                    self.conns[at].inbox.push_back(ServerMsg::Error { doc: ROOM.into(), detail: detail.into(), local: Some(local) });
+                    self.conns[at].inbox.push_back(ServerMsg::Error { doc: ROOM.into(), detail: detail.into(), local: Some(local), code: None });
                     return;
                 }
                 self.seq += 1;

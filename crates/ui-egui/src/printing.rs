@@ -193,8 +193,10 @@ pub fn submit(app: &mut crate::WordApp, params: &serde_json::Value) -> Result<se
         // the copies twice, and duplex could put the end of one copy behind the next.
         object.insert("copies".into(), json!(1));
     }
+    // Not while live: the update would be one more edit to share, made by printing.
     if app.ui.update_fields_before_print
-        && let Err(error) = app.session.run("references.updateFields", &json!({"all": true}))
+        && app.live.is_none()
+        && let Err(error) = app.run("references.updateFields", json!({"all": true}))
     {
         log::warn!("updating fields before printing: {error}");
     }

@@ -134,7 +134,7 @@ impl OrganizerForm {
     }
 
     fn load(&mut self, app: &mut WordApp, path: &str) {
-        match app.session.run("styles.organizer", &json!({"path": path})) {
+        match app.run("styles.organizer", json!({"path": path})) {
             Ok(v) => {
                 let list = v.get("file").and_then(|f| f.get("styles")).and_then(Value::as_array).cloned().unwrap_or_default();
                 let s = |x: &Value, k: &str| x.get(k).and_then(Value::as_str).unwrap_or("").to_string();

@@ -68,10 +68,11 @@ impl WordApp {
         if title.is_empty() { tl!("Document1").into() } else { title }
     }
 
-    /// Tell the host whether the document has unsaved changes ([`Services::on_dirty`]).
+    /// Tell the host whether the document has unsaved changes ([`Services::on_dirty`]). Never
+    /// while live: the document service saves the room's document.
     pub(super) fn report_dirty(&self) {
         if let Some(f) = &self.services.on_dirty {
-            f(self.session.dirty || panes::has_comment_drafts(self));
+            f(!self.live_saves() && (self.session.dirty || panes::has_comment_drafts(self)));
         }
     }
 

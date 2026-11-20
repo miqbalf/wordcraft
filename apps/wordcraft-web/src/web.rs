@@ -74,9 +74,10 @@ pub fn start() {
                     let messages = Rc::new(RefCell::new(Vec::new()));
                     let mut services = services(inbox.clone(), cc.egui_ctx.clone(), dirty, saves.clone(), messages.clone());
                     let live_events = crate::host::LiveEvents::default();
+                    let live = crate::host::Live::default();
                     if let Some(bridge) = &app_bridge {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
-                        bridge.listen_live(live_events.clone(), cc.egui_ctx.clone());
+                        bridge.listen_live(live_events.clone(), live.joining(), cc.egui_ctx.clone());
                     }
                     let control = crate::api::install(cc.egui_ctx.clone());
                     let mut app = WordApp::new(session, services).with_control(control);
@@ -107,7 +108,7 @@ pub fn start() {
                         crate::host::Bridge::set_author(&mut app, &author);
                         prefs.keep_own_author(&app.session.author, &own);
                     }
-                    Ok(Box::new(WebShell { app, inbox, messages, prefs, live: crate::host::Live::default(), live_events }))
+                    Ok(Box::new(WebShell { app, inbox, messages, prefs, live, live_events }))
                 }),
             )
             .await;

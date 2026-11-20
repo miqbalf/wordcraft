@@ -37,7 +37,6 @@ eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
 rfd = { workspace = true }
 # The browser hub over the page's socket.io-client (`/craft/vendor/socket.io.min.js`).
 craft-collab = { workspace = true, features = ["web-hub"] }
-web-time = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"

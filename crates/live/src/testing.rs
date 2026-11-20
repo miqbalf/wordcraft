@@ -23,6 +23,8 @@ struct Conn {
     may_edit: bool,
     connected: bool,
     inbox: VecDeque<ServerMsg>,
+    /// The tickets the host handed this connection with [`Hub::set_token`], oldest first.
+    tokens: Vec<String>,
 }
 
 #[derive(Default)]
@@ -55,7 +57,14 @@ impl MemRelay {
     pub fn connect(&self, uid: &str, display: &str, may_edit: bool) -> MemHub {
         let mut r = self.0.borrow_mut();
         let at = r.conns.len();
-        r.conns.push(Conn { pid: format!("{uid}~{at:08x}"), display: display.to_owned(), may_edit, connected: true, inbox: VecDeque::new() });
+        r.conns.push(Conn {
+            pid: format!("{uid}~{at:08x}"),
+            display: display.to_owned(),
+            may_edit,
+            connected: true,
+            inbox: VecDeque::new(),
+            tokens: Vec::new(),
+        });
         r.join(at);
         MemHub { relay: self.clone(), at }
     }
@@ -78,6 +87,19 @@ impl MemRelay {
             c.connected = true;
         }
         r.join(hub.at);
+    }
+
+    /// The relay refuses the connection of `hub` itself (`code` as `auth` for an expired
+    /// ticket), with `detail` in its words. The link stays up until [`MemRelay::drop_link`].
+    pub fn refuse(&self, hub: &MemHub, code: &str, detail: &str) {
+        if let Some(c) = self.0.borrow_mut().conns.get_mut(hub.at) {
+            c.inbox.push_back(ServerMsg::Error { doc: ROOM.into(), detail: detail.into(), local: None, code: Some(code.into()) });
+        }
+    }
+
+    /// The tickets the host handed `hub` with [`Hub::set_token`], oldest first.
+    pub fn tokens(&self, hub: &MemHub) -> Vec<String> {
+        self.0.borrow().conns.get(hub.at).map(|c| c.tokens.clone()).unwrap_or_default()
     }
 
     /// Nothing is waiting for any connected peer.
@@ -103,6 +125,12 @@ impl Hub for MemHub {
     fn connected(&self) -> bool {
         self.relay.0.borrow().conns.get(self.at).is_some_and(|c| c.connected)
     }
+
+    fn set_token(&mut self, token: String) {
+        if let Some(c) = self.relay.0.borrow_mut().conns.get_mut(self.at) {
+            c.tokens.push(token);
+        }
+    }
 }
 
 impl Relay {
@@ -125,6 +153,7 @@ impl Relay {
             replay_until: Some(self.seq),
             fallback: false,
             text_cap: None,
+            heartbeat: false,
         };
         let replay = self.log.clone();
         let others: Vec<ServerMsg> = self
@@ -160,7 +189,12 @@ impl Relay {
         match msg {
             ClientMsg::Submit { local, command, params, .. } => {
                 if !conn.may_edit {
-                    conn.inbox.push_back(ServerMsg::Error { doc: ROOM.into(), detail: "read-only access to this file".into(), local: Some(local) });
+                    conn.inbox.push_back(ServerMsg::Error {
+                        doc: ROOM.into(),
+                        detail: "read-only access to this file".into(),
+                        local: Some(local),
+                        code: None,
+                    });
                     return;
                 }
                 let origin = conn.pid.clone();

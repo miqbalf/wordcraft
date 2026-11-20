@@ -180,7 +180,7 @@ impl ManualForm {
 
     /// The next word from `from`.
     pub fn next(app: &mut WordApp, from: Value) -> ManualForm {
-        let c = app.session.run("layout.manualHyphenation", &json!({"from": from})).unwrap_or_else(|_| json!({"done": true}));
+        let c = app.run("layout.manualHyphenation", json!({"from": from})).unwrap_or_else(|_| json!({"done": true}));
         let points: Vec<usize> =
             c.get("points").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(|n| n as usize).collect()).unwrap_or_default();
         // The word is selected, so the page shows which one is asked about.
