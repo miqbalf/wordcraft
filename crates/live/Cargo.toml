@@ -8,6 +8,11 @@ description = "WordCraft live co-editing: maps a Document's body to and from cra
 [lints]
 workspace = true
 
+[features]
+# `testing`: an in-memory relay, so a host's interface tests (ui-egui) can join a real
+# `LiveEditing` with no server. Dev-dependencies only.
+test-util = []
+
 [dependencies]
 craft-collab = { workspace = true }
 wordcraft-doc = { workspace = true }
