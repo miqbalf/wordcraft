@@ -80,38 +80,107 @@ impl Document {
         touched
     }
 
-    /// Make the shared paragraph ids unique again: when two paragraphs have the same nonzero
-    /// id, the one in a block `before` already had (the same shared block) keeps it, else the
-    /// first in document order, and the others become never shared (`0`). Returns how many ids
-    /// were cleared.
-    pub fn unshare_duplicate_pids(&mut self, before: &Document) -> usize {
-        // Each id's places: (story, paragraph index in the story, in a block `before` had).
-        let kept: HashSet<*const Block> = before.stories().flat_map(|(_, bl)| bl.iter().map(Arc::as_ptr)).collect();
-        let mut places: HashMap<u64, Vec<(StoryRef, usize, bool)>> = HashMap::new();
-        for (story, blocks) in self.stories() {
-            let mut i = 0usize;
+    /// Every paragraph's id, story by story, in document order (tables descended).
+    fn pid_lists(&self) -> Vec<(StoryRef, Vec<u64>)> {
+        self.stories()
+            .map(|(story, blocks)| {
+                let mut ids = Vec::new();
+                for b in blocks {
+                    for_each_para(b, &mut |p| ids.push(p.pid));
+                }
+                (story, ids)
+            })
+            .collect()
+    }
+
+    /// Whether any paragraph in the document has id `pid`.
+    fn has_pid(&self, pid: u64) -> bool {
+        let mut found = false;
+        for (_, blocks) in self.stories() {
             for b in blocks {
-                let old = kept.contains(&Arc::as_ptr(b));
-                for_each_para(b, &mut |p| {
-                    if p.pid != 0 {
-                        places.entry(p.pid).or_default().push((story, i, old));
-                    }
-                    i += 1;
-                });
+                for_each_para(b, &mut |p| found |= p.pid == pid);
+                if found {
+                    return true;
+                }
             }
         }
-        // The (story, index) that keeps each duplicated id.
-        let keep: HashMap<u64, (StoryRef, usize)> = places
-            .into_iter()
-            .filter(|(_, at)| at.len() > 1)
-            .filter_map(|(pid, at)| at.iter().find(|a| a.2).or_else(|| at.first()).map(|a| (pid, (a.0, a.1))))
-            .collect();
-        if keep.is_empty() {
+        false
+    }
+
+    /// A block about to go into the document: its paragraphs whose ids are in the document
+    /// already are copies, so they become never shared. A block that holds no id costs nothing.
+    pub(crate) fn unshare_copies(&self, b: &mut Block) {
+        let mut ids = Vec::new();
+        for_each_para(b, &mut |p| {
+            if p.pid != 0 {
+                ids.push(p.pid);
+            }
+        });
+        let copied: HashSet<u64> = ids.into_iter().filter(|pid| self.has_pid(*pid)).collect();
+        if !copied.is_empty() {
+            for_each_para_mut(b, &mut |p| {
+                if copied.contains(&p.pid) {
+                    p.pid = 0;
+                }
+            });
+        }
+    }
+
+    /// Make the shared paragraph ids unique again after an edit. When paragraphs share a
+    /// nonzero id, the one that sits where the id was in `before` keeps it: the same story
+    /// and the same neighbours (the nearest shared paragraphs with other ids before and after
+    /// it), then the same paragraph index, then the first in document order. The others become
+    /// never shared (`0`). Returns how many ids were cleared.
+    ///
+    /// Two copies right next to each other with nothing else between them look the same from
+    /// where they sit; the index then decides.
+    pub fn unshare_duplicate_pids(&mut self, before: &Document) -> usize {
+        // (story, index, previous other id, next other id) of the paragraph at `i`.
+        fn place(story: StoryRef, ids: &[u64], i: usize) -> (StoryRef, usize, Option<u64>, Option<u64>) {
+            let me = ids.get(i).copied().unwrap_or(0);
+            let other = |q: &&u64| **q != 0 && **q != me;
+            let prev = ids.get(..i).and_then(|h| h.iter().rev().find(other)).copied();
+            let next = ids.get(i + 1..).and_then(|t| t.iter().find(other)).copied();
+            (story, i, prev, next)
+        }
+        let now = self.pid_lists();
+        let mut at: HashMap<u64, Vec<(StoryRef, usize)>> = HashMap::new();
+        for (story, ids) in &now {
+            for (i, pid) in ids.iter().enumerate().filter(|(_, p)| **p != 0) {
+                at.entry(*pid).or_default().push((*story, i));
+            }
+        }
+        at.retain(|_, v| v.len() > 1);
+        if at.is_empty() {
             return 0;
         }
+        let was: HashMap<u64, (StoryRef, usize, Option<u64>, Option<u64>)> = before
+            .pid_lists()
+            .iter()
+            .flat_map(|(story, ids)| {
+                ids.iter().enumerate().filter(|(_, p)| at.contains_key(p)).map(|(i, p)| (*p, place(*story, ids, i))).collect::<Vec<_>>()
+            })
+            .collect();
+        let ids_of = |story: StoryRef| now.iter().find(|(s, _)| *s == story).map(|(_, ids)| ids.as_slice()).unwrap_or(&[]);
+        // The (story, index) that keeps each duplicated id.
+        let keep: HashMap<u64, (StoryRef, usize)> = at
+            .iter()
+            .filter_map(|(pid, places)| {
+                let score = |(story, i): &(StoryRef, usize)| match was.get(pid) {
+                    Some(old) if old.0 == *story => {
+                        let here = place(*story, ids_of(*story), *i);
+                        (u8::from(here.2 == old.2) + u8::from(here.3 == old.3), u8::from(here.1 == old.1))
+                    }
+                    _ => (0, 0),
+                };
+                // The best place; the first one among equals.
+                let best = places.iter().rev().max_by_key(|p| score(p))?;
+                Some((*pid, *best))
+            })
+            .collect();
         let mut cleared = 0;
-        let ids: Vec<StoryRef> = std::iter::once(StoryRef::Body).chain(self.parts.keys().map(|id| StoryRef::Part(*id))).collect();
-        for (story, blocks) in ids.into_iter().zip(self.stories_mut()) {
+        let stories: Vec<StoryRef> = std::iter::once(StoryRef::Body).chain(self.parts.keys().map(|id| StoryRef::Part(*id))).collect();
+        for (story, blocks) in stories.into_iter().zip(self.stories_mut()) {
             let mut i = 0usize;
             for b in blocks.iter_mut() {
                 let mut hit = false;

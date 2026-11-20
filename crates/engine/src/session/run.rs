@@ -84,13 +84,17 @@ impl Session {
     /// out of the session while the command runs, so the commands run inside it (Repeat, a
     /// macro's steps…) are not reported: it hears once, when the content changed, whatever the
     /// command is. `before` is a copy (a pointer per block) taken before anything ran, the
-    /// Markdown source view's sync included. The observer is put back even when the command
-    /// or the observer panics.
+    /// Markdown source view's sync included. Caret movement and selection commands that do
+    /// not mutate cannot change the content, so they skip the copy and the comparison. The
+    /// observer is put back even when the command or the observer panics, and a command that
+    /// panicked is not reported (the document may be half changed).
     fn run_observed(&mut self, id: &str, params: &Value, mut observer: Box<dyn EditObserver>) -> Result<Value, CmdError> {
         let home = self.document_id;
-        let before = (self.live_doc == Some(home)).then(|| self.doc.clone());
+        let watched = self.live_doc == Some(home) && !self.only_moves_the_selection(id);
+        let before = watched.then(|| self.doc.clone());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_unobserved(id, params)));
         if let Some(before) = &before
+            && result.is_ok()
             && self.document_id == home
             && !before.same_content(&self.doc)
         {
@@ -109,6 +113,13 @@ impl Session {
             Ok(r) => r,
             Err(p) => std::panic::resume_unwind(p),
         }
+    }
+
+    /// Whether command `id` only moves the caret or the selection: a `caret.` or `select.`
+    /// command that does not mutate, outside the Markdown source view (whose sync runs before
+    /// a command).
+    fn only_moves_the_selection(&self, id: &str) -> bool {
+        self.md_source.is_none() && (id.starts_with("caret.") || id.starts_with("select.")) && self.registry.get(id).is_some_and(|spec| !spec.mutates)
     }
 
     /// Dispatches `id` through the command registry with transactional rollback on failure,

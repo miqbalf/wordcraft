@@ -750,6 +750,9 @@ impl Document {
         {
             return Err(DocError::Invalid(format!("tables can't nest more than {MAX_TABLE_DEPTH} deep")));
         }
+        // A copy of a shared paragraph is a new paragraph, not a second one with its id.
+        let mut block = block;
+        self.unshare_copies(&mut block);
         let i = path.last();
         let bl = self.container_mut(story, path)?;
         if i > bl.len() {

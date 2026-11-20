@@ -63,9 +63,15 @@ impl Anchor {
 }
 
 impl Session {
-    /// Bind the live hooks to the active document, or unbind them once none is installed.
+    /// Bind the live hooks to the active document when the first of them is installed, and
+    /// unbind them once both are gone. Installing or removing one while the other stays never
+    /// moves the binding, so it cannot follow the user to another document.
     fn bind_live(&mut self) {
-        self.live_doc = (self.observer.is_some() || self.live_undo.is_some()).then_some(self.document_id);
+        if self.observer.is_none() && self.live_undo.is_none() {
+            self.live_doc = None;
+        } else if self.live_doc.is_none() {
+            self.live_doc = Some(self.document_id);
+        }
     }
 
     /// Whether the live hooks are bound to the active document.
@@ -105,6 +111,21 @@ impl Session {
             return None;
         }
         self.live_undo.as_mut().map(|h| h(redo))
+    }
+
+    /// Give paragraphs their shared ids ([`Paragraph::pid`](wordcraft_doc::Paragraph::pid))
+    /// with `f`, which must change nothing else. It is not an edit: not reported to the
+    /// observer, no undo step, no unsaved changes, and the undo history stays. When `f` changed
+    /// anything but ids, or panicked, the document is put back and the result is an error.
+    pub fn assign_pids(&mut self, f: impl FnOnce(&mut Document)) -> Result<(), CmdError> {
+        let before = self.doc.clone();
+        let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut self.doc)));
+        // Ids are not content, so the same content means only ids changed.
+        if applied.is_err() || !before.same_content(&self.doc) {
+            self.doc = before;
+            return Err(CmdError::Failed("assign ids: only paragraph ids may change".into()));
+        }
+        Ok(())
     }
 
     /// Apply a peer's edit to the document the live hooks are bound to (an error while another

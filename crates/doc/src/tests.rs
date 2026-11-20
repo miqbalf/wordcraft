@@ -889,15 +889,41 @@ fn pasted_paragraphs_are_never_shared() {
     }
 }
 
-/// When an edit copies a shared paragraph, the copy loses the id and the paragraph that had it
-/// where it was keeps it.
+/// When an edit copies a shared paragraph, the copy loses the id and the paragraph that sits
+/// where the id was keeps it: when the original was edited too (a new block), and when the copy
+/// is the very same shared block.
 #[test]
 fn a_copied_shared_id_stays_with_the_original() {
-    let before = shared("Alpha\nBravo\n");
+    let before = shared("Alpha\nBravo\nCharlie\n");
+    let bravo = |d: &Document| d.para_paths(StoryRef::Body)[1].clone();
+
+    // Case 1: Bravo is edited in place, and a copy of it goes in front of everything.
     let mut d = before.clone();
-    // A copy of "Bravo" (id 2) goes in front of everything.
-    let copy = d.para(StoryRef::Body, &d.para_paths(StoryRef::Body)[1]).expect("Bravo").clone();
+    let path = bravo(&d);
+    d.para_mut(StoryRef::Body, &path).expect("Bravo").text.push('!');
+    let copy = d.para(StoryRef::Body, &path).expect("Bravo").clone();
     d.body.insert(0, Arc::new(Block::Para(copy)));
     assert_eq!(d.unshare_duplicate_pids(&before), 1);
-    assert_eq!(body_pids(&d)[..3], [0, 1, 2], "the copy is unshared; Alpha and Bravo keep theirs");
+    assert_eq!(body_pids(&d)[..4], [0, 1, 2, 3], "edited original: the copy is unshared");
+
+    // Case 2: the copy is the same shared block as the original.
+    let mut d = before.clone();
+    let same = d.body[1].clone();
+    d.body.insert(0, same);
+    assert_eq!(d.unshare_duplicate_pids(&before), 1);
+    assert_eq!(body_pids(&d)[..4], [0, 1, 2, 3], "shared block: the copy is unshared");
+}
+
+/// A block inserted with a shared id the document already has is a copy: it goes in unshared.
+#[test]
+fn an_inserted_copy_of_a_shared_paragraph_is_unshared() {
+    let mut d = shared("Alpha\nBravo\n");
+    let copy = d.para(StoryRef::Body, &d.para_paths(StoryRef::Body)[1]).expect("Bravo").clone();
+    d.insert_block(StoryRef::Body, &Path::top(0), Block::Para(copy)).expect("inserted");
+    assert_eq!(body_pids(&d)[..3], [0, 1, 2]);
+    // An id the document does not have yet is kept (a paragraph moved back in).
+    let mut moved = Paragraph::with_text("Moved", CharProps::default());
+    moved.pid = 9;
+    d.insert_block(StoryRef::Body, &Path::top(0), Block::Para(moved)).expect("inserted");
+    assert_eq!(body_pids(&d)[0], 9);
 }

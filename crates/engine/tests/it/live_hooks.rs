@@ -187,14 +187,15 @@ fn apply_remote_adds_no_undo_step() {
     .unwrap();
 
     assert!(s.doc.plain_text(StoryRef::Body).contains("Remote"), "the remote edit is in the document");
-    assert!(s.undo_depth() <= depth, "a remote edit is not the local user's undo step");
+    assert!(depth > 0);
+    assert_eq!(s.undo_depth(), 0, "a remote edit adds no step, and the older ones are gone");
     assert!(!s.dirty, "a remote edit alone does not mark the document for autosave (was {dirty})");
     assert!(calls(&log).is_empty(), "a remote edit is not echoed back to the observer");
 
     // An older snapshot can never come back over the peer's edit.
-    let _ = s.run("edit.undo", &json!({}));
+    s.run("edit.undo", &json!({})).unwrap();
     assert!(s.doc.plain_text(StoryRef::Body).contains("Remote"), "Undo keeps the remote edit");
-    let _ = s.run("edit.redo", &json!({}));
+    s.run("edit.redo", &json!({})).unwrap();
     assert!(s.doc.plain_text(StoryRef::Body).contains("Remote"), "Redo keeps the remote edit");
 }
 
@@ -299,4 +300,47 @@ fn undo_actions_go_to_the_live_hook() {
     assert!(s.can_undo() && s.can_redo());
     s.run("edit.undoTo", &json!({"count": 5})).unwrap();
     assert_eq!(*asked.lock().unwrap(), 3, "asked until it had nothing more to undo");
+}
+
+#[test]
+fn removing_one_hook_does_not_move_the_binding() {
+    let mut s = Session::new(Document::new());
+    let shared = s.document_id();
+    let log = observed(&mut s);
+    s.live_undo_hook(Some(Box::new(|_| true)));
+    s.add_document(Document::new());
+    // The undo hook goes while another document is active; the observer stays on the first.
+    s.live_undo_hook(None);
+    s.run("text.insert", &json!({"text": "elsewhere"})).unwrap();
+    assert!(calls(&log).is_empty(), "the other document's edit is not reported: {:?}", ids(&log));
+    assert!(s.apply_remote(|_| {}).is_err());
+    s.activate(shared).unwrap();
+    s.run("text.insert", &json!({"text": "here"})).unwrap();
+    assert_eq!(ids(&log), ["text.insert"]);
+}
+
+#[test]
+fn assigning_pids_is_not_an_edit() {
+    let mut s = Session::new(Document::from_text("Alpha\nBravo\n"));
+    s.run("text.insert", &json!({"text": "x"})).unwrap();
+    let depth = s.undo_depth();
+    s.dirty = false;
+    let log = observed(&mut s);
+    s.assign_pids(|d| {
+        for (i, path) in d.para_paths(StoryRef::Body).into_iter().enumerate() {
+            if let Ok(p) = d.para_mut(StoryRef::Body, &path) {
+                p.pid = i as u64 + 1;
+            }
+        }
+    })
+    .unwrap();
+    assert!(s.doc.para_paths(StoryRef::Body).iter().all(|p| s.doc.para(StoryRef::Body, p).is_some_and(|q| q.pid != 0)));
+    assert_eq!(s.undo_depth(), depth, "the undo history stays");
+    assert!(!s.dirty);
+    assert!(calls(&log).is_empty(), "ids are not reported as an edit");
+
+    // Anything but ids is refused, and the document is as it was.
+    let text = s.doc.plain_text(StoryRef::Body);
+    assert!(s.assign_pids(|d| d.body.truncate(1)).is_err());
+    assert_eq!(s.doc.plain_text(StoryRef::Body), text);
 }
