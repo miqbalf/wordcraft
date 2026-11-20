@@ -67,7 +67,7 @@ pub const TICKET_SECS: i64 = 600;
 /// A ticket this old is replaced, so a reconnect never offers one close to expiry.
 pub const TICKET_REFRESH_SECS: i64 = 480;
 /// The text the editors get when the file changed outside the session (the copy's name follows).
-pub const CONFLICT_TEXT: &str = "Someone changed this file outside the live session. Your session was saved as";
+pub const CONFLICT_TEXT: &str = "Someone changed this file outside the live session. Their version was kept as";
 
 /// After a failed checkpoint or a raced one, wait this long before trying again.
 const RETRY_MS: u64 = 2_000;
@@ -75,8 +75,12 @@ const RETRY_MS: u64 = 2_000;
 const PUT_RETRY_MS: u64 = 5_000;
 /// A closing room whose last save does not get through is closed anyway after this long.
 const CLOSE_GIVE_UP_MS: u64 = 60_000;
-/// A relay link down this long is replaced by a fresh connection with a fresh ticket.
+/// Between first-connection attempts, and the least wait between two fresh-ticket relinks.
 const RELINK_MS: u64 = 5_000;
+/// The hub reconnects on its own, but always with the ticket it was given. Once that ticket is
+/// this old (it expires at [`TICKET_SECS`]) and the link has been down [`RELINK_MS`], the hub is
+/// replaced by one connected with a fresh ticket, since its own retries can no longer get in.
+const HUB_TICKET_STALE_SECS: i64 = TICKET_SECS - 60;
 /// The first connection to the relay is given up after this long.
 const CONNECT_GIVE_UP_MS: u64 = 120_000;
 const TICK: Duration = Duration::from_millis(100);
@@ -708,7 +712,9 @@ impl<H: Hub> Room<H> {
             return;
         }
         say(&self.doc_id, format_args!("saving stopped: {why}"));
-        self.tell(&format!("This live session can no longer be saved to the file ({why}). Keep a copy of your work."));
+        self.tell(&format!(
+            "Saving has stopped: your changes are no longer being saved to the file ({why}). Download a copy to keep your work, then reopen the file."
+        ));
         self.stopped = Some(why.to_owned());
     }
 
@@ -919,6 +925,8 @@ async fn serve_room(cfg: &Config, nc: Arc<Nextcloud>, grant: &Grant) {
         Ok(w) => w,
         Err(e) => return say(room, e),
     };
+    // When the hub's own ticket was minted.
+    let mut hub_ticket = ticket.minted;
     let mut down_since: Option<u64> = None;
     let mut next_try = 0;
     loop {
@@ -929,13 +937,18 @@ async fn serve_room(cfg: &Config, nc: Arc<Nextcloud>, grant: &Grant) {
         let now = clock.now_ms();
         if w.hub().connected() {
             down_since = None;
-        } else if now.saturating_sub(*down_since.get_or_insert(now)) >= RELINK_MS && now >= next_try {
-            // The hub's own reconnect reuses the first ticket and never says it is back, so a
-            // link down this long is replaced with a fresh connection and a fresh ticket.
-            next_try = now + RELINK_MS;
-            if let Some(h) = connect(cfg, room, &mut ticket, clock.as_ref()).await {
-                w.hub_mut().hub = Some(h);
-                down_since = None;
+        } else {
+            let down = now.saturating_sub(*down_since.get_or_insert(now));
+            let expired = clock.unix_ms() / 1000 - hub_ticket >= HUB_TICKET_STALE_SECS;
+            // A short drop is the hub's own to recover (craft-collab reconnects with backoff and
+            // resends what was not confirmed); only a link it cannot get back in on is replaced.
+            if expired && down >= RELINK_MS && now >= next_try {
+                next_try = now + RELINK_MS;
+                if let Some(h) = connect(cfg, room, &mut ticket, clock.as_ref()).await {
+                    w.hub_mut().hub = Some(h);
+                    hub_ticket = ticket.minted;
+                    down_since = None;
+                }
             }
         }
         tokio::time::sleep(TICK).await;

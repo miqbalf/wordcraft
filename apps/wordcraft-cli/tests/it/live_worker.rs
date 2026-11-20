@@ -25,7 +25,7 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use tokio::sync::watch;
 use wordcraft_cli::live_worker::{
-    CONFLICT_TEXT, Clock, Config, Flow, Grant, NOTICE_KIND, Nextcloud, QUIET_MS, Room, RoomFiles, Rooms, Secret, Spawn, router, service_ticket,
+    Clock, Config, Flow, Grant, NOTICE_KIND, Nextcloud, QUIET_MS, Room, RoomFiles, Rooms, Secret, Spawn, router, service_ticket,
 };
 use wordcraft_doc::{Document, Paragraph, Pos, para_block};
 use wordcraft_engine::io::{open_bytes, save_bytes};
@@ -538,7 +538,7 @@ async fn external_change_makes_conflict_copy() {
     assert_eq!(w.count("put412"), 1, "the save found the file changed");
     assert_eq!(w.file(copy), outside, "the version found there is kept beside the file");
     assert_eq!(w.file(taken), b"someone else's", "a taken name is never overwritten");
-    assert_eq!(w.relay.borrow().notices(), [format!("{CONFLICT_TEXT} {copy}.")]);
+    assert_eq!(w.relay.borrow().notices(), [format!("Someone changed this file outside the live session. Their version was kept as {copy}.")]);
     assert_eq!(w.file_texts(), ["One fish", "Two more"], "the session went on saving over that version");
     assert_eq!(w.eds[0].saved_at().as_deref(), Some(etag_of(&w.file(FILE)).as_str()));
 
@@ -624,7 +624,9 @@ async fn no_file_write_before_ack() {
     assert_eq!(w.run_for(30_000, 1_000).await, Flow::Continue, "the room stays open");
     assert_eq!(w.count("put"), 0);
     assert!(w.worker.saving_stopped().is_some());
-    assert_eq!(w.relay.borrow().notices().len(), 1, "the editors were told once");
+    let notices = w.relay.borrow().notices();
+    assert_eq!(notices.len(), 1, "the editors were told once: {notices:?}");
+    assert!(notices[0].starts_with("Saving has stopped"), "{notices:?}");
 }
 
 /// Sign a notify as the app does.
