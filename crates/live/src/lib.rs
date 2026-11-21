@@ -37,7 +37,9 @@
 //! # The session pump
 //!
 //! [`LiveEditing`] does all of the above over a `craft_collab::Live` link, once per frame, and
-//! tracks the live status, the other editors and their carets; see the [`session`] module.
+//! tracks the live status, the other editors and their carets; see the [`session`] module. The
+//! session state machine underneath is craft-live's, shared by every Craft app: this crate is
+//! WordCraft's side of it (the mapping, the engine hooks and the commands allowed live).
 //!
 //! # Before the relay grants a space
 //!
@@ -78,9 +80,9 @@ mod ops;
 mod remote;
 pub mod session;
 mod shareable;
-/// An in-memory relay for host tests; feature `test-util`, never in a release build.
+/// An in-memory relay for host tests (craft-live's); feature `test-util`, never in a release build.
 #[cfg(feature = "test-util")]
-pub mod testing;
+pub use craft_live::testing;
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -90,7 +92,7 @@ use wordcraft_engine::{CmdError, Session};
 
 pub use map::{RECOVERED_STYLE, RECOVERED_STYLE_ID, assign_seed_pids, seed_blocks, seed_ids, write_pids};
 pub use session::{
-    Access, ENDED_KIND, LiveEditing, LiveFail, LiveStatus, NOTICE_KIND, Peer, SAVED_KIND, SERVICE_UID, SaveEvent, Tap, document_from_state,
+    Access, ENDED_KIND, LiveEditing, LiveFail, LiveStatus, NOTICE_KIND, Peer, SAVED_KIND, SERVICE_UID, SaveEvent, Tap, Word, document_from_state,
 };
 pub use shareable::{SHAREABLE, is_shareable};
 

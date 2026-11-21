@@ -41,7 +41,12 @@ wordcraft-ui-egui = { path = "crates/ui-egui" }
 # Live co-editing: the shared block document (yrs) and its relay protocol. The miqbalf fork's
 # feat/yrs-nextcloud branch, pinned by rev until it is merged upstream; no hub features, so it
 # builds for wasm32 and pulls no socket client.
-craft-collab = { git = "https://github.com/miqbalf/collab-craft", rev = "cc393cf8c42a58b90e46b5d32aecec63c8bb60d8", version = "=0.1.0" }
+craft-collab = { git = "https://github.com/miqbalf/collab-craft", rev = "95eea9626ad619e2e4e2a3cf0fcb56d6fe6be048", version = "=0.1.0" }
+# The live session state machine and the document service's worker loop every Craft app shares
+# (craft-live, craft-live-worker), from the same collab-craft rev as craft-collab: WordCraft keeps
+# only its mapping, engine hooks and document service on top.
+craft-live = { git = "https://github.com/miqbalf/collab-craft", rev = "95eea9626ad619e2e4e2a3cf0fcb56d6fe6be048", version = "=0.1.0" }
+craft-live-worker = { git = "https://github.com/miqbalf/collab-craft", rev = "95eea9626ad619e2e4e2a3cf0fcb56d6fe6be048", version = "=0.1.0" }
 craft-codepage = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 craft-metafile = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 

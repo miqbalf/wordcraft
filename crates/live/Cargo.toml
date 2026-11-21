@@ -11,12 +11,13 @@ workspace = true
 [features]
 # `testing`: an in-memory relay, so a host's interface tests (ui-egui) can join a real
 # `LiveEditing` with no server. Dev-dependencies only.
-test-util = []
+test-util = ["craft-live/test-util"]
 # The native socket transport, for the tests that join a real craft-collab relay.
 native-hub = ["craft-collab/native-hub"]
 
 [dependencies]
 craft-collab = { workspace = true }
+craft-live = { workspace = true }
 wordcraft-doc = { workspace = true }
 wordcraft-engine = { workspace = true }
 log = { workspace = true }

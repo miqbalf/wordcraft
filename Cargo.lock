@@ -1184,7 +1184,7 @@ source = "git+https://github.com/storytold/craft-libs?rev=93dac78c93a7f1fd66e202
 [[package]]
 name = "craft-collab"
 version = "0.1.0"
-source = "git+https://github.com/miqbalf/collab-craft?rev=cc393cf8c42a58b90e46b5d32aecec63c8bb60d8#cc393cf8c42a58b90e46b5d32aecec63c8bb60d8"
+source = "git+https://github.com/miqbalf/collab-craft?rev=95eea9626ad619e2e4e2a3cf0fcb56d6fe6be048#95eea9626ad619e2e4e2a3cf0fcb56d6fe6be048"
 dependencies = [
  "base64 0.23.1",
  "js-sys",
@@ -1384,6 +1384,38 @@ dependencies = [
  "craft-math",
  "craft-mime",
  "craft-wordmodel",
+]
+
+[[package]]
+name = "craft-live"
+version = "0.1.0"
+source = "git+https://github.com/miqbalf/collab-craft?rev=95eea9626ad619e2e4e2a3cf0fcb56d6fe6be048#95eea9626ad619e2e4e2a3cf0fcb56d6fe6be048"
+dependencies = [
+ "craft-collab",
+ "log",
+ "serde_json",
+]
+
+[[package]]
+name = "craft-live-worker"
+version = "0.1.0"
+source = "git+https://github.com/miqbalf/collab-craft?rev=95eea9626ad619e2e4e2a3cf0fcb56d6fe6be048#95eea9626ad619e2e4e2a3cf0fcb56d6fe6be048"
+dependencies = [
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "craft-collab",
+ "craft-live",
+ "getrandom 0.3.4",
+ "hmac",
+ "hyper",
+ "hyper-util",
+ "log",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tokio",
 ]
 
 [[package]]
@@ -7853,17 +7885,14 @@ version = "0.18.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
- "chrono",
  "craft-collab",
+ "craft-live",
+ "craft-live-worker",
  "craft-zip",
- "getrandom 0.3.4",
  "hmac",
- "hyper",
- "hyper-util",
  "image",
  "log",
  "reqwest 0.12.28",
- "serde",
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.1",
@@ -8047,6 +8076,7 @@ version = "0.18.1"
 dependencies = [
  "base64 0.23.1",
  "craft-collab",
+ "craft-live",
  "hmac",
  "log",
  "serde",

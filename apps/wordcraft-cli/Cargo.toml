@@ -25,25 +25,13 @@ wordcraft-mcp = { workspace = true }
 wordcraft-zotero = { workspace = true }
 serde_json = { workspace = true }
 sys-locale = "0.3"
-# live-worker: the document service of live co-editing (see src/live_worker.rs).
+# live-worker: the document service of live co-editing. The worker loop is craft-live-worker's,
+# shared by every Craft app; src/live_worker.rs is WordCraft's document service on it.
 wordcraft-live = { workspace = true }
 craft-collab = { workspace = true, features = ["native-hub"] }
-serde = { workspace = true }
+craft-live = { workspace = true }
+craft-live-worker = { workspace = true }
 log = { workspace = true }
-chrono = { workspace = true }
-hmac = { workspace = true }
-sha2 = { workspace = true }
-base64 = { workspace = true }
-getrandom = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
-# The notify endpoint: one small HTTP/1 route, on the hyper and tokio already in the build.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-# Served by hand on hyper's HTTP/1 connection builder, for its header-read timeout and no
-# keep-alive (axum::serve sets neither); both already in the build under axum and reqwest.
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "service"] }
-# The Nextcloud file API. 0.12 with native-tls is what the socket client already builds.
-reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
 
 [dev-dependencies]
 wordcraft-fonts = { workspace = true }
@@ -52,3 +40,10 @@ image = { workspace = true }
 craft-zip = { workspace = true }
 sha1 = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "sync", "io-util"] }
+# The live-worker tests: a fake Nextcloud (axum) checking the worker's signatures, and relay
+# tickets minted the way the app mints them.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
