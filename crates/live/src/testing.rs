@@ -97,6 +97,21 @@ impl MemRelay {
         }
     }
 
+    /// The relay's sequence: the last op it ordered.
+    pub fn seq(&self) -> u64 {
+        self.0.borrow().seq
+    }
+
+    /// The relay gives up catching `hub` up and sends the room's snapshot instead (a client
+    /// that fell too far behind), which breaks a window's link.
+    pub fn fall_behind(&self, hub: &MemHub) {
+        let mut r = self.0.borrow_mut();
+        let seq = r.seq;
+        if let Some(c) = r.conns.get_mut(hub.at) {
+            c.inbox.push_back(ServerMsg::Snapshot { doc: ROOM.into(), seq, document: Value::Null });
+        }
+    }
+
     /// The tickets the host handed `hub` with [`Hub::set_token`], oldest first.
     pub fn tokens(&self, hub: &MemHub) -> Vec<String> {
         self.0.borrow().conns.get(hub.at).map(|c| c.tokens.clone()).unwrap_or_default()

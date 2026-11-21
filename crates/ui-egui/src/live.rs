@@ -33,6 +33,10 @@ pub const NEWER: &str = "This file is being edited with a newer WordCraft. Updat
 pub const ENDED: &str = "Live editing ended. Reopen the file.";
 /// The notice when the link breaks: [`ENDED`] and why.
 pub const ENDED_BECAUSE: &str = "Live editing ended. Reopen the file. {reason}";
+/// The status line once the link is broken with edits no save holds: Save As keeps them.
+pub const ENDED_UNSAVED: &str = "Live editing ended. Download a copy to keep your changes, then reopen the file.";
+/// [`ENDED_UNSAVED`] and why, as the notice.
+pub const ENDED_UNSAVED_BECAUSE: &str = "Live editing ended. Download a copy to keep your changes, then reopen the file. {reason}";
 /// Save and Save As while live: the document service writes the file for everyone.
 pub const SAVED_FOR_YOU: &str = "While the file is edited live, it is saved for everyone automatically.";
 /// How often the host hears the state when nothing changed, in milliseconds.
@@ -95,6 +99,9 @@ pub struct LiveLink {
     reported: Option<(LiveReport, f64)>,
     /// The broken state's detail has been put on the status line.
     told_broken: bool,
+    /// Milliseconds for the report throttle: the frame clock unless set
+    /// ([`WordApp::live_set_clock`]).
+    clock: Box<dyn Fn() -> f64>,
 }
 
 impl LiveLink {
@@ -174,6 +181,7 @@ impl WordApp {
             saved: None,
             reported: None,
             told_broken: false,
+            clock: Box::new(now_ms),
         })));
         Ok(())
     }
@@ -210,18 +218,31 @@ impl WordApp {
         }
     }
 
-    /// Whether the document service saves this window's document (it is linked to a room), so
-    /// the window never has unsaved changes of its own.
+    /// The clock, in milliseconds, that holds the host's reports to one a second (tests).
+    pub fn live_set_clock(&mut self, clock: Box<dyn Fn() -> f64>) {
+        if let Some(LiveMode::Linked(link)) = &mut self.live {
+            link.clock = clock;
+        }
+    }
+
+    /// Whether the document service saves this window's document: linked to a room and
+    /// connecting, live or reconnecting, so the window has no unsaved changes of its own. Once
+    /// the link is broken or refused, edits no save holds are this window's to keep.
     pub(crate) fn live_saves(&self) -> bool {
-        matches!(self.live, Some(LiveMode::Linked(_)))
+        self.live_link().is_some_and(|link| matches!(link.status(), LiveStatus::Connecting | LiveStatus::Live { .. } | LiveStatus::Reconnecting))
     }
 
     /// Whether live editing lets command `id` run now; true when not live.
     pub(crate) fn live_allows(&self, id: &str) -> bool {
         match &self.live {
             None => true,
-            // Saving this window's copy would race the document service's saves.
-            Some(LiveMode::Linked(link)) => !saves_the_file(id) && link.editing.allows(id),
+            // Saving over the file would race the document service's saves. A copy is refused
+            // while the service saves, and is how edits are kept once the link has ended.
+            Some(LiveMode::Linked(link)) => match id {
+                "file.save" => false,
+                "file.saveAs" => !self.live_saves(),
+                _ => link.editing.allows(id),
+            },
             Some(LiveMode::Newer) => self.session.registry.get(id).is_none_or(|spec| !spec.mutates),
         }
     }
@@ -232,12 +253,15 @@ impl WordApp {
         if self.session.registry.get(id).is_none() || self.live_allows(id) {
             return None;
         }
+        let (saves, dirty) = (self.live_saves(), self.session.dirty);
         let why = match &mut self.live {
             // Refuses without running, with the reason as a notice for the next frame.
             Some(LiveMode::Linked(link)) if !saves_the_file(id) => {
                 return Some(link.editing.run(&mut self.session, id, params).map_err(|e| e.to_string()));
             }
-            Some(LiveMode::Linked(_)) => tl!(SAVED_FOR_YOU),
+            Some(LiveMode::Linked(_)) if saves => tl!(SAVED_FOR_YOU),
+            Some(LiveMode::Linked(_)) if dirty => tl!(ENDED_UNSAVED),
+            Some(LiveMode::Linked(_)) => tl!(ENDED),
             _ => tl!(NEWER),
         };
         self.status_long(why);
@@ -282,15 +306,18 @@ impl WordApp {
             && link.saved.as_ref().is_none_or(|(e, _)| e != etag)
         {
             link.saved = Some((etag.clone(), unix_secs()));
-            // The file now holds the room's document. Every local edit was shared when it ran
-            // (`live_session_run` flushes), so none waits to be saved by this window.
+        }
+        // Clean once the newest save holds every edit this window made; an edit the relay
+        // ordered after the save's checkpoint, or has not ordered yet, keeps it dirty.
+        if self.session.dirty && link.editing.edits_saved() {
             self.session.dirty = false;
         }
         if let LiveStatus::Broken(detail) = link.editing.status()
             && !link.told_broken
         {
             link.told_broken = true;
-            notices.push(i18n::fmt(tl!(ENDED_BECAUSE), &[("reason", tl!(detail.as_str()))]));
+            let notice = if self.session.dirty { ENDED_UNSAVED_BECAUSE } else { ENDED_BECAUSE };
+            notices.push(i18n::fmt(tl!(notice), &[("reason", tl!(detail.as_str()))]));
         }
         // The caret, when it moved.
         let focus = caret_of(&self.session.doc, &self.session.sel.focus);
@@ -303,7 +330,7 @@ impl WordApp {
             }
         }
         let report = report_of(link);
-        let now = now_ms();
+        let now = (link.clock)();
         let due = match &link.reported {
             None => true,
             // A new state at once; a new save or roster at most once a second.
@@ -337,7 +364,10 @@ impl WordApp {
                 None => (tl!("Live").to_string(), None),
             },
             LiveStatus::Refused(why) => (tl!(why.as_str()).to_string(), None),
-            LiveStatus::Broken(why) => (tl!(ENDED).to_string(), Some(tl!(why.as_str()).to_string())),
+            LiveStatus::Broken(why) => {
+                let line = if self.session.dirty { ENDED_UNSAVED } else { ENDED };
+                (tl!(line).to_string(), Some(tl!(why.as_str()).to_string()))
+            }
         })
     }
 

@@ -1,7 +1,7 @@
 //! Live co-editing in the window: a WordCraft window joins a room through the in-memory relay
 //! (`wordcraft-live`'s `test-util`) next to Bob, a second editor with no window.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use egui::accesskit::Role;
@@ -12,7 +12,7 @@ use wordcraft_doc::Document;
 use wordcraft_engine::Session;
 use wordcraft_live::LiveEditing;
 use wordcraft_live::testing::{MemHub, MemRelay, ROOM};
-use wordcraft_ui_egui::live::{Access, LiveReport, NEWER, SAVED_FOR_YOU};
+use wordcraft_ui_egui::live::{Access, ENDED, ENDED_UNSAVED, LiveReport, LiveStatus, NEWER, SAVED_FOR_YOU};
 use wordcraft_ui_egui::{Services, WordApp};
 
 fn file() -> Vec<u8> {
@@ -49,10 +49,22 @@ fn alice(relay: &MemRelay, access: Access, may_edit: bool) -> (Harness<'static, 
 
 /// [`alice`] with the host's `services`.
 fn alice_with(relay: &MemRelay, access: Access, may_edit: bool, services: Services) -> (Harness<'static, WordApp>, MemHub) {
+    alice_set_up(relay, access, may_edit, services, |_| {})
+}
+
+/// [`alice_with`], with `set_up` run on the linked window before its first frame.
+fn alice_set_up(
+    relay: &MemRelay,
+    access: Access,
+    may_edit: bool,
+    services: Services,
+    set_up: impl FnOnce(&mut WordApp),
+) -> (Harness<'static, WordApp>, MemHub) {
     let mut app = WordApp::new(Session::new(Document::new()), services);
     app.ui.language = "en".into();
     let hub = relay.connect("alice", "Alice", may_edit);
     app.start_live(Box::new(hub.clone()), ROOM, &file(), "plan.docx", access).unwrap();
+    set_up(&mut app);
     let h = Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
         |ui, app: &mut WordApp| {
             let ctx = ui.ctx().clone();
@@ -187,31 +199,27 @@ fn non_shareable_command_is_disabled_while_live() {
     assert!(h.state().session.doc.same_content(&before), "and changes nothing");
 }
 
-#[test]
-fn broken_status_blocks_typing() {
-    let relay = MemRelay::new();
-    let mut bob = Bob::join(&relay);
-    // An edit ticket the relay treats as read-only: the first edit breaks the link.
-    let (mut h, _hub) = alice(&relay, Access::Edit, false);
-    settle(&relay, &mut h, &mut bob);
-    let before = alice_text(&mut h);
-    type_text(&mut h, "X");
-    assert_ne!(alice_text(&mut h), before, "typing reaches the document while live");
-    settle(&relay, &mut h, &mut bob);
-    assert!(has_label(&h, "Live editing ended. Reopen the file."), "the status line says live editing ended");
-    let broken = alice_text(&mut h);
-    assert!(h.state_mut().run("text.insert", json!({"text": "Z"})).is_err(), "the window refuses the edit itself");
-    type_text(&mut h, "Y");
-    settle(&relay, &mut h, &mut bob);
-    assert_eq!(alice_text(&mut h), broken, "typing is blocked once the link is broken");
-}
-
 /// The host's `live-state` reports, as they are made.
 fn recorded_reports() -> (Services, Rc<RefCell<Vec<LiveReport>>>) {
-    let reports = Rc::new(RefCell::new(Vec::new()));
-    let seen = Rc::clone(&reports);
-    let services = Services { live_state: Some(Box::new(move |r: &LiveReport| seen.borrow_mut().push(r.clone()))), ..Services::default() };
+    let (services, reports, _) = recorded();
     (services, reports)
+}
+
+/// The host's `live-state` reports and its unsaved-changes flags (the leave guard), as made.
+fn recorded() -> (Services, Rc<RefCell<Vec<LiveReport>>>, Rc<RefCell<Vec<bool>>>) {
+    let reports = Rc::new(RefCell::new(Vec::new()));
+    let dirty = Rc::new(RefCell::new(Vec::new()));
+    let (seen, guard) = (Rc::clone(&reports), Rc::clone(&dirty));
+    let services = Services {
+        live_state: Some(Box::new(move |r: &LiveReport| seen.borrow_mut().push(r.clone()))),
+        on_dirty: Some(Box::new(move |d| guard.borrow_mut().push(d))),
+        ..Services::default()
+    };
+    (services, reports, dirty)
+}
+
+fn status(h: &Harness<'static, WordApp>) -> LiveStatus {
+    h.state().live_link().map(|l| l.status().clone()).unwrap()
 }
 
 #[test]
@@ -219,22 +227,123 @@ fn nothing_unsaved_is_shown_while_live() {
     let relay = MemRelay::new();
     let mut bob = Bob::join(&relay);
     let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
-    let reported = Rc::new(RefCell::new(Vec::new()));
-    let seen = Rc::clone(&reported);
-    let services = Services { on_dirty: Some(Box::new(move |dirty| seen.borrow_mut().push(dirty))), ..Services::default() };
+    let (services, _, guard) = recorded();
     let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
     type_text(&mut h, "X");
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
     assert!(alice_text(&mut h).contains('X'), "the edit was made");
-    assert!(!reported.borrow().is_empty(), "the host heard about unsaved changes");
-    assert!(reported.borrow().iter().all(|dirty| !dirty), "never dirty while live: the service saves");
-    // The service saves the room's document: the window's own copy is clean again, so it is
-    // not dirty once live editing ends either.
-    service.le.announce_saved(1, "etag-1").unwrap();
+    assert!(h.state().session.dirty, "no save holds it yet");
+    assert!(!guard.borrow().is_empty(), "the host heard about unsaved changes");
+    assert!(guard.borrow().iter().all(|dirty| !dirty), "never dirty while live: the service saves");
+    // The service saves through the edit: this window's copy is clean again.
+    service.le.announce_saved(relay.seq(), "etag-1").unwrap();
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
-    assert!(h.state().live_link().is_some_and(|l| matches!(l.status(), wordcraft_ui_egui::live::LiveStatus::Live { saved_at: Some(_) })));
-    assert!(!h.state().session.dirty, "the save took this window's edits");
+    assert!(matches!(status(&h), LiveStatus::Live { saved_at: Some(_) }));
+    assert!(!h.state().session.dirty, "the save holds this window's edits");
+}
+
+#[test]
+fn an_edit_after_the_saved_checkpoint_stays_unsaved() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
+    let (mut h, _hub) = alice(&relay, Access::Edit, true);
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    // The service snapshots the room here, then Alice types before its save is announced.
+    let checkpoint = relay.seq();
+    type_text(&mut h, "X");
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert!(relay.seq() > checkpoint, "the edit was ordered after the checkpoint");
+    service.le.announce_saved(checkpoint, "etag-1").unwrap();
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert!(matches!(status(&h), LiveStatus::Live { saved_at: Some(_) }), "the save was heard");
+    assert!(h.state().session.dirty, "but it does not hold the edit");
+    service.le.announce_saved(relay.seq(), "etag-2").unwrap();
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert!(!h.state().session.dirty, "the next save does");
+}
+
+#[test]
+fn broken_link_with_an_unsaved_edit_keeps_it_for_a_copy() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (services, _, guard) = recorded();
+    // An edit ticket the relay treats as read-only: the first edit breaks the link.
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, false, services);
+    settle(&relay, &mut h, &mut bob);
+    let before = alice_text(&mut h);
+    type_text(&mut h, "X");
+    assert_ne!(alice_text(&mut h), before, "typing reaches the document while live");
+    settle(&relay, &mut h, &mut bob);
+    assert!(matches!(status(&h), LiveStatus::Broken(_)));
+    assert!(has_label(&h, ENDED_UNSAVED), "the status line says to download a copy");
+    assert_eq!(guard.borrow().last(), Some(&true), "the leave guard is on");
+    assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "Save As keeps the edit");
+    assert!(!wordcraft_ui_egui::widgets::enabled(h.state(), "file.save"), "but nothing saves over the shared file");
+    assert!(h.state_mut().run("file.save", json!({})).is_err());
+    let broken = alice_text(&mut h);
+    assert!(h.state_mut().run("text.insert", json!({"text": "Z"})).is_err(), "the window refuses the edit itself");
+    type_text(&mut h, "Y");
+    settle(&relay, &mut h, &mut bob);
+    assert_eq!(alice_text(&mut h), broken, "typing is blocked once the link is broken");
+}
+
+#[test]
+fn broken_link_with_every_edit_saved_shows_saved() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
+    let (services, _, guard) = recorded();
+    let (mut h, hub) = alice_with(&relay, Access::Edit, true, services);
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    type_text(&mut h, "X");
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    service.le.announce_saved(relay.seq(), "etag-1").unwrap();
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    relay.fall_behind(&hub);
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert!(matches!(status(&h), LiveStatus::Broken(_)));
+    assert!(!h.state().session.dirty, "the save holds every edit");
+    assert!(has_label(&h, ENDED), "reopening loses nothing");
+    assert_eq!(guard.borrow().last(), Some(&false), "the leave guard stays off");
+}
+
+#[test]
+fn the_host_hears_each_state_at_once_and_a_seconds_changes_once() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (services, reports) = recorded_reports();
+    let now = Rc::new(Cell::new(0.0));
+    let clock = Rc::clone(&now);
+    // The report clock is the test's from the first frame on.
+    let (mut h, hub) = alice_set_up(&relay, Access::Edit, true, services, |app| app.live_set_clock(Box::new(move || clock.get())));
+    settle(&relay, &mut h, &mut bob);
+    assert_eq!(reports.borrow().last().map(|r| r.state), Some("live"));
+    assert!(reports.borrow().last().is_some_and(|r| r.peers.iter().any(|(_, name)| name == "Bob")), "with Bob");
+    let n = reports.borrow().len();
+    for _ in 0..20 {
+        h.step();
+    }
+    assert_eq!(reports.borrow().len(), n, "nothing changed: nothing told");
+    // Two roster changes within the second: held, then told once.
+    now.set(100.0);
+    let mut carol = Bob::join_as(&relay, "carol", "Carol");
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut carol]);
+    now.set(500.0);
+    let mut dave = Bob::join_as(&relay, "dave", "Dave");
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut carol, &mut dave]);
+    assert_eq!(reports.borrow().len(), n, "held within the second");
+    now.set(1100.0);
+    h.step();
+    assert_eq!(reports.borrow().len(), n + 1, "one report for both");
+    let names: Vec<String> = reports.borrow().last().map(|r| r.peers.iter().map(|(_, name)| name.clone()).collect()).unwrap_or_default();
+    assert!(names.contains(&"Carol".to_string()) && names.contains(&"Dave".to_string()), "{names:?}");
+    // A new state goes out at once, however soon after the last report.
+    relay.drop_link(&hub);
+    h.step();
+    assert_eq!(reports.borrow().len(), n + 2);
+    assert_eq!(reports.borrow().last().map(|r| r.state), Some("reconnecting"));
 }
 
 #[test]
@@ -267,32 +376,6 @@ fn a_refused_connection_says_why_until_a_fresh_ticket_joins() {
     settle(&relay, &mut h, &mut bob);
     assert!(has_label(&h, "Live"), "live again");
     assert_eq!(reports.borrow().last().map(|r| r.state), Some("live"));
-}
-
-#[test]
-fn the_host_hears_each_state_at_once_and_nothing_twice() {
-    let relay = MemRelay::new();
-    let mut bob = Bob::join(&relay);
-    let (services, reports) = recorded_reports();
-    let (mut h, hub) = alice_with(&relay, Access::Edit, true, services);
-    settle(&relay, &mut h, &mut bob);
-    assert_eq!(reports.borrow().last().map(|r| r.state), Some("live"));
-    assert!(reports.borrow().last().is_some_and(|r| r.peers.iter().any(|(_, name)| name == "Bob")), "with Bob");
-    let n = reports.borrow().len();
-    for _ in 0..20 {
-        h.step();
-    }
-    assert_eq!(reports.borrow().len(), n, "nothing changed: nothing told");
-    // A roster change is told within a second.
-    let mut carol = Bob::join_as(&relay, "carol", "Carol");
-    settle_all(&relay, &mut h, &mut [&mut bob, &mut carol]);
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    h.step();
-    assert!(reports.borrow().last().is_some_and(|r| r.peers.iter().any(|(_, name)| name == "Carol")), "Carol is told");
-    // A new state goes out at once, however soon after the last report.
-    relay.drop_link(&hub);
-    h.step();
-    assert_eq!(reports.borrow().last().map(|r| r.state), Some("reconnecting"));
 }
 
 #[test]
