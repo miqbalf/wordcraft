@@ -68,7 +68,7 @@
 //! Recovered and forwarded text (see the crate documentation) is made outside the replica's
 //! undo history, so the user's Undo never takes it back.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use craft_collab::{BlockChange, ClientMsg, Hub, Live, LiveDoc, LiveError, ServerMsg, Work};
@@ -171,6 +171,17 @@ struct Seen {
     text_ops_owed: bool,
     /// The relay could not catch this link up (`snapshot`: fell too far behind).
     replaced: bool,
+    /// This connection's peer id, from its join.
+    me: Option<String>,
+    /// This replica's edit submits (their `local` counters) the relay has not ordered yet.
+    pending: BTreeSet<u64>,
+    /// The highest sequence the relay gave one of this replica's edits.
+    confirmed: Option<u64>,
+    /// Edits sent before a rejoin, unconfirmed, and not yet sent again (`Live` resends them,
+    /// merged, while it handles the join).
+    stale: bool,
+    /// A join was just seen: the submits sent before the next poll are the resend.
+    resending: bool,
 }
 
 impl Seen {
@@ -180,9 +191,42 @@ impl Seen {
         self.replay_until.is_some() || self.text_ops_owed
     }
 
+    /// Whether a save through `saved` holds every edit this replica made: each one the relay
+    /// ordered is at or before it, and none is waiting to be ordered or sent again.
+    fn covered(&self, saved: Option<u64>) -> bool {
+        !self.stale && self.pending.is_empty() && self.confirmed.is_none_or(|c| saved.is_some_and(|s| c <= s))
+    }
+
+    /// An edit submit went out.
+    fn sent(&mut self, msg: &ClientMsg) {
+        if let ClientMsg::Submit { local, command, .. } = msg
+            && craft_collab::is_crdt_command(command)
+        {
+            self.pending.insert(*local);
+            // The rejoin's resend carries the edits sent before it.
+            if self.resending {
+                self.stale = false;
+            }
+        }
+    }
+
     fn saw(&mut self, m: &ServerMsg) {
+        if let ServerMsg::Op { seq, origin, local: Some(local), .. } = m
+            && self.me.as_ref() == Some(origin)
+            && self.pending.remove(local)
+        {
+            self.confirmed = self.confirmed.max(Some(*seq));
+        }
         match m {
-            ServerMsg::Joined { seq, space, replay_until, fallback, .. } => {
+            ServerMsg::Joined { peer, seq, space, replay_until, fallback, .. } => {
+                // What was sent before is never ordered under these counters now: `Live` sends
+                // it again, merged, as it handles the join.
+                if !self.pending.is_empty() {
+                    self.pending.clear();
+                    self.stale = true;
+                    self.resending = true;
+                }
+                self.me = Some(peer.clone());
                 self.joins += 1;
                 self.space = Some(*space);
                 // An older relay does not mark its replay; there nothing can be waited for.
@@ -207,11 +251,14 @@ pub struct Tap<H> {
 
 impl<H: Hub> Hub for Tap<H> {
     fn send(&mut self, msg: ClientMsg) -> craft_collab::Result<()> {
+        lock(&self.seen).sent(&msg);
         self.hub.send(msg)
     }
     fn poll(&mut self) -> Vec<ServerMsg> {
         let msgs = self.hub.poll();
         let mut seen = lock(&self.seen);
+        // The last join's resend, if any, has gone out by now.
+        seen.resending = false;
         for m in &msgs {
             seen.saw(m);
         }
@@ -219,6 +266,9 @@ impl<H: Hub> Hub for Tap<H> {
     }
     fn connected(&self) -> bool {
         self.hub.connected()
+    }
+    fn set_token(&mut self, token: String) {
+        self.hub.set_token(token);
     }
 }
 
@@ -324,6 +374,8 @@ pub struct LiveEditing<H: Hub> {
     service_uid: String,
     carets: HashMap<String, Caret>,
     notices: Vec<String>,
+    /// A local edit stayed in the session without reaching the room.
+    lost: bool,
     save_events: Vec<SaveEvent>,
     cursor: CursorOut,
     clock: Option<Clock>,
@@ -371,6 +423,7 @@ impl<H: Hub> LiveEditing<H> {
             service_uid: SERVICE_UID.to_owned(),
             carets: HashMap::new(),
             notices: Vec::new(),
+            lost: false,
             save_events: Vec::new(),
             cursor: CursorOut::default(),
             clock: default_clock(),
@@ -470,6 +523,14 @@ impl<H: Hub> LiveEditing<H> {
             Some(spec) if !spec.mutates => true,
             _ => self.editable() && is_shareable(command_id),
         }
+    }
+
+    /// Whether the newest save announced holds every local edit this replica made: each one
+    /// the relay ordered is at or before the save's sequence, none is waiting to be ordered or
+    /// sent again, and none was kept back from the room. False means the document has edits
+    /// only this window holds, which reopening the file would lose.
+    pub fn edits_saved(&self) -> bool {
+        !self.lost && lock(&self.seen).covered(self.saved.as_ref().map(|(seq, _)| *seq))
     }
 
     /// Lines for the user since the last call, in plain English (untranslated).
@@ -686,6 +747,7 @@ impl<H: Hub> LiveEditing<H> {
     /// An update this replica holds never reached the relay, so the room will not have it:
     /// carrying on would let this window drift from the others for good.
     fn unsent(&mut self) {
+        self.lost = true;
         self.notices.push(UNSENT.to_owned());
         self.break_with(BROKEN);
     }

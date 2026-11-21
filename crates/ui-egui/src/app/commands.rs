@@ -119,6 +119,15 @@ impl WordApp {
         if let Some(r) = self.ui_command(id, &params) {
             return r;
         }
+        // Live editing: an engine command it doesn't allow now is refused here, before any
+        // save, download or close below could act on it.
+        if let Some(r) = self.live_gate(id, &params) {
+            return r;
+        }
+        // A live session that ended: Save As downloads a copy itself, and the edits stay unsaved.
+        if let Some(r) = self.live_copy(id) {
+            return r;
+        }
         if id == "file.close" {
             return self.close_document(&params);
         }
@@ -238,11 +247,8 @@ impl WordApp {
         let math_session = self.session.math.as_ref().map(|m| m.session);
         let composing_before = !self.canvas.ime_preedit.is_empty();
         let old_path = self.session.path.clone();
-        let r = if self.ime_origin {
-            self.session.run_ime(id, &params).map_err(|e| e.to_string())
-        } else {
-            self.session.run(id, &params).map_err(|e| e.to_string())
-        };
+        // Through the live link while live, so the edit is shared before the next command.
+        let r = self.live_session_run(id, &params, self.ime_origin);
         if self.session.ime_body_epoch() != body_epoch {
             self.canvas.ime_interrupted_preedit |= composing_before;
             // The body (or the whole document) was replaced under the same id — setText, a

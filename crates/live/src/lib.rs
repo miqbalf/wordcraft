@@ -78,6 +78,9 @@ mod ops;
 mod remote;
 pub mod session;
 mod shareable;
+/// An in-memory relay for host tests; feature `test-util`, never in a release build.
+#[cfg(feature = "test-util")]
+pub mod testing;
 
 use std::collections::{BTreeMap, VecDeque};
 

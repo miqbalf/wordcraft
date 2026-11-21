@@ -414,7 +414,8 @@ impl WordApp {
 
     /// Whether AutoSave covers the document: it is on and nothing blocks it ([`Self::autosave_block`]).
     pub fn autosaves(&self) -> bool {
-        self.autosave && self.autosave_block().is_none()
+        // While live the document service saves the file; this window's copy is never written.
+        self.autosave && self.autosave_block().is_none() && self.live.is_none()
     }
 
     /// `file.autosave` (the AutoSave switch, and scripts): `value` turns AutoSave on or off;

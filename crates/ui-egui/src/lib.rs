@@ -54,6 +54,7 @@ pub mod ink;
 pub mod keys;
 pub mod keytips;
 pub(crate) mod language_packs;
+pub mod live;
 mod local_time;
 pub mod md_source;
 pub mod mini_toolbar;
@@ -818,6 +819,8 @@ pub struct WordApp {
     pub(crate) outline_prev_tab: Option<String>,
     /// Zotero commands in flight (`ui.zotero.*`).
     pub zotero: zotero::ZoteroLink,
+    /// The live co-editing session, when the host started one ([`WordApp::start_live`]).
+    pub live: Option<live::LiveMode>,
     /// The egui context, once the first frame has run (background work wakes the UI with it).
     pub(crate) ctx: Option<egui::Context>,
     /// Whether the current command was entered by an input method's own transaction. The engine

@@ -8,6 +8,13 @@ description = "WordCraft live co-editing: maps a Document's body to and from cra
 [lints]
 workspace = true
 
+[features]
+# `testing`: an in-memory relay, so a host's interface tests (ui-egui) can join a real
+# `LiveEditing` with no server. Dev-dependencies only.
+test-util = []
+# The native socket transport, for the tests that join a real craft-collab relay.
+native-hub = ["craft-collab/native-hub"]
+
 [dependencies]
 craft-collab = { workspace = true }
 wordcraft-doc = { workspace = true }
@@ -16,10 +23,6 @@ log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-
-[features]
-# The native socket transport, for the tests that join a real craft-collab relay.
-native-hub = ["craft-collab/native-hub"]
 
 [dev-dependencies]
 # Mint relay tickets (HMAC-SHA256 over the base64url payload) and drive the native hub.

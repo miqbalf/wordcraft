@@ -1187,12 +1187,14 @@ version = "0.1.0"
 source = "git+https://github.com/miqbalf/collab-craft?rev=828ed15#828ed15574233800b75c6036d642660d99ee891e"
 dependencies = [
  "base64 0.23.1",
+ "js-sys",
  "log",
  "rust_socketio",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "wasm-bindgen",
  "yrs",
 ]
 
@@ -1637,8 +1639,9 @@ dependencies = [
 [[package]]
 name = "craft-web-host"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=93dac78c93a7f1fd66e2022edeb089233b1dc45a#93dac78c93a7f1fd66e2022edeb089233b1dc45a"
+source = "git+https://github.com/miqbalf/craft-libs?rev=3e8880147169abf363601ffced61d3b8306e5b18#3e8880147169abf363601ffced61d3b8306e5b18"
 dependencies = [
+ "serde_json",
  "wasm-bindgen",
  "web-sys",
 ]
@@ -8109,6 +8112,7 @@ dependencies = [
  "accesskit_consumer",
  "cfb",
  "chrono",
+ "craft-collab",
  "craft-i18n",
  "craft-ui",
  "craft-update",
@@ -8130,6 +8134,7 @@ dependencies = [
  "wordcraft-fonts",
  "wordcraft-geom",
  "wordcraft-layout",
+ "wordcraft-live",
  "wordcraft-render",
  "wordcraft-zotero",
  "zbus",
@@ -8139,6 +8144,8 @@ dependencies = [
 name = "wordcraft-web"
 version = "0.18.1"
 dependencies = [
+ "base64 0.23.1",
+ "craft-collab",
  "craft-web-api",
  "craft-web-host",
  "eframe",
