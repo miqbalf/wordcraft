@@ -188,7 +188,7 @@ impl Relay {
                     None
                 };
                 if let Some(detail) = refusal {
-                    self.conns[at].inbox.push_back(ServerMsg::Error { doc: ROOM.into(), detail: detail.into(), local: Some(local) });
+                    self.conns[at].inbox.push_back(ServerMsg::Error { doc: ROOM.into(), detail: detail.into(), local: Some(local), code: None });
                     return;
                 }
                 self.seq += 1;

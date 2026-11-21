@@ -10,6 +10,8 @@ use wordcraft_engine::{EditObserver, Selection, Session};
 use wordcraft_live::{LiveMap, LocalEdit, MapError, RECOVERED_STYLE, RECOVERED_STYLE_ID, Refusal, assign_seed_pids, is_shareable, seed_blocks};
 
 mod pump;
+#[cfg(feature = "native-hub")]
+mod relay;
 
 /// The dev stack's seed files (craft-office-nextcloud `dev/seed/*.md`, our own text), which it
 /// converts to `.docx` with `wordcraft-cli convert`.
