@@ -109,6 +109,23 @@ impl WordApp {
         r
     }
 
+    /// Hand a web save or export to where it goes: a copy downloaded in the browser when the
+    /// framing page keeps no saves, the host page, or the browser download. `save_as` is what
+    /// the host page is told (`Services::host_save`).
+    fn deliver_web_save(&self, name: &str, bytes: &[u8], save_as: bool) -> Result<(), String> {
+        if self.services.saves_are_copies {
+            return match &self.services.download_copy {
+                Some(copy) => copy(name, bytes),
+                None => Err("this window can't download files".to_owned()),
+            };
+        }
+        match (&self.services.host_save, &self.services.download) {
+            (Some(host), _) => host(name, bytes, save_as),
+            (None, Some(download)) => download(name, bytes),
+            (None, None) => Ok(()),
+        }
+    }
+
     /// Run a command for a script or an agent (control channel, MCP bridge): never asks first.
     /// UI-level commands (`ui.*`) are handled here, the rest by the engine.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
@@ -202,17 +219,14 @@ impl WordApp {
             }
             // An export is a copy, and so is a save in a format that doesn't keep everything (a
             // page image, plain text): the document itself still has unsaved changes.
-            let marked_saved = matches!(id, "file.save" | "file.saveAs") && keeps_everything(&name);
+            let copies = self.services.saves_are_copies;
+            let marked_saved = !copies && matches!(id, "file.save" | "file.saveAs") && keeps_everything(&name);
             // Save As tells the host page the document is now this file, which it only is when the
             // save marks it saved. A Save under a name the page never sent (an untitled document,
             // an imported .doc saved as .docx) is a new file too, never an overwrite.
             let opened_name = self.session.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
             let new_file = id == "file.saveAs" || opened_name.as_deref() != Some(name.as_str());
-            let delivered = match (&self.services.host_save, &self.services.download) {
-                (Some(host), _) => host(&name, &bytes, marked_saved && new_file),
-                (None, Some(download)) => download(&name, &bytes),
-                (None, None) => Ok(()),
-            };
+            let delivered = self.deliver_web_save(&name, &bytes, marked_saved && new_file);
             if let Err(e) = delivered {
                 (
                     self.session.doc.settings.zoom,
@@ -239,6 +253,13 @@ impl WordApp {
                 let document = self.session.document_id();
                 self.saves_in_flight.push(SaveInFlight { ticket, name: name.clone(), document, marked_saved });
                 return Ok(json!({"downloaded": name, "bytes": bytes.len(), "pendingSave": ticket}));
+            }
+            if copies {
+                self.status_long(i18n::fmt(
+                    tl!("{name} was downloaded. This page doesn't keep saves, so the document still has unsaved changes."),
+                    &[("name", &name)],
+                ));
+                return Ok(json!({"downloaded": name, "bytes": bytes.len(), "copy": true}));
             }
             return Ok(json!({"downloaded": name, "bytes": bytes.len()}));
         }

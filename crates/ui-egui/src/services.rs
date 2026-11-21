@@ -53,6 +53,10 @@ pub struct Services {
     /// under its own name and format, as on the desktop, and a Save or Save As that keeps
     /// everything makes that name the document's file, so the next Save goes to it.
     pub host_save: Option<HostSaveFn>,
+    /// Web, framed by a page that does not store saves (`?host=parent`): Save, Save As and the
+    /// exports download a copy through `download_copy` instead, and never mark the document
+    /// saved (the browser can't say whether the user kept the download).
+    pub saves_are_copies: bool,
     /// Web: told whether the document has unsaved changes after each pass, for the browser's
     /// leave-page guard (`beforeunload` runs between frames and can't ask the app).
     pub on_dirty: Option<Box<dyn Fn(bool)>>,

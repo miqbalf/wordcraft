@@ -4,10 +4,11 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use craft_collab::{ClientMsg, Hub};
 use egui::accesskit::Role;
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
-use serde_json::json;
+use serde_json::{Value, json};
 use wordcraft_doc::Document;
 use wordcraft_engine::Session;
 use wordcraft_live::LiveEditing;
@@ -223,24 +224,25 @@ fn status(h: &Harness<'static, WordApp>) -> LiveStatus {
 }
 
 #[test]
-fn nothing_unsaved_is_shown_while_live() {
+fn live_edits_no_save_holds_yet_keep_the_leave_guard_on() {
     let relay = MemRelay::new();
     let mut bob = Bob::join(&relay);
     let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
     let (services, _, guard) = recorded();
     let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert_eq!(guard.borrow().last(), Some(&false), "nothing unsaved after joining");
     type_text(&mut h, "X");
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
     assert!(alice_text(&mut h).contains('X'), "the edit was made");
     assert!(h.state().session.dirty, "no save holds it yet");
-    assert!(!guard.borrow().is_empty(), "the host heard about unsaved changes");
-    assert!(guard.borrow().iter().all(|dirty| !dirty), "never dirty while live: the service saves");
+    assert_eq!(guard.borrow().last(), Some(&true), "leaving now would lose it: the guard is on while live");
     // The service saves through the edit: this window's copy is clean again.
     service.le.announce_saved(relay.seq(), "etag-1").unwrap();
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
     assert!(matches!(status(&h), LiveStatus::Live { saved_at: Some(_) }));
     assert!(!h.state().session.dirty, "the save holds this window's edits");
+    assert_eq!(guard.borrow().last(), Some(&false), "and the guard is off again");
 }
 
 #[test]
@@ -455,4 +457,97 @@ fn save_as_after_the_link_broke_downloads_a_copy_and_stays_unsaved() {
     }
     assert!(h.state().session.dirty, "a download can't be confirmed: still unsaved");
     assert_eq!(guard.borrow().last(), Some(&true), "and the leave guard stays on");
+}
+
+/// The document service in the room sends the editors `kind` with `payload`.
+fn service_says(service: &mut Bob, kind: &str, payload: Value) {
+    service.le.hub_mut().send(ClientMsg::Ephemeral { doc: ROOM.into(), kind: kind.into(), payload }).unwrap();
+}
+
+#[test]
+fn the_service_ending_the_session_ends_the_link_and_allows_a_copy() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
+    let (services, reports) = recorded_reports();
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    type_text(&mut h, "X");
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert!(!wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "no copy while the service saves");
+    let reason = "Saving has stopped: your changes are no longer being saved to the file. Download a copy to keep your work.";
+    service_says(&mut service, "ended", json!({ "reason": reason }));
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert_eq!(status(&h), LiveStatus::Broken(reason.into()));
+    assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "Save As downloads a copy now");
+    assert!(has_label(&h, ENDED_UNSAVED), "the status bar says to keep a copy, not that it is saved");
+    let last = reports.borrow().last().cloned().unwrap();
+    assert_eq!((last.state, last.reason.as_deref()), ("broken", Some(reason)), "the host hears it ended, apart from a refusal");
+}
+
+#[test]
+fn a_service_notice_reaches_the_status_bar() {
+    let relay = MemRelay::new();
+    let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
+    let (mut h, _hub) = alice(&relay, Access::Edit, true);
+    settle(&relay, &mut h, &mut service);
+    let text = "Someone changed this file outside the live session. Their version was kept as Plan (conflict 2026-11-21 1403).docx.";
+    service_says(&mut service, "notice", json!({ "text": text }));
+    settle(&relay, &mut h, &mut service);
+    assert_eq!(h.state().status_msg.as_ref().map(|(m, _)| m.as_str()), Some(text));
+    assert!(matches!(status(&h), LiveStatus::Live { .. }), "a notice does not end the link");
+}
+
+#[test]
+fn the_host_ending_the_link_allows_a_copy() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (services, reports) = recorded_reports();
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
+    settle(&relay, &mut h, &mut bob);
+    // The page sent another room (the session was restarted) or a ticket with less access.
+    let reason = "The live session was restarted. Reopen the file.";
+    assert!(h.state_mut().live_end(reason));
+    settle(&relay, &mut h, &mut bob);
+    assert_eq!(status(&h), LiveStatus::Broken(reason.into()));
+    assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"));
+    assert!(h.state_mut().run("text.insert", json!({"text": "Z"})).is_err(), "no edits once ended");
+    assert_eq!(reports.borrow().last().map(|r| r.state), Some("broken"));
+}
+
+#[test]
+fn a_page_that_keeps_no_saves_gets_a_download_and_the_document_stays_unsaved() {
+    // `?host=parent`: the framing page stores nothing WordCraft saves, so Save is a download.
+    let copies = Rc::new(RefCell::new(Vec::<String>::new()));
+    let posted = Rc::new(Cell::new(0));
+    let (c, p, q) = (Rc::clone(&copies), Rc::clone(&posted), Rc::clone(&posted));
+    let services = Services {
+        saves_are_copies: true,
+        download_copy: Some(Box::new(move |name: &str, _: &[u8]| {
+            c.borrow_mut().push(name.to_owned());
+            Ok(())
+        })),
+        download: Some(Box::new(move |_: &str, _: &[u8]| {
+            p.set(p.get() + 1);
+            Ok(())
+        })),
+        host_save: Some(Box::new(move |_: &str, _: &[u8], _: bool| {
+            q.set(q.get() + 1);
+            Ok(())
+        })),
+        ..Services::default()
+    };
+    let mut session = Session::new(Document::from_text("Hello"));
+    session.path = Some("plan.docx".into());
+    let mut app = WordApp::new(session, services);
+    app.ui.language = "en".into();
+    assert!(app.run("text.insert", json!({"text": "X"})).is_ok());
+    assert!(app.session.dirty);
+    for id in ["file.save", "file.saveAs", "file.exportPdf"] {
+        let r = app.run(id, json!({}));
+        assert!(r.is_ok(), "{id}: {r:?}");
+    }
+    assert_eq!(copies.borrow().len(), 3, "each one downloads: {:?}", copies.borrow());
+    assert_eq!(posted.get(), 0, "nothing goes to the page or the save picker");
+    assert!(app.session.dirty, "a download can't be confirmed: the document stays unsaved");
 }

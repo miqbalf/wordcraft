@@ -70,11 +70,13 @@ impl Hub for DynHub {
 /// What the host is told about the session (`live-state`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveReport {
-    /// `connecting`, `live`, `readonly`, `reconnecting` or `refused`.
+    /// `connecting`, `live`, `readonly`, `reconnecting`, `refused` (nothing can be shared now)
+    /// or `broken` (the link ended for good: reopen the file).
     pub state: &'static str,
-    /// Why, for `refused`: the user's message, in English.
+    /// Why, for `refused` and `broken`: the user's message, in English.
     pub reason: Option<String>,
-    /// When this window learned of the newest save, in Unix milliseconds.
+    /// When this window learned of the newest save, in Unix milliseconds (to the second). Not
+    /// when the document service wrote the file, which the window is not told.
     pub saved_at_ms: Option<i64>,
     /// The other editors: `(peer id, display name)`.
     pub peers: Vec<(String, String)>,
@@ -208,6 +210,19 @@ impl WordApp {
         }
     }
 
+    /// End the link for good, with `reason` (English) on the status bar: the host learned that
+    /// the session is over (the page sent another room, or less access). Save As then keeps a
+    /// copy. False when nothing is linked.
+    pub fn live_end(&mut self, reason: &str) -> bool {
+        match &mut self.live {
+            Some(LiveMode::Linked(link)) => {
+                link.editing.end(reason);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A fresh ticket from the host: the hub uses it for its next (re)connect, and a hub the
     /// relay refused (an expired ticket) connects again with it. False when nothing is linked.
     pub fn live_refresh_ticket(&mut self, ticket: String) -> bool {
@@ -261,6 +276,16 @@ impl WordApp {
     /// the link is broken or refused, edits no save holds are this window's to keep.
     pub(crate) fn live_saves(&self) -> bool {
         self.live_link().is_some_and(|link| matches!(link.status(), LiveStatus::Connecting | LiveStatus::Live { .. } | LiveStatus::Reconnecting))
+    }
+
+    /// Whether the document has changes no save holds: while the service saves it, edits the
+    /// newest save does not hold yet (reloading now would lose them); otherwise the session's
+    /// own unsaved changes.
+    pub(crate) fn live_unsaved(&self) -> bool {
+        match self.live_link() {
+            Some(link) if self.live_saves() => !link.editing.edits_saved(),
+            _ => self.session.dirty,
+        }
     }
 
     /// Whether live editing lets command `id` run now; true when not live.
@@ -442,7 +467,8 @@ fn report_of(link: &LiveLink) -> LiveReport {
         LiveStatus::Live { .. } => ("live", None),
         LiveStatus::ReadOnly => ("readonly", None),
         LiveStatus::Reconnecting => ("reconnecting", None),
-        LiveStatus::Refused(why) | LiveStatus::Broken(why) => ("refused", Some(why.clone())),
+        LiveStatus::Refused(why) => ("refused", Some(why.clone())),
+        LiveStatus::Broken(why) => ("broken", Some(why.clone())),
     };
     LiveReport {
         state,

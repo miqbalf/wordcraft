@@ -438,7 +438,7 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                 format!(
                     "{} — {}",
                     crate::i18n::isolate(&app.title_stem()),
-                    if app.session.dirty && !app.live_saves() {
+                    if app.live_unsaved() {
                         tl!("Edited")
                     } else if app.session.path.is_some() {
                         tl!("Saved")
