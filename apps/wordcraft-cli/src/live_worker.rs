@@ -716,7 +716,7 @@ impl<H: Hub> Room<H> {
         if self.beat.refused() {
             say(&self.doc_id, "the app ended this room's grant; leaving");
             self.tell(GRANT_ENDED_REASON);
-            self.leave(GRANT_ENDED_REASON);
+            self.leave(GRANT_ENDED_REASON, true);
             return Flow::Done;
         }
 
@@ -742,11 +742,19 @@ impl<H: Hub> Room<H> {
                         say(&self.doc_id, format_args!("outside versions copied aside but never announced: {}", self.untold_copies.join(", ")));
                     }
                 }
-                if let Err(e) = self.files.close().await {
-                    say(&self.doc_id, format_args!("closing the room failed: {e}"));
-                }
-                say(&self.doc_id, "no editors left; room closed");
-                self.leave(LEFT_REASON);
+                // Only a room the app closed is marked closed: one it still holds may get a
+                // worker again (its stale job re-notifies), and an editor rejoining it waits.
+                let closed = match self.files.close().await {
+                    Ok(()) => {
+                        say(&self.doc_id, "no editors left; room closed");
+                        true
+                    }
+                    Err(e) => {
+                        say(&self.doc_id, format_args!("closing the room failed: {e}; leaving it open"));
+                        false
+                    }
+                };
+                self.leave(LEFT_REASON, closed);
                 return Flow::Done;
             }
         }
@@ -915,13 +923,16 @@ impl<H: Hub> Room<H> {
             Err(WriteFail::Retry(e)) => {
                 say(&self.doc_id, format_args!("saving failed: {e}"));
                 self.unsaved(inflight.dirty_since);
+                // Counted from the first failed write, a conflict's or not: a failed conflict
+                // earlier must not keep later plain failures from giving up.
+                let failing_for = now.saturating_sub(*self.put_failing_since.get_or_insert(now));
                 if e == FileError::Forbidden {
                     self.stop(FORBIDDEN_WHY);
+                } else if failing_for >= SAVE_GIVE_UP_MS {
+                    self.stop(&format!("the file could not be written for {} minutes: {e}", SAVE_GIVE_UP_MS / 60_000));
                 } else if self.conflict_failures > 0 {
                     let at = (self.conflict_failures as usize).min(CONFLICT_RETRY_MS.len()) - 1;
                     self.retry_at = now + CONFLICT_RETRY_MS[at];
-                } else if now.saturating_sub(*self.put_failing_since.get_or_insert(now)) >= SAVE_GIVE_UP_MS {
-                    self.stop(&format!("the file could not be written for {} minutes: {e}", SAVE_GIVE_UP_MS / 60_000));
                 } else {
                     self.retry_at = now + PUT_RETRY_MS;
                 }
@@ -1013,11 +1024,14 @@ impl<H: Hub> Room<H> {
         }
     }
 
-    /// Before leaving the room: end the editors' session, and mark the room's newest save
-    /// `closed`, which the relay keeps for an editor that rejoins after the worker left.
-    fn leave(&mut self, reason: &str) {
+    /// Before leaving the room: end the editors' session, and, when the room is `closed`, mark
+    /// its newest save so, which the relay keeps for an editor that rejoins after the worker left.
+    fn leave(&mut self, reason: &str, closed: bool) {
         self.end_session(reason);
         self.beat.stop();
+        if !closed {
+            return;
+        }
         let (seq, etag) = self.le.saved().map_or_else(|| (self.announced_seq, self.etag.clone()), |(seq, etag)| (seq, etag.to_owned()));
         if let Err(e) = self.le.announce_closed(seq, &etag) {
             say(&self.doc_id, format_args!("the closed marker did not go out: {e}"));

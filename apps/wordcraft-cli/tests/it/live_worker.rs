@@ -288,6 +288,8 @@ struct Nc {
     put_status: Option<StatusCode>,
     /// The name the file is served under, when not [`FILE`] (renamed).
     name: Option<String>,
+    /// Answer the room's close with this status.
+    close_status: Option<StatusCode>,
 }
 
 type NcState = Arc<Mutex<Nc>>;
@@ -374,7 +376,14 @@ async fn nc_room(State(nc): State<NcState>, Path((room, what)): Path<(String, St
     if !signed(&h, &room) {
         return deny(&nc);
     }
-    nc.lock().unwrap().calls.push(if what == "close" { "close" } else { "heartbeat" });
+    let mut n = nc.lock().unwrap();
+    if what == "close"
+        && let Some(status) = n.close_status
+    {
+        n.calls.push("closefail");
+        return (status, "no").into_response();
+    }
+    n.calls.push(if what == "close" { "close" } else { "heartbeat" });
     json_response(json!({"ok": true}))
 }
 
@@ -1302,4 +1311,50 @@ async fn a_fresh_worker_in_a_room_that_lost_its_history_stops_when_no_snapshot_c
     let stopped = w.worker.saving_stopped().map(str::to_owned).unwrap_or_default();
     assert!(stopped.contains("lost its history"), "{stopped:?}");
     assert_eq!(w.count("put"), 0, "its own copy of the file is never written as the room's");
+}
+
+#[tokio::test]
+async fn a_failed_conflict_earlier_does_not_keep_failing_writes_from_giving_up() {
+    let mut w = world(file(&["One"]), 1).await;
+    let original = w.file(FILE);
+    {
+        // A conflict whose copy fails: a failure that may pass, retried.
+        let mut n = w.nc.lock().unwrap();
+        n.files.insert(FILE.into(), file(&["Changed outside"]));
+        n.copy_status = Some(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    w.eds[0].type_at_end(0, " fish");
+    w.run_for(10_000, 1_000).await;
+    assert!(w.count("copyfail") >= 1, "the conflict failed first");
+    {
+        // The outside change is undone; from now on every plain write fails.
+        let mut n = w.nc.lock().unwrap();
+        n.files.insert(FILE.into(), original);
+        n.copy_status = None;
+        n.put_status = Some(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    w.run_for(SAVE_GIVE_UP_MS + 180_000, 1_000).await;
+    assert!(w.count("putfail") >= 1, "the plain writes failed");
+    let stopped = w.worker.saving_stopped().map(str::to_owned).unwrap_or_default();
+    assert!(stopped.contains("503"), "given up, not retried for ever: {stopped:?}");
+}
+
+#[tokio::test]
+async fn a_room_the_app_did_not_close_is_not_marked_closed() {
+    let mut w = world(file(&["One", "Two"]), 1).await;
+    w.eds[0].type_at_end(1, " and three");
+    w.run_for(10_000, 1_000).await;
+    w.nc.lock().unwrap().close_status = Some(StatusCode::SERVICE_UNAVAILABLE);
+    let at = w.eds[0].at;
+    w.relay.borrow_mut().leave(at);
+    assert_eq!(w.run_for(60_000, 1_000).await, Flow::Done);
+    assert_eq!(w.count("closefail"), 1);
+    let marker = w.relay.borrow().saved_marker.clone().map(|(_, v)| v).unwrap_or_default();
+    assert!(marker["closed"].as_bool() != Some(true), "the room is still open: {marker}");
+    // A rejoining editor is not told the room closed (a new worker may serve it).
+    w.relay.borrow_mut().rejoin(at);
+    for _ in 0..3 {
+        w.eds[0].pump();
+    }
+    assert!(!matches!(w.eds[0].le.status(), LiveStatus::Broken(_)), "{:?}", w.eds[0].le.status());
 }

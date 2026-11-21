@@ -80,6 +80,8 @@ crates and the git dependencies from the miqbalf forks; see [Flags](#flags).
   storytold rev, in their own PR.
 - **openssl (Apache-2.0) and the system OpenSSL.** `native-tls` links the platform TLS library:
   OpenSSL on Linux. The crate's licence is on the list. The linked library is the system's own
-  and is not shipped by the worker binary. NOTICE's general line on permissively licensed
+  and is not part of the worker binary. The worker image (craft-office-nextcloud
+  `dev/worker.Dockerfile`) installs it from Ubuntu as `libssl3t64` (OpenSSL 3, Apache-2.0, on the
+  list), so that image ships it. NOTICE's general line on permissively licensed
   dependencies (MIT/Apache-2.0/BSD/ISC/Zlib) covers the crates above, Zlib, BSD-3-Clause and
   Unlicense-or-MIT included.

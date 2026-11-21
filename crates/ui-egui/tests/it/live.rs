@@ -13,7 +13,7 @@ use wordcraft_doc::Document;
 use wordcraft_engine::Session;
 use wordcraft_live::LiveEditing;
 use wordcraft_live::testing::{MemHub, MemRelay, ROOM};
-use wordcraft_ui_egui::live::{Access, COPY_DOWNLOADED, ENDED, ENDED_UNSAVED, LiveReport, LiveStatus, NEWER, SAVED_FOR_YOU};
+use wordcraft_ui_egui::live::{Access, COPY_DOWNLOADED, ENDED, ENDED_UNSAVED, LiveReport, LiveStatus, NEWER, NOT_SAVING, SAVED_FOR_YOU};
 use wordcraft_ui_egui::{Services, WordApp};
 
 fn file() -> Vec<u8> {
@@ -550,4 +550,39 @@ fn a_page_that_keeps_no_saves_gets_a_download_and_the_document_stays_unsaved() {
     assert_eq!(copies.borrow().len(), 3, "each one downloads: {:?}", copies.borrow());
     assert_eq!(posted.get(), 0, "nothing goes to the page or the save picker");
     assert!(app.session.dirty, "a download can't be confirmed: the document stays unsaved");
+}
+
+#[test]
+fn a_room_with_no_document_service_says_nothing_is_saved_and_allows_a_copy() {
+    // The worker never joined (refused at its cap, gave up, or could not start), or it left.
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (mut h, _hub) = alice(&relay, Access::Edit, true);
+    let now = std::sync::Arc::new(std::sync::Mutex::new(0.0_f64));
+    let clock = std::sync::Arc::clone(&now);
+    h.state_mut().live_set_session_clock(Box::new(move || *clock.lock().unwrap()));
+    settle(&relay, &mut h, &mut bob);
+    assert!(matches!(status(&h), LiveStatus::Live { .. }));
+    assert!(!wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "the service may still be on its way");
+    *now.lock().unwrap() = 16_000.0;
+    settle(&relay, &mut h, &mut bob);
+    assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "nothing saves the edits: a copy keeps them");
+    assert!(has_label(&h, NOT_SAVING), "the status bar says the changes are not being saved");
+    // The service joins: it saves again.
+    let service_hub = relay.connect("craft_office", "Craft Office", true);
+    let mut s = Session::new(Document::new());
+    let le = LiveEditing::start(service_hub.clone(), ROOM, &file(), "plan.docx", &mut s).unwrap();
+    let mut service = Bob { s, le };
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert!(!wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"));
+    assert!(!has_label(&h, NOT_SAVING));
+    // It leaves: counted again from then.
+    relay.drop_link(&service_hub);
+    *now.lock().unwrap() = 20_000.0;
+    settle(&relay, &mut h, &mut bob);
+    assert!(!wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "within the wait");
+    *now.lock().unwrap() = 36_000.0;
+    settle(&relay, &mut h, &mut bob);
+    assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"));
+    assert!(has_label(&h, NOT_SAVING));
 }

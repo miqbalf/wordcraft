@@ -37,6 +37,8 @@ pub const ENDED_BECAUSE: &str = "Live editing ended. Reopen the file. {reason}";
 pub const ENDED_UNSAVED: &str = "Live editing ended. Download a copy to keep your changes, then reopen the file.";
 /// [`ENDED_UNSAVED`] and why, as the notice.
 pub const ENDED_UNSAVED_BECAUSE: &str = "Live editing ended. Download a copy to keep your changes, then reopen the file. {reason}";
+/// Live, but no document service is in the room: nothing saves the edits.
+pub const NOT_SAVING: &str = "Changes are not being saved right now. Download a copy to keep them.";
 /// Save and Save As while live: the document service writes the file for everyone.
 pub const SAVED_FOR_YOU: &str = "While the file is edited live, it is saved for everyone automatically.";
 /// The status line after Save As downloaded a copy of a document whose live session ended.
@@ -273,9 +275,19 @@ impl WordApp {
 
     /// Whether the document service saves this window's document: linked to a room and
     /// connecting, live or reconnecting, so the window has no unsaved changes of its own. Once
-    /// the link is broken or refused, edits no save holds are this window's to keep.
+    /// the link is broken or refused, or no document service has been in the room for a while,
+    /// edits no save holds are this window's to keep.
     pub(crate) fn live_saves(&self) -> bool {
-        self.live_link().is_some_and(|link| matches!(link.status(), LiveStatus::Connecting | LiveStatus::Live { .. } | LiveStatus::Reconnecting))
+        self.live_link().is_some_and(|link| {
+            !link.editing.saver_missing() && matches!(link.status(), LiveStatus::Connecting | LiveStatus::Live { .. } | LiveStatus::Reconnecting)
+        })
+    }
+
+    /// The clock, in milliseconds, of the live session's own waits (tests).
+    pub fn live_set_session_clock(&mut self, clock: Box<dyn FnMut() -> f64 + Send>) {
+        if let Some(LiveMode::Linked(link)) = &mut self.live {
+            link.editing.set_clock(clock);
+        }
     }
 
     /// Whether the document has changes no save holds: while the service saves it, edits the
@@ -310,12 +322,14 @@ impl WordApp {
             return None;
         }
         let (saves, dirty) = (self.live_saves(), self.session.dirty);
+        let unsaved_live = self.live_link().is_some_and(|link| link.editing.saver_missing() && matches!(link.status(), LiveStatus::Live { .. }));
         let why = match &mut self.live {
             // Refuses without running, with the reason as a notice for the next frame.
             Some(LiveMode::Linked(link)) if !saves_the_file(id) => {
                 return Some(link.editing.run(&mut self.session, id, params).map_err(|e| e.to_string()));
             }
             Some(LiveMode::Linked(_)) if saves => tl!(SAVED_FOR_YOU),
+            Some(LiveMode::Linked(_)) if unsaved_live => tl!(NOT_SAVING),
             Some(LiveMode::Linked(_)) if dirty => tl!(ENDED_UNSAVED),
             Some(LiveMode::Linked(_)) => tl!(ENDED),
             _ => tl!(NEWER),
@@ -415,6 +429,7 @@ impl WordApp {
             LiveStatus::Connecting => (tl!("Connecting…").to_string(), None),
             LiveStatus::Reconnecting => (tl!("Reconnecting…").to_string(), None),
             LiveStatus::ReadOnly => (tl!("Read-only").to_string(), None),
+            LiveStatus::Live { .. } if link.editing.saver_missing() => (tl!(NOT_SAVING).to_string(), None),
             LiveStatus::Live { .. } => match &link.saved {
                 Some((_, secs)) => (i18n::fmt(tl!("Live · saved {time}"), &[("time", &crate::local_time::clock_time(*secs))]), None),
                 None => (tl!("Live").to_string(), None),

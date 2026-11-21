@@ -125,6 +125,11 @@ const CATCH_UP_LATE_FRAMES: u32 = 600;
 /// The room lost its history (the relay restarted with nothing to replay) and this window holds
 /// no state of its own from before: nothing can be trusted until the service's snapshot.
 const HISTORY_LOST: &str = "The live session lost its history. Download a copy, then reopen the file.";
+/// How long a live window waits for the document service to be in the room before it says the
+/// file is not being saved (no worker joined: refused at its cap, gave up, or could not start).
+const SAVER_WAIT_MS: f64 = 15_000.0;
+/// The same without a clock, in frames.
+const SAVER_WAIT_FRAMES: u32 = 900;
 /// How long a replica that joined a room which lost its history waits for the snapshot.
 const HISTORY_WAIT_MS: f64 = 20_000.0;
 /// The same without a clock, in frames.
@@ -411,6 +416,10 @@ pub struct LiveEditing<H: Hub> {
     history_lost: bool,
     /// Since when a replica with nothing settled has waited for the room's snapshot.
     snapshot_wait: Option<CatchUp>,
+    /// Since when the link has been live with no document service in the room.
+    saver_wait: Option<CatchUp>,
+    /// Live, yet no document service has been in the room for [`SAVER_WAIT_MS`].
+    saver_missing: bool,
 }
 
 impl<H: Hub> LiveEditing<H> {
@@ -462,6 +471,8 @@ impl<H: Hub> LiveEditing<H> {
             catch_up: None,
             history_lost: false,
             snapshot_wait: None,
+            saver_wait: None,
+            saver_missing: false,
         })
     }
 
@@ -570,6 +581,13 @@ impl<H: Hub> LiveEditing<H> {
     /// Lines for the user since the last call, in plain English (untranslated).
     pub fn take_notices(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notices)
+    }
+
+    /// Whether the link is live but no document service has been in the room for 15 s (it never
+    /// joined, or it left): nothing saves this window's edits, so the window keeps them itself.
+    /// Clears as soon as the service is in the room again.
+    pub fn saver_missing(&self) -> bool {
+        self.saver_missing
     }
 
     /// Whether a join since the last call found the room had lost its history (the relay
@@ -1003,6 +1021,33 @@ impl<H: Hub> LiveEditing<H> {
         } else {
             LiveStatus::Connecting
         };
+        self.watch_saver();
+    }
+
+    /// Count how long the link has been live with no document service in the room.
+    fn watch_saver(&mut self) {
+        let service = &self.service_uid;
+        if self.live.roster.iter().any(|(id, _)| uid_of(id) == service) {
+            self.saver_wait = None;
+            self.saver_missing = false;
+            return;
+        }
+        if !matches!(self.status, LiveStatus::Live { .. }) {
+            // Counted from Live; what it found stays until the service is seen again.
+            self.saver_wait = None;
+            return;
+        }
+        let now = self.clock.as_mut().map(|c| c());
+        let wait = self.saver_wait.get_or_insert(CatchUp { since: now, frames: 0, told: false });
+        wait.frames = wait.frames.saturating_add(1);
+        let over = match (now, wait.since) {
+            (Some(now), Some(t)) => now - t >= SAVER_WAIT_MS,
+            _ => wait.frames >= SAVER_WAIT_FRAMES,
+        };
+        if over && !self.saver_missing {
+            log::warn!("live: no document service in the room; this window's edits are not being saved");
+            self.saver_missing = true;
+        }
     }
 
     /// Count how long the join's catch-up has been arriving: say so once when it is late, and
