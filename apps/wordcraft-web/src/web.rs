@@ -32,12 +32,13 @@ pub fn start() {
         // it and stores what it saves (`host`); unframed there is no parent, so that URL on its
         // own stays the normal app with downloads. `data-host="page"` on the canvas opts a page
         // in instead: it runs WordCraft in its own document and talks over DOM `CustomEvent`s
-        // on the canvas (`host`). The host guards leaving the page, so this one doesn't.
+        // on the canvas (`host`). That page guards leaving it, so this one doesn't; a framing
+        // page can't see the frame's unsaved changes, so a framed window guards itself.
         let bridge = crate::host::Bridge::detect(&canvas);
         let app_bridge = bridge.clone();
         let dirty = Rc::new(Cell::new(false));
         let saves = AsyncSaves::default();
-        if bridge.is_none()
+        if crate::live_ticket::guards_own_leaving(bridge.as_ref().map(crate::host::Bridge::mode))
             && let Err(e) = guard_unload(dirty.clone(), saves.clone())
         {
             log::error!("no unsaved-changes guard: {e}");
@@ -72,11 +73,11 @@ pub fn start() {
                     let mut session = Session::new(doc);
                     session.system_region = region;
                     let messages = Rc::new(RefCell::new(Vec::new()));
-                    let mut services = services(inbox.clone(), cc.egui_ctx.clone(), dirty, saves.clone(), messages.clone());
+                    let mut services = services(inbox.clone(), cc.egui_ctx.clone(), dirty.clone(), saves.clone(), messages.clone());
                     let live_events = crate::host::LiveEvents::default();
                     let live = crate::host::Live::default();
                     if let Some(bridge) = &app_bridge {
-                        bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
+                        bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone(), dirty.clone());
                         bridge.listen_live(live_events.clone(), live.joining(), cc.egui_ctx.clone());
                     }
                     let control = crate::api::install(cc.egui_ctx.clone());
@@ -573,7 +574,7 @@ async fn write_file_handle(handle: &wasm_bindgen::JsValue, bytes: &[u8]) -> Resu
     Ok(())
 }
 
-fn trigger_anchor_download(window: &web_sys::Window, name: &str, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn trigger_anchor_download(window: &web_sys::Window, name: &str, bytes: &[u8]) -> Result<(), String> {
     let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
     let document = window.document().ok_or("no document")?;
     let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));

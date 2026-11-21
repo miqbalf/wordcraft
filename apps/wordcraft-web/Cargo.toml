@@ -19,10 +19,10 @@ wordcraft-ui-egui = { workspace = true }
 # The host messages (storytold/craft-libs): one contract and one bridge for the web builds.
 # The page command API (storytold/craft-libs#413): window.wordcraft over the control channel.
 craft-web-api = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "0.1.0" }
-# The live messages (`live`, `live-state`, unprefixed `ready`, craft-live/1) are on the miqbalf
-# fork's feat/web-host-live, pinned by rev (storytold 93dac78c plus that one commit) until it is
-# merged upstream.
-craft-web-host = { git = "https://github.com/miqbalf/craft-libs", rev = "3e8880147169abf363601ffced61d3b8306e5b18", version = "0.1.0" }
+# The live messages (`live`, `live-state` with its `broken` state, unprefixed `ready`,
+# craft-live/1) are on the miqbalf fork's feat/web-host-live, pinned by rev (storytold 93dac78c
+# plus those two commits) until it is merged upstream.
+craft-web-host = { git = "https://github.com/miqbalf/craft-libs", rev = "4002d697e63eb689d56b52c32e2fcec36e02b7c3", version = "0.1.0" }
 egui = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }

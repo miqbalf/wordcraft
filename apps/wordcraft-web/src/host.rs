@@ -26,9 +26,12 @@
 //! - `wordcraft:dirty` whenever unsaved changes appear or go away, `wordcraft:failed` when the
 //!   app couldn't start.
 //!
-//! In both host modes the host sends the document to edit, so no sample opens, saves are handed
-//! to the host rather than downloaded, the host guards leaving the page, and `?author=` names the
-//! user for comments and tracked changes.
+//! In both host modes the host sends the document to edit, so no sample opens, and `?author=`
+//! names the user for comments and tracked changes. With `data-host="page"` saves are handed to
+//! the host rather than downloaded, and the host guards leaving the page. A framing page
+//! (`?host=parent`) stores no saves: Save, Save As and Export download a copy in the browser and
+//! never mark the document saved, and the frame guards leaving the page itself (`beforeunload`),
+//! with unsaved changes as `wordcraft:dirty` also tells the page.
 //!
 //! # Live editing (`craft-live/1`, `?host=parent` only)
 //!
@@ -47,11 +50,16 @@
 //! - A later `live` for the same room is the page's ticket refresh (every 480 s). It goes to the
 //!   hub (`Hub::set_token`) for its next reconnect; a hub the relay refused (an expired
 //!   ticket) connects again with it. One that comes while the file is fetched waits for the join.
+//!   One whose ticket no longer has the update bit ends the link ("Your access changed").
+//! - A `live` for another room after the join means the session was restarted (the room closed
+//!   and the page opened the file again): the link ends ("The live session was restarted").
+//!   Either way the window is `broken` and Save As downloads a copy.
 //! - Another `proto` shows "This file is being edited with a newer WordCraft. Update to join."
 //!   and nothing can be edited.
 //! - `live-state` `{state, reason, savedAt, peers}` goes to the parent on every change of
-//!   state and at most once a second otherwise. `savedAt` is when this window learned of the
-//!   newest save (ISO 8601).
+//!   state and at most once a second otherwise. `state` is `broken` once the link ended for good
+//!   (reopen the file), apart from `refused` (nothing can be shared now). `savedAt` is when this
+//!   window learned of the newest save (ISO 8601, to the second), not when the file was written.
 //!
 //! Tickets are never logged.
 
@@ -60,7 +68,7 @@ use std::rc::Rc;
 
 use crate::live_ticket::{Joining, Next};
 use craft_web_host::Mode;
-use craft_web_host::live::{LiveError, LiveMessage, LiveState, LiveStatus, Peer as HostPeer};
+use craft_web_host::live::{LiveError, LiveMessage, LiveState, Peer as HostPeer};
 use craft_web_host::web::{FileData, Host, Message};
 use wasm_bindgen::JsCast as _;
 use wordcraft_ui_egui::live::LiveReport;
@@ -91,20 +99,39 @@ impl Bridge {
         Some(Self { host: Rc::new(Host::connect(APP, canvas)?) })
     }
 
-    /// Hand saved and exported files to the host instead of downloading them, report unsaved
-    /// changes to it, and hear the files it sends.
-    pub fn connect(&self, services: &mut Services, inbox: Inbox, ctx: egui::Context) {
+    /// The host mode of this page.
+    pub fn mode(&self) -> Mode {
+        self.host.mode()
+    }
+
+    /// Hear the files the host sends and report unsaved changes to it (and to `dirty`, the flag
+    /// the window's own leave guard reads). A page (`data-host="page"`) gets saved and exported
+    /// files instead of downloads; under a framing page (`?host=parent`), which stores none, they
+    /// download in the browser as copies.
+    pub fn connect(&self, services: &mut Services, inbox: Inbox, ctx: egui::Context, dirty: Rc<std::cell::Cell<bool>>) {
         self.listen(inbox, ctx);
-        let bridge = self.clone();
-        services.host_save = Some(Box::new(move |name: &str, bytes: &[u8], save_as: bool| bridge.post_save(name, bytes, save_as)));
-        // Anything else that would download goes to the host too.
-        let bridge = self.clone();
-        services.download = Some(Box::new(move |name: &str, bytes: &[u8]| bridge.post_save(name, bytes, false)));
+        if self.host.mode() == Mode::Parent {
+            services.saves_are_copies = true;
+            services.host_save = None;
+            services.download = Some(Box::new(|name: &str, bytes: &[u8]| {
+                let window = web_sys::window().ok_or("no window")?;
+                crate::web::trigger_anchor_download(&window, name, bytes)
+            }));
+        } else {
+            let bridge = self.clone();
+            services.host_save = Some(Box::new(move |name: &str, bytes: &[u8], save_as: bool| bridge.post_save(name, bytes, save_as)));
+            // Anything else that would download goes to the host too.
+            let bridge = self.clone();
+            services.download = Some(Box::new(move |name: &str, bytes: &[u8]| bridge.post_save(name, bytes, false)));
+        }
         // The browser's save picker is never used, so no save finishes later.
         services.async_saves = None;
         // The crate does not repeat a state it already reported.
         let host = self.host.clone();
-        services.on_dirty = Some(Box::new(move |dirty: bool| host.post_dirty(dirty)));
+        services.on_dirty = Some(Box::new(move |d: bool| {
+            dirty.set(d);
+            host.post_dirty(d);
+        }));
         let host = self.host.clone();
         services.live_state = Some(Box::new(move |report: &LiveReport| {
             if let Err(e) = host.post_live_state(&live_state(report)) {
@@ -124,9 +151,15 @@ impl Bridge {
             // The error never quotes the message, so no ticket reaches the log.
             Err(e) => log::warn!("live message refused: {e}"),
             Ok(message) => {
-                let next = joining.borrow_mut().message(&message.room);
+                let access = crate::live_ticket::ticket_access(message.ticket());
+                let next = joining.borrow_mut().message(&message.room, access);
                 match next {
-                    Next::Ignore => log::warn!("a live message for another room was ignored"),
+                    Next::Restarted | Next::AccessDropped => {
+                        let reason = next.end_reason().unwrap_or(crate::live_ticket::RESTARTED);
+                        log::warn!("the live session ended: {reason}");
+                        events.borrow_mut().push(LiveEvent::End(reason));
+                        ctx.request_repaint();
+                    }
                     Next::Refresh => {
                         events.borrow_mut().push(LiveEvent::Ticket(message.ticket().to_owned()));
                         ctx.request_repaint();
@@ -215,6 +248,8 @@ pub enum LiveEvent {
     Failed(String),
     /// The room speaks a newer protocol.
     Newer,
+    /// The session ended (another room, less access), for this reason.
+    End(&'static str),
 }
 
 pub type LiveEvents = Rc<RefCell<Vec<LiveEvent>>>;
@@ -239,6 +274,9 @@ impl Live {
         for event in arrived {
             match event {
                 LiveEvent::Newer => app.live_newer(),
+                LiveEvent::End(reason) => {
+                    app.live_end(wordcraft_ui_egui::tl!(reason));
+                }
                 LiveEvent::Failed(e) => {
                     log::error!("live file not fetched: {e}");
                     not_opened(app, &e);
@@ -262,7 +300,7 @@ impl Live {
             .and_then(|hub| app.start_live(Box::new(hub), &message.room, bytes, &message.file_name, access));
         match started {
             Ok(()) => {
-                self.joining.borrow_mut().joined(&message.room);
+                self.joining.borrow_mut().joined(&message.room, access);
                 if let Some(ticket) = self.pending.take() {
                     app.live_refresh_ticket(ticket);
                 }
@@ -331,13 +369,7 @@ async fn fetch_file(file_url: &str) -> Result<Vec<u8>, String> {
 
 /// The window's report as the host message.
 fn live_state(report: &LiveReport) -> LiveState {
-    let state = match report.state {
-        "connecting" => LiveStatus::Connecting,
-        "live" => LiveStatus::Live,
-        "readonly" => LiveStatus::Readonly,
-        "reconnecting" => LiveStatus::Reconnecting,
-        _ => LiveStatus::Refused,
-    };
+    let state = crate::live_ticket::live_status(report.state);
     let saved_at = report.saved_at_ms.and_then(|ms| js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ms as f64)).to_iso_string().as_string());
     LiveState {
         state,
