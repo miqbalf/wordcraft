@@ -712,6 +712,10 @@ impl<H: Hub> Room<H> {
         if newest <= self.announced_seq || !quiet || !idle || !matches!(self.le.status(), LiveStatus::Live { .. }) {
             return;
         }
+        // Only the body is compared, because phase 1 shares only the body: `crdt.text` ops are
+        // the only ones that change the document (wordcraft sends no scoped or locked commands,
+        // and `LiveEditing` ignores a `Work::Command` from another editor). Sharing anything
+        // outside the body must extend this comparison, or this would claim it saved.
         if !equal_blocks(&self.session.doc.body, &self.saved_body) {
             return;
         }

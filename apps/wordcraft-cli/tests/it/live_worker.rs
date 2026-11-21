@@ -1036,3 +1036,44 @@ async fn a_no_op_op_still_advances_saved() {
     assert_eq!(w.count("put"), 1, "no write");
     assert_eq!(w.eds[0].saved_at().as_deref(), Some(first[0].1.as_str()));
 }
+
+#[tokio::test]
+async fn saved_never_claims_an_op_held_for_a_gap() {
+    let saved = |w: &World| -> Vec<u64> {
+        w.relay.borrow().ephemeral.iter().filter(|(_, kind, _)| kind == "saved").map(|(_, _, p)| p["seq"].as_u64().unwrap()).collect()
+    };
+    let mut w = world(file(&["One"]), 1).await;
+    w.eds[0].type_at_end(0, " fish");
+    w.tick(0).await;
+    let edit =
+        w.relay.borrow().log.iter().rev().find(|m| matches!(m, ServerMsg::Op { origin, .. } if origin.starts_with("editor"))).cloned().unwrap();
+    w.run_for(10_000, 1_000).await;
+    let first = saved(&w);
+    assert_eq!(first.len(), 1);
+
+    // Two resends of the edit (they change nothing), which reach the worker out of order:
+    // the later one alone first.
+    let me = w.relay.borrow().conns.iter().position(|c| c.service && c.connected).unwrap();
+    let [a, b] = {
+        let mut r = w.relay.borrow_mut();
+        let ops = [1, 2].map(|_| {
+            r.seq += 1;
+            let ServerMsg::Op { doc, origin, local, command, params, scope, .. } = edit.clone() else { unreachable!() };
+            ServerMsg::Op { doc, seq: r.seq, origin, local, command, params, scope }
+        });
+        for op in &ops {
+            r.log.push(op.clone());
+            r.broadcast(op, Some(me));
+        }
+        ops
+    };
+    w.relay.borrow_mut().conns[me].inbox.push_back(b.clone());
+    w.run_for(10_000, 1_000).await;
+    assert_eq!(saved(&w), first, "no marker may claim the op held for the gap");
+    w.relay.borrow_mut().conns[me].inbox.push_back(a);
+    w.run_for(10_000, 1_000).await;
+    let after = saved(&w);
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert_eq!(after[1], op_seq(&b), "saved up to both, once the gap filled");
+    assert_eq!(w.count("put"), 1, "no write");
+}
