@@ -532,6 +532,11 @@ pub struct Room<H: Hub> {
     /// The body the file holds: as seeded, then as last written. Anything else is unsaved,
     /// whether it came as an edit, in a join's catch-up or a rejoin's.
     saved_body: Blocks,
+    /// The newest `saved` sequence announced, and when the room's newest op sequence last
+    /// moved: a sequence taken by ops that changed nothing is announced after quiet too.
+    announced_seq: u64,
+    seq_seen: u64,
+    seq_moved_at: u64,
     /// Saves in a row whose conflict handling failed, and when the first of them was.
     conflict_failures: u32,
     conflict_since: u64,
@@ -570,6 +575,9 @@ impl<H: Hub> Room<H> {
         Ok(Room {
             seen_body: session.doc.body.clone(),
             saved_body: session.doc.body.clone(),
+            announced_seq: 0,
+            seq_seen: 0,
+            seq_moved_at: now,
             conflict_failures: 0,
             conflict_since: 0,
             untold_copies: Vec::new(),
@@ -653,6 +661,7 @@ impl<H: Hub> Room<H> {
         let closing_for = self.empty_since.map(|t| now.saturating_sub(t)).filter(|d| *d >= EMPTY_GRACE_MS);
 
         self.maybe_checkpoint(now, closing_for.is_some());
+        self.maybe_reannounce(now);
 
         if let Some(d) = closing_for {
             let settled = self.inflight.is_none() && (self.dirty_since.is_none() || self.stopped.is_some());
@@ -685,6 +694,32 @@ impl<H: Hub> Room<H> {
         self.last_edit = now;
         if !equal_blocks(body, &self.saved_body) {
             self.dirty_since.get_or_insert(now);
+        }
+    }
+
+    /// The room's sequence moved past the last `saved` while the document still equals the file
+    /// (ops that changed nothing): after quiet, announce the file saved up to there, with its
+    /// current ETag. No checkpoint and no write: the file already holds the document at that
+    /// sequence. Editors that wait for `saved` to reach their own edits' sequence so clear.
+    fn maybe_reannounce(&mut self, now: u64) {
+        let newest = self.le.newest_seq();
+        if newest != self.seq_seen {
+            self.seq_seen = newest;
+            self.seq_moved_at = now;
+        }
+        let quiet = now.saturating_sub(self.seq_moved_at) >= QUIET_MS && now.saturating_sub(self.last_edit) >= QUIET_MS;
+        let idle = self.stopped.is_none() && self.inflight.is_none() && self.dirty_since.is_none();
+        if newest <= self.announced_seq || !quiet || !idle || !matches!(self.le.status(), LiveStatus::Live { .. }) {
+            return;
+        }
+        if !equal_blocks(&self.session.doc.body, &self.saved_body) {
+            return;
+        }
+        // Once per quiet period: a failed send waits for the next move or a later try.
+        self.seq_moved_at = now;
+        match self.le.announce_saved(newest, &self.etag) {
+            Ok(()) => self.announced_seq = newest,
+            Err(e) => say(&self.doc_id, format_args!("the saved marker did not go out: {e}")),
         }
     }
 
@@ -750,8 +785,9 @@ impl<H: Hub> Room<H> {
         };
         match self.put(bytes).await {
             Ok(etag) => {
-                if let Err(e) = self.le.announce_saved(seq, &etag) {
-                    say(&self.doc_id, format_args!("the saved marker did not go out: {e}"));
+                match self.le.announce_saved(seq, &etag) {
+                    Ok(()) => self.announced_seq = self.announced_seq.max(seq),
+                    Err(e) => say(&self.doc_id, format_args!("the saved marker did not go out: {e}")),
                 }
                 self.etag = etag;
                 self.saved_body = inflight.body;

@@ -991,3 +991,48 @@ async fn heartbeats_while_a_step_is_blocked() {
     let during = w.count("heartbeat") - before;
     assert!(during >= 10, "heartbeats went on while the step was blocked ({during})");
 }
+
+#[tokio::test]
+async fn a_no_op_op_still_advances_saved() {
+    let saved = |w: &World| -> Vec<(u64, String)> {
+        w.relay
+            .borrow()
+            .ephemeral
+            .iter()
+            .filter(|(_, kind, _)| kind == "saved")
+            .map(|(_, _, p)| (p["seq"].as_u64().unwrap(), p["etag"].as_str().unwrap().to_owned()))
+            .collect()
+    };
+    let mut w = world(file(&["One"]), 1).await;
+    w.eds[0].type_at_end(0, " fish");
+    w.tick(0).await;
+    let edit =
+        w.relay.borrow().log.iter().rev().find(|m| matches!(m, ServerMsg::Op { origin, .. } if origin.starts_with("editor"))).cloned().unwrap();
+    w.run_for(10_000, 1_000).await;
+    assert_eq!(w.count("put"), 1);
+    let first = saved(&w);
+    assert_eq!(first.len(), 1, "one save, one marker: {first:?}");
+    w.run_for(20_000, 1_000).await;
+    assert_eq!(saved(&w), first, "nothing new: no second marker");
+
+    // The editor's edit comes again after a reconnect: it takes a sequence and changes nothing.
+    let resent = {
+        let mut r = w.relay.borrow_mut();
+        r.seq += 1;
+        let seq = r.seq;
+        let ServerMsg::Op { doc, origin, local, command, params, scope, .. } = edit else { unreachable!() };
+        let op = ServerMsg::Op { doc, seq, origin, local, command, params, scope };
+        r.log.push(op.clone());
+        r.broadcast(&op, None);
+        seq
+    };
+    w.tick(1_000).await;
+    assert_eq!(saved(&w).len(), 1, "not before quiet");
+    w.run_for(10_000, 1_000).await;
+    let after = saved(&w);
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert_eq!(after[1], (resent, first[0].1.clone()), "saved up to the resend, the same file");
+    assert!(after[1].0 > first[0].0);
+    assert_eq!(w.count("put"), 1, "no write");
+    assert_eq!(w.eds[0].saved_at().as_deref(), Some(first[0].1.as_str()));
+}

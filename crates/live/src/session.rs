@@ -171,6 +171,8 @@ struct Seen {
     text_ops_owed: bool,
     /// The relay could not catch this link up (`snapshot`: fell too far behind).
     replaced: bool,
+    /// The highest sequence of an ordered op that has passed (0 before any).
+    newest_op: u64,
 }
 
 impl Seen {
@@ -181,6 +183,9 @@ impl Seen {
     }
 
     fn saw(&mut self, m: &ServerMsg) {
+        if let ServerMsg::Op { seq, .. } = m {
+            self.newest_op = self.newest_op.max(*seq);
+        }
         match m {
             ServerMsg::Joined { seq, space, replay_until, fallback, .. } => {
                 self.joins += 1;
@@ -447,6 +452,14 @@ impl<H: Hub> LiveEditing<H> {
 
     pub fn status(&self) -> &LiveStatus {
         &self.status
+    }
+
+    /// The highest relay sequence of an ordered op this session has taken in (0 before any);
+    /// once [`LiveStatus::Live`], every op up to it is in the replica. An op can take a sequence
+    /// and change nothing (a merged resend, an edit undone): the saver uses this to mark the file
+    /// saved up to there when the document still equals it.
+    pub fn newest_seq(&self) -> u64 {
+        lock(&self.seen).newest_op
     }
 
     /// Whether the host may take edits now: live, connected, with an edit ticket.
