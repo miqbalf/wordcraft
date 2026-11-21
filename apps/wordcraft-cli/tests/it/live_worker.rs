@@ -25,8 +25,8 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use tokio::sync::watch;
 use wordcraft_cli::live_worker::{
-    Clock, Config, Flow, Grant, HubTicket, NOTICE_KIND, Nextcloud, QUIET_MS, Room, RoomFiles, Rooms, Secret, Spawn, listen, router, serve_grant,
-    service_ticket,
+    Clock, Config, ENDED_KIND, FileGot, Flow, Grant, HubTicket, NOTICE_KIND, Nextcloud, OpenError, QUIET_MS, Room, RoomFiles, Rooms, SAVE_GIVE_UP_MS,
+    Secret, Spawn, listen, router, serve_grant, service_ticket,
 };
 use wordcraft_doc::{Document, Paragraph, Pos, para_block};
 use wordcraft_engine::io::{open_bytes, save_bytes};
@@ -71,6 +71,9 @@ struct Relay {
     refuse_snapshots: Option<&'static str>,
     /// Every `Hub::set_token`: `(connection, ticket)`.
     tokens: Vec<(usize, String)>,
+    /// The newest `saved` marker, kept after its sender left and sent to every joiner, as the
+    /// relay does: `(origin, payload)`.
+    saved_marker: Option<(String, Value)>,
 }
 
 type Shared = Rc<RefCell<Relay>>;
@@ -151,6 +154,9 @@ impl Relay {
         };
         self.conns[at].inbox.push_back(joined);
         self.conns[at].inbox.extend(replay);
+        if let Some((origin, payload)) = self.saved_marker.clone() {
+            self.conns[at].inbox.push_back(ServerMsg::Ephemeral { doc: DOC.into(), origin, kind: "saved".into(), payload });
+        }
         let presence = ServerMsg::Presence { doc: DOC.into(), roster: self.roster() };
         self.broadcast(&presence, Some(at));
     }
@@ -208,6 +214,9 @@ impl Relay {
             }
             ClientMsg::Ephemeral { kind, payload, .. } => {
                 let origin = self.conns[at].pid.clone();
+                if kind == "saved" {
+                    self.saved_marker = Some((origin.clone(), payload.clone()));
+                }
                 self.ephemeral.push((origin.clone(), kind.clone(), payload.clone()));
                 self.broadcast(&ServerMsg::Ephemeral { doc: DOC.into(), origin, kind, payload }, Some(at));
             }
@@ -227,6 +236,21 @@ impl Relay {
         self.conns[at].inbox.clear();
         let presence = ServerMsg::Presence { doc: DOC.into(), roster: self.roster() };
         self.broadcast(&presence, None);
+    }
+
+    /// A connection that left comes back and joins again.
+    fn rejoin(&mut self, at: usize) {
+        self.conns[at].connected = true;
+        self.join(at);
+    }
+
+    /// The reasons the worker ended the editors' session with, in order.
+    fn ended(&self) -> Vec<String> {
+        self.ephemeral
+            .iter()
+            .filter(|(origin, kind, _)| origin.starts_with(SERVICE_UID) && kind == ENDED_KIND)
+            .filter_map(|(_, _, p)| p.get("reason").and_then(Value::as_str).map(str::to_owned))
+            .collect()
     }
 
     /// The worker's notices, in order.
@@ -256,6 +280,10 @@ struct Nc {
     put_delay: Option<std::time::Duration>,
     /// Answer every write with this status once a conflict copy was made.
     put_status_after_copy: Option<StatusCode>,
+    /// Answer every write with this status.
+    put_status: Option<StatusCode>,
+    /// The name the file is served under, when not [`FILE`] (renamed).
+    name: Option<String>,
 }
 
 type NcState = Arc<Mutex<Nc>>;
@@ -290,7 +318,8 @@ async fn nc_get(State(nc): State<NcState>, Path(room): Path<String>, h: HeaderMa
     let mut n = nc.lock().unwrap();
     n.calls.push("get");
     let bytes = n.files[FILE].clone();
-    ([(header::ETAG, format!("\"{}\"", etag_of(&bytes))), (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{FILE}\""))], bytes)
+    let name = n.name.clone().unwrap_or_else(|| FILE.to_owned());
+    ([(header::ETAG, format!("\"{}\"", etag_of(&bytes))), (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\""))], bytes)
         .into_response()
 }
 
@@ -308,7 +337,7 @@ async fn nc_put(State(nc): State<NcState>, Path(room): Path<String>, h: HeaderMa
         n.calls.push("put412");
         return (StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response();
     }
-    if let Some(status) = n.put_status_after_copy.filter(|_| n.calls.contains(&"copy")) {
+    if let Some(status) = n.put_status.or(n.put_status_after_copy.filter(|_| n.calls.contains(&"copy"))) {
         n.calls.push("putfail");
         return (status, "no").into_response();
     }
@@ -1076,4 +1105,146 @@ async fn saved_never_claims_an_op_held_for_a_gap() {
     assert_eq!(after.len(), 2, "{after:?}");
     assert_eq!(after[1], op_seq(&b), "saved up to both, once the gap filled");
     assert_eq!(w.count("put"), 1, "no write");
+}
+
+/// A new editor joining the room with its own copy of the file, `bytes`.
+fn editor(relay: &Shared, uid: &str, bytes: &[u8]) -> Ed {
+    let hub = Relay::connect(relay, uid);
+    let at = hub.at;
+    let mut s = Session::new(Document::new());
+    let le = LiveEditing::start(hub, DOC, bytes, FILE, &mut s).unwrap();
+    Ed { s, le, at }
+}
+
+fn room_files(base: &str) -> RoomFiles {
+    RoomFiles::new(Arc::new(Nextcloud::new(base, worker_secret()).unwrap()), ROOM.into(), watch::channel(TOKEN.to_owned()).1)
+}
+
+#[tokio::test]
+async fn saving_stopping_ends_the_editors_session_and_the_heartbeat() {
+    let mut w = world(file(&["One"]), 1).await;
+    w.worker.heartbeat_every(std::time::Duration::from_millis(20)).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(w.count("heartbeat") > 0, "heartbeating while saving");
+    w.relay.borrow_mut().refuse_snapshots = Some("that checkpoint is too large to retain for joining editors");
+    w.eds[0].type_at_end(0, " big");
+    w.run_for(10_000, 1_000).await;
+    assert!(w.worker.saving_stopped().is_some());
+    // The editor is told, and its link ends: nothing would save what it types now.
+    assert!(w.eds[0].le.take_notices().iter().any(|n| n.starts_with("Saving has stopped")), "the notice reaches the editor");
+    let LiveStatus::Broken(why) = w.eds[0].le.status().clone() else { panic!("ended: {:?}", w.eds[0].le.status()) };
+    assert!(why.starts_with("Saving has stopped"), "{why}");
+    assert!(!w.eds[0].le.editable());
+    assert_eq!(w.relay.borrow().ended().len(), 1, "ended once");
+    // And the app stops hearing from the room, so its stale-room recovery takes it.
+    let beats = w.count("heartbeat");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    w.tick(1_000).await;
+    assert_eq!(w.count("heartbeat"), beats, "no heartbeat once saving stopped");
+}
+
+#[tokio::test]
+async fn an_editor_rejoining_after_the_worker_left_stops_editing() {
+    let mut w = world(file(&["One", "Two"]), 1).await;
+    w.eds[0].type_at_end(1, " and three");
+    w.run_for(10_000, 1_000).await;
+    assert_eq!(w.count("put"), 1);
+    // The editor's link drops; the room empties and the worker closes it and leaves.
+    let at = w.eds[0].at;
+    w.relay.borrow_mut().leave(at);
+    assert_eq!(w.run_for(60_000, 1_000).await, Flow::Done);
+    assert!(matches!(w.eds[0].le.status(), LiveStatus::Reconnecting), "not told while away: {:?}", w.eds[0].le.status());
+    // Its reconnect finds the room the relay still holds, with no saver in it.
+    w.relay.borrow_mut().rejoin(at);
+    for _ in 0..3 {
+        w.eds[0].pump();
+    }
+    let LiveStatus::Broken(why) = w.eds[0].le.status().clone() else { panic!("ended: {:?}", w.eds[0].le.status()) };
+    assert!(why.contains("Reopen"), "{why}");
+    assert!(!w.eds[0].le.editable(), "nothing would save its edits");
+}
+
+#[tokio::test]
+async fn the_first_join_checkpoints_the_room() {
+    let mut w = world(file(&["One", "Two"]), 0).await;
+    w.run_for(5_000, 1_000).await;
+    let snapshot = w.relay.borrow().log.iter().any(|m| matches!(m, ServerMsg::Op { params, .. } if is_snap(params)));
+    assert!(snapshot, "the room was checkpointed once it was caught up");
+    assert!(w.relay.borrow().saved > 0, "and has a join baseline past the start (0 reads as never saved)");
+    assert_eq!(w.count("put"), 0, "the file already holds it: no write");
+    // An editor whose copy of the file is not the room's base (it changed since the worker read
+    // it) restores the room's document from that checkpoint instead of seeding from its copy.
+    let mut late = editor(&w.relay, "editor9", &file(&["Something else"]));
+    for _ in 0..3 {
+        late.pump();
+        w.tick(1_000).await;
+        late.pump();
+    }
+    assert!(late.le.editable(), "{:?}", late.le.status());
+    assert_eq!(texts(&late.s.doc), ["One", "Two"], "the room's document, not the stale copy");
+}
+
+#[tokio::test]
+async fn a_change_while_no_worker_served_the_room_is_kept_aside() {
+    // The worker saves, then ends (a restart). While no worker serves the room, someone writes
+    // the file outside it, and the editor keeps typing. The next worker reads the changed file:
+    // its save must not write over that version unseen.
+    let mut w = world(file(&["One", "Two"]), 1).await;
+    w.eds[0].type_at_end(0, " fish");
+    w.run_for(10_000, 1_000).await;
+    assert_eq!(w.count("put"), 1);
+    let gone = w.relay.borrow().conns.iter().position(|c| c.service && c.connected).unwrap();
+    w.relay.borrow_mut().leave(gone);
+    let outside = file(&["Changed outside"]);
+    w.nc.lock().unwrap().files.insert(FILE.into(), outside.clone());
+    w.eds[0].type_at_end(1, " more");
+    w.tick(1_000).await;
+
+    w.worker = Room::open(Relay::connect(&w.relay, SERVICE_UID), room_files(&w.base), w.clock.clone()).await.unwrap();
+    w.run_for(20_000, 1_000).await;
+    assert_eq!(w.count("put412"), 1, "the save found the file changed");
+    let copy = "Plan (conflict 2026-11-21 1403).docx";
+    assert_eq!(w.file(copy), outside, "the outside version is kept beside the file");
+    assert_eq!(w.file_texts(), ["One fish", "Two more"], "the room's document is saved");
+    assert!(w.relay.borrow().notices().iter().any(|n| n.contains(copy)), "the editors are told where it went");
+}
+
+#[tokio::test]
+async fn writes_that_keep_failing_are_given_up() {
+    let mut w = world(file(&["One"]), 1).await;
+    w.nc.lock().unwrap().put_status = Some(StatusCode::SERVICE_UNAVAILABLE);
+    w.eds[0].type_at_end(0, " fish");
+    w.run_for(SAVE_GIVE_UP_MS - 30_000, 1_000).await;
+    assert!(w.worker.saving_stopped().is_none(), "retried for minutes first");
+    assert!(w.count("putfail") > 10, "and retried: {}", w.count("putfail"));
+    w.run_for(60_000, 1_000).await;
+    let stopped = w.worker.saving_stopped().map(str::to_owned).unwrap_or_default();
+    assert!(stopped.contains("503"), "{stopped:?}");
+    assert!(matches!(w.eds[0].le.status(), LiveStatus::Broken(_)), "the editor's session ended");
+    let fails = w.count("putfail");
+    w.run_for(60_000, 1_000).await;
+    assert_eq!(w.count("putfail"), fails, "no more tries");
+}
+
+#[tokio::test]
+async fn only_word_documents_are_served() {
+    let (_nc, base) = nextcloud(file(&["One"])).await;
+    let relay: Shared = Rc::default();
+    let clock = Arc::new(TestClock(AtomicU64::new(0)));
+    let got = FileGot { bytes: b"plain text".to_vec(), name: "Notes.txt".into(), etag: "e1".into() };
+    let started = Room::start(Relay::connect(&relay, SERVICE_UID), room_files(&base), got, clock);
+    assert!(matches!(started, Err(OpenError::Format(ref name)) if name == "Notes.txt"), "{:?}", started.err());
+}
+
+#[tokio::test]
+async fn a_renamed_file_names_its_conflict_copy() {
+    let mut w = world(file(&["One"]), 1).await;
+    {
+        let mut n = w.nc.lock().unwrap();
+        n.name = Some("Budget.docx".into());
+        n.files.insert(FILE.into(), file(&["Changed outside"]));
+    }
+    w.eds[0].type_at_end(0, " fish");
+    w.run_for(10_000, 1_000).await;
+    assert_eq!(w.file("Budget (conflict 2026-11-21 1403).docx"), file(&["Changed outside"]), "named after the file as it is now");
 }

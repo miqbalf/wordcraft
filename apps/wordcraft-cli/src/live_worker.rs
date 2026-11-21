@@ -17,9 +17,21 @@
 //!    [`EMPTY_GRACE_MS`], saves a last time, closes the room (which releases the app lock) and
 //!    leaves.
 //!
+//! Right after its first join has caught up, the worker checkpoints the room once, so an editor
+//! that joins later restores the room's document from that snapshot instead of seeding from a
+//! file that may have changed since. When the room's newest `saved` marker (from an earlier
+//! worker) names another ETag than the file has now, the file changed while no worker served the
+//! room: the next save takes the conflict path below.
+//!
 //! When the file changed outside the session (`412`), the version found there is copied aside
 //! as `"{stem} (conflict {YYYY-MM-DD HHMM}).{ext}"` (` 2` … ` 9` added when the name is
 //! taken), the editors get a `notice`, and the room goes on saving over that version's ETag.
+//! A write that keeps failing for another reason is given up after [`SAVE_GIVE_UP_MS`].
+//!
+//! When saving stops for good, and before the worker leaves a room, it sends the editors `ended`
+//! (`{reason}`), which ends their link, and stops heartbeating, so the app's stale-room recovery
+//! runs. Leaving, it also marks the room's newest `saved` marker `closed`, which the relay keeps
+//! for an editor that rejoins later. Only `.docx` files are served.
 //!
 //! Tickets, tokens and secrets are never logged.
 
@@ -51,8 +63,9 @@ use wordcraft_engine::Session;
 use wordcraft_engine::io::save_bytes;
 use wordcraft_live::{LiveEditing, LiveStatus, SERVICE_UID, SaveEvent, document_from_state};
 
-/// The ephemeral kind the worker tells the editors something with: `{text}`.
-pub const NOTICE_KIND: &str = "notice";
+/// The ephemeral kinds the worker tells the editors something with (`{text}`) and ends their
+/// session with (`{reason}`).
+pub use wordcraft_live::{ENDED_KIND, NOTICE_KIND};
 /// Save this long after the last edit.
 pub const QUIET_MS: u64 = 5_000;
 /// Save at least this often while edits keep coming.
@@ -61,6 +74,8 @@ pub const MAX_UNSAVED_MS: u64 = 60_000;
 pub const HEARTBEAT_MS: u64 = 30_000;
 /// A room with no editor for this long gets its last save and is closed.
 pub const EMPTY_GRACE_MS: u64 = 10_000;
+/// Turns live before the first join counts as caught up (half a second at [`TICK`]).
+const SETTLE_STEPS: u32 = 5;
 /// A room no editor ever joined is given up after this long.
 pub const ALONE_MS: u64 = 120_000;
 /// How long a service ticket is good for.
@@ -74,6 +89,13 @@ pub const CONFLICT_TEXT: &str = "Someone changed this file outside the live sess
 const RETRY_MS: u64 = 2_000;
 /// After a failed write, wait this long before checkpointing again.
 const PUT_RETRY_MS: u64 = 5_000;
+/// Writes that keep failing (not a conflict: a missing file, a lock that stays, a server error)
+/// are given up this long after the first failure, and saving stops.
+pub const SAVE_GIVE_UP_MS: u64 = 300_000;
+/// What the editors are told when the worker leaves an empty room.
+const LEFT_REASON: &str = "The live session ended. Reopen the file to keep editing.";
+/// What the editors are told when the app ended the room's grant.
+const GRANT_ENDED_REASON: &str = "This live session was ended on the server. Changes from now on are not saved; reopen the file.";
 /// A closing room whose last save does not get through is closed anyway after this long. The
 /// edits that last save would have written are then lost: they were only in the room, and the
 /// room ends with the close (the worker logs it).
@@ -507,6 +529,8 @@ enum WriteFail {
 pub enum OpenError {
     File(FileError),
     Live(String),
+    /// Not a `.docx` file: its name.
+    Format(String),
 }
 
 impl fmt::Display for OpenError {
@@ -514,6 +538,7 @@ impl fmt::Display for OpenError {
         match self {
             OpenError::File(e) => write!(f, "the file could not be read: {e}"),
             OpenError::Live(e) => write!(f, "live editing did not start: {e}"),
+            OpenError::Format(name) => write!(f, "only .docx files are edited live, not {name}"),
         }
     }
 }
@@ -550,6 +575,15 @@ pub struct Room<H: Hub> {
     retry_at: u64,
     /// Saving stopped for good, and why.
     stopped: Option<String>,
+    /// The editors were sent `ended`.
+    ended: bool,
+    /// The first join has caught up (the room's base was checked), after this many turns live.
+    caught_up: bool,
+    live_steps: u32,
+    /// The checkpoint right after the first join is still to be sent.
+    first_checkpoint: bool,
+    /// When the first of the writes failing in a row (not conflicts) failed.
+    put_failing_since: Option<u64>,
     beat: Beat,
     opened_at: u64,
     seen_editor: bool,
@@ -565,6 +599,11 @@ impl<H: Hub> Room<H> {
 
     /// Join the room on `hub` as the service peer, with the file already read.
     pub fn start(hub: H, files: RoomFiles, got: FileGot, clock: Arc<dyn Clock>) -> Result<Room<H>, OpenError> {
+        // Phase 1 edits Word documents only: the body is what is shared, and the file is written
+        // back in its own format, which for anything else could lose what it holds.
+        if !is_docx(&got.name) {
+            return Err(OpenError::Format(got.name));
+        }
         let doc_id = format!("doc:{}", files.room());
         let mut session = Session::new(Document::new());
         let mut le = LiveEditing::start(hub, &doc_id, &got.bytes, &got.name, &mut session).map_err(|e| OpenError::Live(e.to_string()))?;
@@ -593,6 +632,11 @@ impl<H: Hub> Room<H> {
             inflight: None,
             retry_at: 0,
             stopped: None,
+            ended: false,
+            caught_up: false,
+            live_steps: 0,
+            first_checkpoint: false,
+            put_failing_since: None,
             beat,
             opened_at: now,
             seen_editor: false,
@@ -642,11 +686,22 @@ impl<H: Hub> Room<H> {
         if let LiveStatus::Broken(why) = self.le.status().clone() {
             self.stop(&why);
         }
+        if !self.caught_up && matches!(self.le.status(), LiveStatus::Live { .. }) {
+            self.live_steps += 1;
+            // The relay sends the room's `saved` marker after the catch-up's ops: give it a few
+            // turns to arrive before reading it.
+            if self.live_steps >= SETTLE_STEPS {
+                self.caught_up = true;
+                self.check_base(now);
+                self.first_checkpoint = true;
+            }
+        }
         self.answers(now).await;
 
         if self.beat.refused() {
             say(&self.doc_id, "the app ended this room's grant; leaving");
-            self.tell("This live session was ended on the server. Changes from now on are not saved; reopen the file.");
+            self.tell(GRANT_ENDED_REASON);
+            self.leave(GRANT_ENDED_REASON);
             return Flow::Done;
         }
 
@@ -676,6 +731,7 @@ impl<H: Hub> Room<H> {
                     say(&self.doc_id, format_args!("closing the room failed: {e}"));
                 }
                 say(&self.doc_id, "no editors left; room closed");
+                self.leave(LEFT_REASON);
                 return Flow::Done;
             }
         }
@@ -727,12 +783,33 @@ impl<H: Hub> Room<H> {
         }
     }
 
+    /// The first join has caught up: when the room's newest save (an earlier worker's) names
+    /// another ETag than the file read now, the file changed while nobody served the room. The
+    /// room's document is then saved over the version that save wrote, so the write finds the
+    /// change and copies it aside (the conflict path) instead of writing over it unseen. When the
+    /// room's document is what the file holds now, nothing is lost either way.
+    fn check_base(&mut self, now: u64) {
+        let Some((_, room_etag)) = self.le.saved() else { return };
+        if room_etag == self.etag || equal_blocks(&self.session.doc.body, &self.saved_body) {
+            return;
+        }
+        say(&self.doc_id, "the file changed while the room had no saver; the next save keeps that version aside");
+        self.etag = room_etag.to_owned();
+        self.dirty_since.get_or_insert(now);
+    }
+
     fn maybe_checkpoint(&mut self, now: u64, closing: bool) {
-        let Some(since) = self.dirty_since else { return };
         if self.stopped.is_some() || self.inflight.is_some() || now < self.retry_at {
             return;
         }
-        let due = closing || now.saturating_sub(self.last_edit) >= QUIET_MS || now.saturating_sub(since) >= MAX_UNSAVED_MS;
+        // The first checkpoint goes out as soon as the first join has caught up. With edits to
+        // save it is an ordinary save, due when they have been quiet.
+        let (since, first) = match self.dirty_since {
+            Some(since) => (since, false),
+            None if self.first_checkpoint => (now, true),
+            None => return,
+        };
+        let due = first || closing || now.saturating_sub(self.last_edit) >= QUIET_MS || now.saturating_sub(since) >= MAX_UNSAVED_MS;
         if !due {
             return;
         }
@@ -741,6 +818,7 @@ impl<H: Hub> Room<H> {
             Ok(state) => {
                 self.inflight = Some(Inflight { state, body: self.session.doc.body.clone(), dirty_since: since });
                 self.dirty_since = None;
+                self.first_checkpoint = false;
             }
             Err(craft_collab::Error::Refused(why)) => self.stop(&why),
             Err(e) => {
@@ -756,7 +834,15 @@ impl<H: Hub> Room<H> {
         for event in self.le.take_save_events() {
             let Some(inflight) = self.inflight.take() else { continue };
             match event {
-                SaveEvent::Checkpointed { seq } => self.write(inflight, seq, now).await,
+                SaveEvent::Checkpointed { seq } => {
+                    // A room's join baseline is the sequence before its checkpoint, and a
+                    // baseline of 0 reads as "never saved" (joiners seed from their file). The
+                    // first checkpoint of an untouched room is ordered at 1, so it takes another.
+                    if seq <= 1 {
+                        self.first_checkpoint = true;
+                    }
+                    self.write(inflight, seq, now).await;
+                }
                 SaveEvent::Raced => {
                     self.unsaved(inflight.dirty_since);
                     self.retry_at = now + RETRY_MS;
@@ -774,8 +860,17 @@ impl<H: Hub> Room<H> {
         self.dirty_since = Some(self.dirty_since.map_or(since, |d| d.min(since)));
     }
 
-    /// Write the acknowledged checkpoint `inflight` (ordered at `seq`) to the file.
+    /// Write the acknowledged checkpoint `inflight` (ordered at `seq`) to the file. One that
+    /// holds what the file holds already (the first checkpoint, or edits undone) is only
+    /// announced, with the file's ETag.
     async fn write(&mut self, inflight: Inflight, seq: u64, now: u64) {
+        if equal_blocks(&inflight.body, &self.saved_body) && self.untold_copies.is_empty() {
+            match self.le.announce_saved(seq, &self.etag) {
+                Ok(()) => self.announced_seq = self.announced_seq.max(seq),
+                Err(e) => say(&self.doc_id, format_args!("the saved marker did not go out: {e}")),
+            }
+            return;
+        }
         let bytes = match document_from_state(&self.session.doc, &inflight.state)
             .map_err(|e| e.to_string())
             .and_then(|doc| save_bytes(&self.file_name, &doc))
@@ -795,6 +890,7 @@ impl<H: Hub> Room<H> {
                 }
                 self.etag = etag;
                 self.saved_body = inflight.body;
+                self.put_failing_since = None;
             }
             Err(WriteFail::Stop(why)) => {
                 self.unsaved(inflight.dirty_since);
@@ -808,6 +904,8 @@ impl<H: Hub> Room<H> {
                 } else if self.conflict_failures > 0 {
                     let at = (self.conflict_failures as usize).min(CONFLICT_RETRY_MS.len()) - 1;
                     self.retry_at = now + CONFLICT_RETRY_MS[at];
+                } else if now.saturating_sub(*self.put_failing_since.get_or_insert(now)) >= SAVE_GIVE_UP_MS {
+                    self.stop(&format!("the file could not be written for {} minutes: {e}", SAVE_GIVE_UP_MS / 60_000));
                 } else {
                     self.retry_at = now + PUT_RETRY_MS;
                 }
@@ -852,6 +950,11 @@ impl<H: Hub> Room<H> {
     /// The outside version copied aside and the session written over it: the new ETag.
     async fn keep_outside(&mut self, bytes: Vec<u8>) -> Result<String, ConflictFail> {
         let outside = self.files.get().await.map_err(ConflictFail::from)?;
+        // The file may have been renamed since it was first read: the copy is named after it as
+        // it is now. Still a Word document, or the format it is written in would change.
+        if outside.name != self.file_name && is_docx(&outside.name) {
+            self.file_name = outside.name;
+        }
         let name = copy_aside(&self.files, &self.file_name, self.clock.unix_ms()).await?;
         say(&self.doc_id, "the file changed outside the session; that version was copied aside");
         self.untold_copies.push(name);
@@ -867,16 +970,42 @@ impl<H: Hub> Room<H> {
         etag
     }
 
-    /// Stop saving for good: tell the editors, keep the room open.
+    /// Stop saving for good: tell the editors and end their session, stop heartbeating (the
+    /// app then treats the room as stale), keep the room open until it empties.
     fn stop(&mut self, why: &str) {
         if self.stopped.is_some() {
             return;
         }
         say(&self.doc_id, format_args!("saving stopped: {why}"));
-        self.tell(&format!(
+        let text = format!(
             "Saving has stopped: your changes are no longer being saved to the file ({why}). Download a copy to keep your work, then reopen the file."
-        ));
+        );
+        self.tell(&text);
+        self.end_session(&text);
+        self.beat.stop();
         self.stopped = Some(why.to_owned());
+    }
+
+    /// Send the editors `ended` (once): their link ends with `reason`.
+    fn end_session(&mut self, reason: &str) {
+        if std::mem::replace(&mut self.ended, true) {
+            return;
+        }
+        let msg = ClientMsg::Ephemeral { doc: self.doc_id.clone(), kind: ENDED_KIND.to_owned(), payload: json!({ "reason": reason }) };
+        if let Err(e) = self.le.hub_mut().send(msg) {
+            say(&self.doc_id, format_args!("the end of the session did not go out: {e}"));
+        }
+    }
+
+    /// Before leaving the room: end the editors' session, and mark the room's newest save
+    /// `closed`, which the relay keeps for an editor that rejoins after the worker left.
+    fn leave(&mut self, reason: &str) {
+        self.end_session(reason);
+        self.beat.stop();
+        let (seq, etag) = self.le.saved().map_or_else(|| (self.announced_seq, self.etag.clone()), |(seq, etag)| (seq, etag.to_owned()));
+        if let Err(e) = self.le.announce_closed(seq, &etag) {
+            say(&self.doc_id, format_args!("the closed marker did not go out: {e}"));
+        }
     }
 
     /// A `notice` for every editor.
@@ -923,6 +1052,11 @@ impl Beat {
     /// Whether the app refused a heartbeat: the grant is over.
     fn refused(&self) -> bool {
         self.refused.load(Ordering::Relaxed)
+    }
+
+    /// Heartbeat no more.
+    fn stop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -971,6 +1105,11 @@ fn same_blocks(a: &Blocks, b: &Blocks) -> bool {
 /// Whether two bodies hold equal blocks: by address first, by value where that differs.
 fn equal_blocks(a: &Blocks, b: &Blocks) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y) || x == y)
+}
+
+/// Whether `name` is a Word document (`.docx`), the only format edited live in phase 1.
+fn is_docx(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && ext.eq_ignore_ascii_case("docx"))
 }
 
 fn say(room: &str, msg: impl fmt::Display) {
@@ -1252,7 +1391,9 @@ async fn run_room(cfg: Arc<Config>, nc: Arc<Nextcloud>, rooms: Arc<Rooms>, grant
 }
 
 /// Serve the notify routes on `listener`: HTTP/1, one request per connection, a header timeout
-/// and a whole-connection timeout, so a slow or idle client cannot hold connections open.
+/// and a whole-connection timeout, so a slow or idle client cannot hold connections open. There
+/// is no cap on connections open at once: the worker listens on a private network only the app
+/// reaches (the dev stack's container network), not on a public address.
 pub async fn listen(listener: tokio::net::TcpListener, app: Router) {
     loop {
         let stream = match listener.accept().await {
