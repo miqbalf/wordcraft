@@ -449,6 +449,14 @@ impl<H: Hub> LiveEditing<H> {
         &self.status
     }
 
+    /// The highest relay sequence the replica has applied in order: an op that arrived ahead
+    /// of a gap is not counted until the ops before it are in. An op can take a sequence and
+    /// change nothing (a merged resend): the saver uses this to mark the file saved up to there
+    /// when the document still equals it.
+    pub fn newest_seq(&self) -> u64 {
+        self.live.applied()
+    }
+
     /// Whether the host may take edits now: live, connected, with an edit ticket.
     pub fn editable(&self) -> bool {
         matches!(self.status, LiveStatus::Live { .. }) && self.access == Access::Edit && self.live.connected() && self.live.ready_to_type()
