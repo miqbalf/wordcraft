@@ -44,7 +44,10 @@
 //!   edit this replica already holds, an update this replica holds could not be sent, the
 //!   catch-up could not be rebuilt (`Work::TextIncomplete`), the relay could no longer catch
 //!   this link up (it fell too far behind), a checkpoint did not restore, or yrs failed on an
-//!   update. It is final: the message tells the user to reopen the file. A read-only ticket
+//!   update. The document service ends it too: an `ended` message (`{reason}`) when it stops
+//!   saving or leaves, and a `saved` marker marked `closed` (kept by the relay for an editor
+//!   that rejoins after the service left), and the host with [`LiveEditing::end`]. It is final:
+//!   the message tells the user to reopen the file. A read-only ticket
 //!   started for editing ends here too, when the relay refuses its first edit ("read-only
 //!   access"): start a read-only ticket with [`Access::Read`].
 //!
@@ -65,6 +68,9 @@
 //! - `checkpoint()` failing with any other error (not ready, still catching up, one in flight,
 //!   the hub failed): nothing was sent; keep pumping and try again later.
 //!
+//! The service's `notice` messages (`{text}`, from [`SERVICE_UID`] only) come out of
+//! [`LiveEditing::take_notices`] like the link's own.
+//!
 //! Recovered and forwarded text (see the crate documentation) is made outside the replica's
 //! undo history, so the user's Undo never takes it back.
 
@@ -82,14 +88,22 @@ use crate::{LiveMap, MapError, Refusal, Remote, assign_seed_pids, is_shareable, 
 pub const SERVICE_UID: &str = "craft_office";
 /// The ephemeral kind carrying a caret: `{pid, at, end}`, `end` `[pid, at]` or null.
 pub const CURSOR_KIND: &str = "cursor";
-/// The ephemeral kind the document service announces a save with: `{seq, etag}`.
+/// The ephemeral kind the document service announces a save with: `{seq, etag}`. The last one
+/// before the service leaves a room also says `closed: true`: the room has no saver any more.
 pub const SAVED_KIND: &str = "saved";
+/// The ephemeral kind the document service tells the editors something with: `{text}`.
+pub const NOTICE_KIND: &str = "notice";
+/// The ephemeral kind the document service ends the session with, when it stops saving or
+/// leaves the room: `{reason}`. The editors' link ends ([`LiveStatus::Broken`]) with that reason.
+pub const ENDED_KIND: &str = "ended";
 /// The least time between two carets sent: at most five a second.
 pub const CURSOR_INTERVAL_MS: f64 = 200.0;
 /// Without a clock, the frames between two carets sent (five a second at 60 frames).
 const CURSOR_FRAMES: u32 = 12;
 /// The largest `saved` payload the relay keeps.
 const SAVED_MAX_BYTES: usize = 1024;
+/// The largest `notice` text or `ended` reason taken from the service.
+const SERVICE_TEXT_MAX_BYTES: usize = 2048;
 
 const BROKEN: &str = "This document fell out of step with the other editors. Reopen the file to keep editing.";
 const READ_ONLY_BROKEN: &str = "You can only read this file. Reopen it to keep following the other editors.";
@@ -107,6 +121,8 @@ const CATCH_UP_LATE_MS: f64 = 10_000.0;
 /// The same without a clock, in frames.
 const CATCH_UP_LATE_FRAMES: u32 = 600;
 const AFTER_UNDO: &str = "An edit made right after Undo was not kept. Please make it again.";
+/// The service closed the room: nothing saves edits made in it any more.
+const CLOSED: &str = "The live session ended. Reopen the file to keep editing.";
 
 /// What live editing is doing now; see the [module documentation](self).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -374,6 +390,8 @@ pub struct LiveEditing<H: Hub> {
     service_uid: String,
     carets: HashMap<String, Caret>,
     notices: Vec<String>,
+    /// The newest service notice taken from each peer: a rejoin's catch-up sends it again.
+    told: HashMap<String, String>,
     /// A local edit stayed in the session without reaching the room.
     lost: bool,
     save_events: Vec<SaveEvent>,
@@ -423,6 +441,7 @@ impl<H: Hub> LiveEditing<H> {
             service_uid: SERVICE_UID.to_owned(),
             carets: HashMap::new(),
             notices: Vec::new(),
+            told: HashMap::new(),
             lost: false,
             save_events: Vec::new(),
             cursor: CursorOut::default(),
@@ -556,6 +575,25 @@ impl<H: Hub> LiveEditing<H> {
         let me = self.service_uid.clone();
         self.take_saved(&me, &json!({"seq": seq, "etag": etag}));
         Ok(())
+    }
+
+    /// The newest save announced: its sequence and the file's ETag.
+    pub fn saved(&self) -> Option<(u64, &str)> {
+        self.saved.as_ref().map(|(seq, etag)| (*seq, etag.as_str()))
+    }
+
+    /// Announce that the service leaves the room (the saver only): the newest save again, marked
+    /// `closed`. The relay keeps it after the service has left, so an editor that rejoins the
+    /// room later learns that nothing saves it any more.
+    pub fn announce_closed(&mut self, seq: u64, etag: &str) -> craft_collab::Result<()> {
+        self.live.send_ephemeral(SAVED_KIND, json!({"seq": seq, "etag": etag, "closed": true}))
+    }
+
+    /// End the link from outside (the host learned the session is over: another room, less
+    /// access): [`LiveStatus::Broken`] with `reason`, at once and for good.
+    pub fn end(&mut self, reason: &str) {
+        self.break_with(reason);
+        self.update_status();
     }
 
     /// The uid whose `saved` markers count, [`SERVICE_UID`] unless the relay names another.
@@ -807,6 +845,20 @@ impl<H: Hub> LiveEditing<H> {
     fn ephemeral(&mut self, origin: &str, kind: &str, payload: &Value, session: &Session) {
         match kind {
             SAVED_KIND => self.take_saved(origin, payload),
+            NOTICE_KIND => {
+                if let Some(text) = self.service_text(origin, payload, "text")
+                    && self.told.get(origin) != Some(&text)
+                {
+                    self.told.insert(origin.to_owned(), text.clone());
+                    self.notices.push(text);
+                }
+            }
+            ENDED_KIND => {
+                if let Some(reason) = self.service_text(origin, payload, "reason") {
+                    log::warn!("live: the document service ended the session");
+                    self.break_with(&reason);
+                }
+            }
             CURSOR_KIND => {
                 let caret = payload.get("pid").and_then(Value::as_u64).zip(payload.get("at").and_then(Value::as_u64));
                 let text = caret.and_then(|(pid, _)| para_text(&session.doc, pid));
@@ -824,12 +876,26 @@ impl<H: Hub> LiveEditing<H> {
         }
     }
 
+    /// Field `field` of a service message: a non-empty string within [`SERVICE_TEXT_MAX_BYTES`],
+    /// from the service uid only.
+    fn service_text(&self, origin: &str, payload: &Value, field: &str) -> Option<String> {
+        if uid_of(origin) != self.service_uid {
+            log::debug!("live: ignoring a service message from a peer that is not the service");
+            return None;
+        }
+        let text = payload.get(field).and_then(Value::as_str).map(str::trim)?;
+        (!text.is_empty() && text.len() <= SERVICE_TEXT_MAX_BYTES).then(|| text.to_owned())
+    }
+
     /// A `saved` marker counts only from the service uid, shaped `{seq, etag}` within the
-    /// relay's size, and with `seq` not going back.
+    /// relay's size, and with `seq` not going back. One marked `closed` ends the link.
     fn take_saved(&mut self, origin: &str, payload: &Value) {
         if uid_of(origin) != self.service_uid {
             log::debug!("live: ignoring a saved marker from a peer that is not the service");
             return;
+        }
+        if payload.get("closed").and_then(Value::as_bool) == Some(true) {
+            self.break_with(CLOSED);
         }
         let seq = payload.get("seq").and_then(Value::as_u64);
         let etag = payload.get("etag").and_then(Value::as_str);

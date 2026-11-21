@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use wordcraft_doc::{Block, Document, Pos};
 use wordcraft_engine::io::save_bytes;
 use wordcraft_engine::{Selection, Session};
-use wordcraft_live::{Access, LiveEditing, LiveStatus, SERVICE_UID, SaveEvent, document_from_state};
+use wordcraft_live::{Access, ENDED_KIND, LiveEditing, LiveStatus, NOTICE_KIND, SERVICE_UID, SaveEvent, document_from_state};
 
 use super::{Rng, plain, random_off, texts};
 
@@ -934,4 +934,86 @@ fn a_catch_up_that_never_arrives_ends_in_reopen() {
     *now.lock().unwrap() = 60_000.0;
     c.pump();
     assert!(c.le.take_notices().is_empty(), "no more catch-up notices once broken");
+}
+
+/// `peer` (a connection of the fake relay) sends ephemeral `kind` with `payload` to the room.
+fn tell(relay: &Shared, peer: usize, kind: &str, payload: Value) {
+    let msg = ClientMsg::Ephemeral { doc: ROOM.into(), kind: kind.into(), payload };
+    relay.borrow_mut().handle(peer, msg);
+}
+
+#[test]
+fn a_service_notice_reaches_the_editors_once() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut m = Ed::open(&relay, "mallory", Access::Edit, &bytes);
+    let mut saver = Ed::open(&relay, SERVICE_UID, Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut m, &mut saver]);
+    a.le.take_notices();
+    tell(&relay, 1, NOTICE_KIND, json!({"text": "Forged notice."}));
+    tell(&relay, 2, NOTICE_KIND, json!({"text": "Their version was kept as Plan (conflict).docx."}));
+    settle(&relay, &mut [&mut a, &mut m, &mut saver]);
+    assert_eq!(a.le.take_notices(), ["Their version was kept as Plan (conflict).docx."], "the service's notice only");
+    // A rejoin's catch-up sends the newest notice again: it is not told twice.
+    relay.borrow_mut().drop_link(0);
+    a.pump();
+    relay.borrow_mut().restore_link(0);
+    settle(&relay, &mut [&mut a, &mut m, &mut saver]);
+    assert!(a.le.take_notices().iter().all(|n| !n.contains("conflict")), "told once");
+    assert!(matches!(a.le.status(), LiveStatus::Live { .. }), "a notice does not end the link");
+}
+
+#[test]
+fn the_service_ending_the_session_ends_the_link() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut m = Ed::open(&relay, "mallory", Access::Edit, &bytes);
+    let mut saver = Ed::open(&relay, SERVICE_UID, Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut m, &mut saver]);
+    tell(&relay, 1, ENDED_KIND, json!({"reason": "forged"}));
+    settle(&relay, &mut [&mut a, &mut m, &mut saver]);
+    assert!(a.le.editable(), "only the service ends the session");
+    tell(&relay, 2, ENDED_KIND, json!({"reason": "Saving has stopped. Download a copy, then reopen the file."}));
+    settle(&relay, &mut [&mut a, &mut m, &mut saver]);
+    assert_eq!(a.le.status(), &LiveStatus::Broken("Saving has stopped. Download a copy, then reopen the file.".into()));
+    assert!(!a.le.editable());
+    a.end_of(0);
+    assert!(!a.run("text.insert", json!({"text": "x"})), "no edits once ended");
+}
+
+#[test]
+fn an_editor_rejoining_a_room_the_service_closed_stops_editing() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut saver = Ed::open(&relay, SERVICE_UID, Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut saver]);
+    save(&mut [&mut a, &mut saver], 1, "etag-1");
+    settle(&relay, &mut [&mut a, &mut saver]);
+    // Alice's link is down when the service closes the room and leaves.
+    relay.borrow_mut().drop_link(0);
+    a.pump();
+    let (seq, etag) = saver.le.saved().map(|(s, e)| (s, e.to_owned())).unwrap();
+    saver.le.announce_closed(seq, &etag).unwrap();
+    relay.borrow_mut().drop_link(1);
+    assert!(!matches!(a.le.status(), LiveStatus::Broken(_)), "not told yet: {:?}", a.le.status());
+    // The relay still holds the room; her reconnect gets the closed marker in its catch-up.
+    relay.borrow_mut().restore_link(0);
+    settle(&relay, &mut [&mut a]);
+    let LiveStatus::Broken(why) = a.le.status().clone() else { panic!("broken: {:?}", a.le.status()) };
+    assert!(why.contains("Reopen"), "{why}");
+}
+
+#[test]
+fn the_host_can_end_the_link() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a]);
+    a.le.end("The live session was restarted. Reopen the file.");
+    assert_eq!(a.le.status(), &LiveStatus::Broken("The live session was restarted. Reopen the file.".into()));
+    settle(&relay, &mut [&mut a]);
+    assert!(matches!(a.le.status(), LiveStatus::Broken(_)), "for good");
 }
