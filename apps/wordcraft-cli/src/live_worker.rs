@@ -33,6 +33,10 @@
 //! runs. Leaving, it also marks the room's newest `saved` marker `closed`, which the relay keeps
 //! for an editor that rejoins later. Only `.docx` files are served.
 //!
+//! When the relay lost the room's history (it restarted with nothing to replay), a worker that
+//! held the document checkpoints it at once; one that held nothing waits for a snapshot like an
+//! editor, and stops saving when none comes.
+//!
 //! Tickets, tokens and secrets are never logged.
 
 use std::collections::HashMap;
@@ -582,6 +586,9 @@ pub struct Room<H: Hub> {
     live_steps: u32,
     /// The checkpoint right after the first join is still to be sent.
     first_checkpoint: bool,
+    /// The room lost its history while this worker held the document: checkpoint at once,
+    /// edits or not, so the room has a snapshot to give the editors waiting for one.
+    checkpoint_now: bool,
     /// When the first of the writes failing in a row (not conflicts) failed.
     put_failing_since: Option<u64>,
     beat: Beat,
@@ -636,6 +643,7 @@ impl<H: Hub> Room<H> {
             caught_up: false,
             live_steps: 0,
             first_checkpoint: false,
+            checkpoint_now: false,
             put_failing_since: None,
             beat,
             opened_at: now,
@@ -695,6 +703,13 @@ impl<H: Hub> Room<H> {
                 self.check_base(now);
                 self.first_checkpoint = true;
             }
+        }
+        // The relay lost the room's history (it restarted with nothing to replay). Holding a
+        // settled document, the worker gives the room a snapshot at once. A worker that held
+        // nothing yet waits like an editor, and its link ends (saving stops) if none comes.
+        if self.le.take_history_lost() && self.caught_up {
+            say(&self.doc_id, "the room lost its history; checkpointing it now");
+            self.checkpoint_now = true;
         }
         self.answers(now).await;
 
@@ -805,8 +820,8 @@ impl<H: Hub> Room<H> {
         // The first checkpoint goes out as soon as the first join has caught up. With edits to
         // save it is an ordinary save, due when they have been quiet.
         let (since, first) = match self.dirty_since {
-            Some(since) => (since, false),
-            None if self.first_checkpoint => (now, true),
+            Some(since) => (since, self.checkpoint_now),
+            None if self.first_checkpoint || self.checkpoint_now => (now, true),
             None => return,
         };
         let due = first || closing || now.saturating_sub(self.last_edit) >= QUIET_MS || now.saturating_sub(since) >= MAX_UNSAVED_MS;
@@ -819,6 +834,7 @@ impl<H: Hub> Room<H> {
                 self.inflight = Some(Inflight { state, body: self.session.doc.body.clone(), dirty_since: since });
                 self.dirty_since = None;
                 self.first_checkpoint = false;
+                self.checkpoint_now = false;
             }
             Err(craft_collab::Error::Refused(why)) => self.stop(&why),
             Err(e) => {

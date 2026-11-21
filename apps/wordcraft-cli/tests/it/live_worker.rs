@@ -74,6 +74,8 @@ struct Relay {
     /// The newest `saved` marker, kept after its sender left and sent to every joiner, as the
     /// relay does: `(origin, payload)`.
     saved_marker: Option<(String, Value)>,
+    /// The relay restarted and lost the room's history: joins say so and replay nothing.
+    lost_history: bool,
 }
 
 type Shared = Rc<RefCell<Relay>>;
@@ -138,7 +140,8 @@ impl Relay {
 
     fn join(&mut self, at: usize) {
         self.next_space += 1;
-        let replay: Vec<ServerMsg> = self.log.iter().filter(|m| op_seq(m) > self.saved).cloned().collect();
+        let replay: Vec<ServerMsg> =
+            if self.lost_history { Vec::new() } else { self.log.iter().filter(|m| op_seq(m) > self.saved).cloned().collect() };
         let until = replay.last().map_or(self.saved, op_seq);
         let joined = ServerMsg::Joined {
             doc: DOC.into(),
@@ -151,10 +154,11 @@ impl Relay {
             fallback: false,
             text_cap: None,
             heartbeat: false,
+            history_lost: self.lost_history,
         };
         self.conns[at].inbox.push_back(joined);
         self.conns[at].inbox.extend(replay);
-        if let Some((origin, payload)) = self.saved_marker.clone() {
+        if let Some((origin, payload)) = self.saved_marker.clone().filter(|_| !self.lost_history) {
             self.conns[at].inbox.push_back(ServerMsg::Ephemeral { doc: DOC.into(), origin, kind: "saved".into(), payload });
         }
         let presence = ServerMsg::Presence { doc: DOC.into(), roster: self.roster() };
@@ -1247,4 +1251,55 @@ async fn a_renamed_file_names_its_conflict_copy() {
     w.eds[0].type_at_end(0, " fish");
     w.run_for(10_000, 1_000).await;
     assert_eq!(w.file("Budget (conflict 2026-11-21 1403).docx"), file(&["Changed outside"]), "named after the file as it is now");
+}
+
+/// The relay restarts and loses the room's history: nothing to replay, joins say so.
+fn lose_history(relay: &Shared) {
+    let mut r = relay.borrow_mut();
+    r.lost_history = true;
+    r.log.clear();
+    r.saved_marker = None;
+}
+
+fn snapshots(w: &World) -> usize {
+    w.relay.borrow().log.iter().filter(|m| matches!(m, ServerMsg::Op { params, .. } if is_snap(params))).count()
+}
+
+#[tokio::test]
+async fn a_settled_worker_checkpoints_a_room_that_lost_its_history() {
+    let mut w = world(file(&["One"]), 1).await;
+    w.eds[0].type_at_end(0, " fish");
+    w.run_for(10_000, 1_000).await;
+    assert_eq!(w.count("put"), 1);
+    // The relay restarts: every link drops and rejoins a room with no history.
+    let worker_at = w.relay.borrow().conns.iter().position(|c| c.service && c.connected).unwrap();
+    let ed_at = w.eds[0].at;
+    w.relay.borrow_mut().leave(worker_at);
+    w.relay.borrow_mut().leave(ed_at);
+    w.tick(100).await;
+    lose_history(&w.relay);
+    w.relay.borrow_mut().rejoin(worker_at);
+    w.relay.borrow_mut().rejoin(ed_at);
+    w.tick(100).await;
+    w.tick(100).await;
+    assert_eq!(snapshots(&w), 1, "checkpointed at once, with no edit and no quiet period");
+    assert!(w.worker.saving_stopped().is_none());
+}
+
+#[tokio::test]
+async fn a_fresh_worker_in_a_room_that_lost_its_history_stops_when_no_snapshot_comes() {
+    let (nc, base) = nextcloud(file(&["One"])).await;
+    let relay: Shared = Rc::default();
+    relay.borrow_mut().seq = 7;
+    lose_history(&relay);
+    let clock = Arc::new(TestClock(AtomicU64::new(0)));
+    let worker = Room::open(Relay::connect(&relay, SERVICE_UID), room_files(&base), clock.clone()).await.unwrap();
+    let mut w = World { relay, nc, clock, worker, eds: Vec::new(), base };
+    w.run_for(10_000, 1_000).await;
+    assert!(w.worker.saving_stopped().is_none(), "it waits for the snapshot first");
+    assert_eq!(w.count("put"), 0);
+    w.run_for(15_000, 1_000).await;
+    let stopped = w.worker.saving_stopped().map(str::to_owned).unwrap_or_default();
+    assert!(stopped.contains("lost its history"), "{stopped:?}");
+    assert_eq!(w.count("put"), 0, "its own copy of the file is never written as the room's");
 }

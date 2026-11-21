@@ -23,7 +23,8 @@ struct Conn {
     may_edit: bool,
     service: bool,
     connected: bool,
-    /// Refuse this peer's edits, as a relay that could not order them.
+    /// Refuse this peer's edits for good, as a relay that will not carry them (a refusal that
+    /// may pass is sent again by `Live`, so only a final one breaks the replica).
     refuse_edits: bool,
     /// The hub fails to send, as a transport that lost the message.
     fail_sends: bool,
@@ -47,6 +48,8 @@ struct Relay {
     rng: Option<Rng>,
     /// Deliver one message per poll.
     one_per_poll: bool,
+    /// The relay restarted and lost the room's history: joins say so and replay nothing.
+    lost_history: bool,
 }
 
 type Shared = Rc<RefCell<Relay>>;
@@ -61,6 +64,7 @@ fn relay(rng: Option<u64>) -> Shared {
         ephemeral: Vec::new(),
         rng: rng.map(Rng),
         one_per_poll: false,
+        lost_history: false,
     }))
 }
 
@@ -126,7 +130,8 @@ impl Relay {
     fn join(&mut self, at: usize) {
         let space = self.next_space;
         self.next_space += 1;
-        let replay: Vec<ServerMsg> = self.log.iter().filter(|m| op_seq(m) > self.saved).cloned().collect();
+        let replay: Vec<ServerMsg> =
+            if self.lost_history { Vec::new() } else { self.log.iter().filter(|m| op_seq(m) > self.saved).cloned().collect() };
         let until = replay.last().map_or(self.saved, op_seq);
         let joined = ServerMsg::Joined {
             doc: ROOM.into(),
@@ -139,6 +144,7 @@ impl Relay {
             fallback: false,
             text_cap: None,
             heartbeat: false,
+            history_lost: self.lost_history,
         };
         let pid = self.conns[at].pid.clone();
         let others: Vec<ServerMsg> = self
@@ -184,7 +190,7 @@ impl Relay {
                 } else if is_snap(&params) && !self.conns[at].service {
                     Some("only the document service may checkpoint; ask the saver")
                 } else if self.conns[at].refuse_edits {
-                    Some("the relay could not order that edit")
+                    Some("that edit is 99 bytes, more than this relay will carry")
                 } else {
                     None
                 };
@@ -1016,4 +1022,80 @@ fn the_host_can_end_the_link() {
     assert_eq!(a.le.status(), &LiveStatus::Broken("The live session was restarted. Reopen the file.".into()));
     settle(&relay, &mut [&mut a]);
     assert!(matches!(a.le.status(), LiveStatus::Broken(_)), "for good");
+}
+
+/// The relay restarts and loses the room's history: nothing to replay, joins say so.
+fn lose_history(relay: &Shared) {
+    let mut r = relay.borrow_mut();
+    r.lost_history = true;
+    r.log.clear();
+    r.ephemeral.clear();
+    // The relay keeps the room's sequence: joins start at it, with nothing before it to replay.
+    r.saved = r.seq;
+}
+
+#[test]
+fn a_fresh_window_waits_for_the_snapshot_after_the_room_lost_its_history() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut saver = Ed::open(&relay, SERVICE_UID, Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut saver]);
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": " world"})));
+    settle(&relay, &mut [&mut a, &mut saver]);
+    lose_history(&relay);
+    // A window opened now seeds from a file that may not be the room's document.
+    let mut c = Ed::open(&relay, "carol", Access::Edit, &bytes);
+    let now = std::sync::Arc::new(std::sync::Mutex::new(0.0_f64));
+    let clock = now.clone();
+    c.le.set_clock(Box::new(move || *clock.lock().unwrap()));
+    settle(&relay, &mut [&mut a, &mut saver, &mut c]);
+    assert_eq!(c.le.status(), &LiveStatus::Connecting, "it waits");
+    assert!(!c.le.editable());
+    // The service, holding the document, checkpoints it: the waiting window restarts on it.
+    save(&mut [&mut a, &mut saver, &mut c], 1, "etag-2");
+    settle(&relay, &mut [&mut a, &mut saver, &mut c]);
+    assert!(c.le.editable(), "{:?}", c.le.status());
+    assert_eq!(texts(&c.s.doc), ["Hello world"], "the room's document, not its own file");
+}
+
+#[test]
+fn a_fresh_window_with_no_snapshot_coming_ends() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a]);
+    lose_history(&relay);
+    let mut c = Ed::open(&relay, "carol", Access::Edit, &bytes);
+    let now = std::sync::Arc::new(std::sync::Mutex::new(0.0_f64));
+    let clock = now.clone();
+    c.le.set_clock(Box::new(move || *clock.lock().unwrap()));
+    settle(&relay, &mut [&mut a, &mut c]);
+    *now.lock().unwrap() = 10_000.0;
+    c.pump();
+    assert_eq!(c.le.status(), &LiveStatus::Connecting, "still waiting");
+    *now.lock().unwrap() = 21_000.0;
+    c.pump();
+    let LiveStatus::Broken(why) = c.le.status().clone() else { panic!("ended: {:?}", c.le.status()) };
+    assert!(why.contains("lost its history") && why.contains("Download a copy"), "{why}");
+}
+
+#[test]
+fn a_settled_window_goes_on_after_the_room_lost_its_history() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a]);
+    // Settled on the room's history: an edit of its own was ordered and came back.
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": "!"})));
+    settle(&relay, &mut [&mut a]);
+    relay.borrow_mut().drop_link(0);
+    a.pump();
+    lose_history(&relay);
+    relay.borrow_mut().restore_link(0);
+    settle(&relay, &mut [&mut a]);
+    assert!(a.le.take_history_lost(), "told the room lost its history");
+    assert!(a.le.editable(), "holding a settled document, it does not wait: {:?}", a.le.status());
 }

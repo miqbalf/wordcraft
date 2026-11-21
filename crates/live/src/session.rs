@@ -42,7 +42,9 @@
 //! - [`LiveStatus::Refused`] when the relay grants no client space, so nothing can be shared.
 //! - [`LiveStatus::Broken`] when the replica can no longer be trusted: the relay refused an
 //!   edit this replica already holds, an update this replica holds could not be sent, the
-//!   catch-up could not be rebuilt (`Work::TextIncomplete`), the relay could no longer catch
+//!   catch-up could not be rebuilt (`Work::TextIncomplete`), the room lost its history and no
+//!   snapshot came within 20 s to a replica that held nothing (it stays
+//!   [`LiveStatus::Connecting`] meanwhile), the relay could no longer catch
 //!   this link up (it fell too far behind), a checkpoint did not restore, or yrs failed on an
 //!   update. The document service ends it too: an `ended` message (`{reason}`) when it stops
 //!   saving or leaves, and a `saved` marker marked `closed` (kept by the relay for an editor
@@ -120,6 +122,13 @@ const CATCH_UP_FAILED: &str = "Catching up with the other editors is taking too 
 const CATCH_UP_LATE_MS: f64 = 10_000.0;
 /// The same without a clock, in frames.
 const CATCH_UP_LATE_FRAMES: u32 = 600;
+/// The room lost its history (the relay restarted with nothing to replay) and this window holds
+/// no state of its own from before: nothing can be trusted until the service's snapshot.
+const HISTORY_LOST: &str = "The live session lost its history. Download a copy, then reopen the file.";
+/// How long a replica that joined a room which lost its history waits for the snapshot.
+const HISTORY_WAIT_MS: f64 = 20_000.0;
+/// The same without a clock, in frames.
+const HISTORY_WAIT_FRAMES: u32 = 1200;
 const AFTER_UNDO: &str = "An edit made right after Undo was not kept. Please make it again.";
 /// The service closed the room: nothing saves edits made in it any more.
 const CLOSED: &str = "The live session ended. Reopen the file to keep editing.";
@@ -398,6 +407,10 @@ pub struct LiveEditing<H: Hub> {
     cursor: CursorOut,
     clock: Option<Clock>,
     catch_up: Option<CatchUp>,
+    /// A join that lost the room's history ([`Work::HistoryLost`]), not yet taken by the saver.
+    history_lost: bool,
+    /// Since when a replica with nothing settled has waited for the room's snapshot.
+    snapshot_wait: Option<CatchUp>,
 }
 
 impl<H: Hub> LiveEditing<H> {
@@ -447,6 +460,8 @@ impl<H: Hub> LiveEditing<H> {
             cursor: CursorOut::default(),
             clock: default_clock(),
             catch_up: None,
+            history_lost: false,
+            snapshot_wait: None,
         })
     }
 
@@ -555,6 +570,13 @@ impl<H: Hub> LiveEditing<H> {
     /// Lines for the user since the last call, in plain English (untranslated).
     pub fn take_notices(&mut self) -> Vec<String> {
         std::mem::take(&mut self.notices)
+    }
+
+    /// Whether a join since the last call found the room had lost its history (the relay
+    /// restarted with nothing to replay). The saver, holding a settled document, checkpoints
+    /// it at once, so the room and every editor that waits for it have a snapshot again.
+    pub fn take_history_lost(&mut self) -> bool {
+        std::mem::take(&mut self.history_lost)
     }
 
     /// Checkpoint outcomes since the last call, for the saver.
@@ -666,6 +688,13 @@ impl<H: Hub> LiveEditing<H> {
             Work::SeedWanted { .. } => log::debug!("live: the shared document was seeded at the start"),
             Work::Command { command, .. } => log::warn!("live: ignoring the locked command {command} from another editor"),
             Work::Frame { .. } => {}
+            // The relay lost the room's history. A replica that held a settled state goes on
+            // (the saver checkpoints it at once, see `take_history_lost`); one that held nothing
+            // waits for the snapshot (`Live::awaiting_snapshot`), see `update_status`.
+            Work::HistoryLost => {
+                log::warn!("live: the room lost its history");
+                self.history_lost = true;
+            }
             // The relay refused the ticket or the protocol and closed the link, and the hub has
             // stopped reconnecting until the host gives it a new ticket (`Hub::set_token`
             // through `live().hub_mut()`). Refused until a later join is granted a space.
@@ -954,7 +983,9 @@ impl<H: Hub> LiveEditing<H> {
         }
         let counting = catching_up && !self.need_join && self.broken.is_none() && self.refused.is_none();
         self.wait_for_catch_up(counting);
-        if self.broken.is_none() && !self.need_join && self.space != 0 && !self.live.ready_to_type() {
+        let awaiting = self.live.awaiting_snapshot();
+        self.wait_for_snapshot(awaiting && self.broken.is_none());
+        if self.broken.is_none() && !self.need_join && self.space != 0 && !awaiting && !self.live.ready_to_type() {
             // Joined with a space, yet the replica takes no edits: Live gave up on it.
             self.broken = Some(BROKEN.to_owned());
         }
@@ -964,7 +995,7 @@ impl<H: Hub> LiveEditing<H> {
             LiveStatus::Refused(m.clone())
         } else if self.access == Access::Read {
             LiveStatus::ReadOnly
-        } else if connected && !self.need_join && self.space != 0 && !catching_up {
+        } else if connected && !self.need_join && self.space != 0 && !catching_up && !awaiting {
             self.been_live = true;
             LiveStatus::Live { saved_at: self.saved.as_ref().map(|(_, e)| e.clone()) }
         } else if self.been_live {
@@ -994,6 +1025,26 @@ impl<H: Hub> LiveEditing<H> {
             self.break_with(CATCH_UP_FAILED);
         } else if periods >= 1.0 && !std::mem::replace(&mut since.told, true) {
             self.notices.push(CATCHING_UP.to_owned());
+        }
+    }
+
+    /// Count how long a replica that holds nothing has waited for the room's snapshot after the
+    /// room lost its history, and give up (download a copy, reopen) after [`HISTORY_WAIT_MS`].
+    fn wait_for_snapshot(&mut self, waiting: bool) {
+        if !waiting {
+            self.snapshot_wait = None;
+            return;
+        }
+        let now = self.clock.as_mut().map(|c| c());
+        let wait = self.snapshot_wait.get_or_insert(CatchUp { since: now, frames: 0, told: false });
+        wait.frames = wait.frames.saturating_add(1);
+        let over = match (now, wait.since) {
+            (Some(now), Some(t)) => now - t >= HISTORY_WAIT_MS,
+            _ => wait.frames >= HISTORY_WAIT_FRAMES,
+        };
+        if over {
+            self.snapshot_wait = None;
+            self.break_with(HISTORY_LOST);
         }
     }
 

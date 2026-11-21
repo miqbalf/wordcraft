@@ -169,6 +169,7 @@ impl Relay {
             fallback: false,
             text_cap: None,
             heartbeat: false,
+            history_lost: false,
         };
         let replay = self.log.clone();
         let others: Vec<ServerMsg> = self
