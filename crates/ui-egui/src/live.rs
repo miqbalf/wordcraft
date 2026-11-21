@@ -39,6 +39,8 @@ pub const ENDED_UNSAVED: &str = "Live editing ended. Download a copy to keep you
 pub const ENDED_UNSAVED_BECAUSE: &str = "Live editing ended. Download a copy to keep your changes, then reopen the file. {reason}";
 /// Save and Save As while live: the document service writes the file for everyone.
 pub const SAVED_FOR_YOU: &str = "While the file is edited live, it is saved for everyone automatically.";
+/// The status line after Save As downloaded a copy of a document whose live session ended.
+pub const COPY_DOWNLOADED: &str = "A copy was downloaded. Check it, then reopen the file.";
 /// How often the host hears the state when nothing changed, in milliseconds.
 const REPORT_MS: f64 = 1000.0;
 /// How often a live window draws a frame to take in the relay's messages, in milliseconds.
@@ -218,6 +220,35 @@ impl WordApp {
         }
     }
 
+    /// Save As once the link no longer saves (broken, refused or read-only): a copy downloads
+    /// in the browser, named `<stem> (my copy <date> <time>).<ext>`, whatever page frames the app,
+    /// because the host page may not keep a save. The browser can't say whether the user kept
+    /// it, so the document stays unsaved and the leave guard stays on. `None` for anything else.
+    pub(crate) fn live_copy(&mut self, id: &str) -> Option<Result<Value, String>> {
+        if id != "file.saveAs" || self.live_link().is_none() || self.live_saves() {
+            return None;
+        }
+        let file =
+            self.session.path.as_ref().and_then(|p| p.file_name()).map_or_else(|| "Document.docx".to_owned(), |n| n.to_string_lossy().into_owned());
+        let name = copy_name(&file, &crate::local_time::file_stamp(unix_secs()));
+        let delivered = wordcraft_engine::io::save_bytes(&name, &self.session.doc).and_then(|bytes| {
+            let download = self.services.download_copy.as_ref().ok_or_else(|| "this window can't download files".to_owned())?;
+            download(&name, &bytes).map(|()| bytes.len())
+        });
+        Some(match delivered {
+            Ok(bytes) => {
+                self.status_long(tl!(COPY_DOWNLOADED));
+                Ok(serde_json::json!({"downloaded": name, "bytes": bytes, "copy": true}))
+            }
+            Err(error) => {
+                let msg = i18n::fmt(tl!("Couldn't download {name}: {error}"), &[("name", &name), ("error", &error)]);
+                log::error!("download of the live copy {name} failed: {error}");
+                self.status_long(msg.clone());
+                Err(msg)
+            }
+        })
+    }
+
     /// The clock, in milliseconds, that holds the host's reports to one a second (tests).
     pub fn live_set_clock(&mut self, clock: Box<dyn Fn() -> f64>) {
         if let Some(LiveMode::Linked(link)) = &mut self.live {
@@ -390,6 +421,16 @@ impl WordApp {
     }
 }
 
+/// A live copy's file name: `plan.docx` at `2026-11-21 0930` is
+/// `plan (my copy 2026-11-21 0930).docx`; a name without an extension gets `.docx`.
+fn copy_name(file: &str, stamp: &str) -> String {
+    let (stem, ext) = match file.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => (stem, ext),
+        _ => (file, "docx"),
+    };
+    format!("{stem} (my copy {stamp}).{ext}")
+}
+
 /// Save and Save As, which write this window's copy over the file.
 fn saves_the_file(id: &str) -> bool {
     matches!(id, "file.save" | "file.saveAs")
@@ -455,6 +496,13 @@ pub(crate) fn paint_carets(app: &mut WordApp, ui: &mut Ui, painter: &egui::Paint
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_live_copy_is_named_after_the_file_and_the_time() {
+        assert_eq!(copy_name("plan.docx", "2026-11-21 0930"), "plan (my copy 2026-11-21 0930).docx");
+        assert_eq!(copy_name("notes.v2.odt", "2026-11-21 0930"), "notes.v2 (my copy 2026-11-21 0930).odt");
+        assert_eq!(copy_name("plan", "2026-11-21 0930"), "plan (my copy 2026-11-21 0930).docx");
+    }
 
     #[test]
     fn caret_offsets_are_chars_both_ways() {

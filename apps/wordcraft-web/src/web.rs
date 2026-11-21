@@ -302,6 +302,11 @@ fn services(inbox: Inbox, ctx: egui::Context, dirty: Rc<Cell<bool>>, saves: Asyn
         pick_save: Some(Box::new(|name: &str| Some(name.to_string()))),
         async_saves: Some(saves.clone()),
         download: Some(Box::new(move |path: &str, bytes: &[u8]| download(&saves, &save_ctx, path, bytes))),
+        // A live copy always downloads here, framed or not (`live` in wordcraft-ui-egui).
+        download_copy: Some(Box::new(|name: &str, bytes: &[u8]| {
+            let window = web_sys::window().ok_or("no window")?;
+            trigger_anchor_download(&window, name, bytes)
+        })),
         print: Some(Box::new(print_pdf)),
         inbox: Some(inbox),
         on_dirty: Some(Box::new(move |d| dirty.set(d))),

@@ -12,7 +12,7 @@ use wordcraft_doc::Document;
 use wordcraft_engine::Session;
 use wordcraft_live::LiveEditing;
 use wordcraft_live::testing::{MemHub, MemRelay, ROOM};
-use wordcraft_ui_egui::live::{Access, ENDED, ENDED_UNSAVED, LiveReport, LiveStatus, NEWER, SAVED_FOR_YOU};
+use wordcraft_ui_egui::live::{Access, COPY_DOWNLOADED, ENDED, ENDED_UNSAVED, LiveReport, LiveStatus, NEWER, SAVED_FOR_YOU};
 use wordcraft_ui_egui::{Services, WordApp};
 
 fn file() -> Vec<u8> {
@@ -409,4 +409,50 @@ fn a_newer_room_refuses_every_edit() {
     assert!(has_label(&h, NEWER), "the status line says to update");
     assert!(h.state_mut().run("text.insert", json!({"text": "Z"})).is_err());
     assert!(!wordcraft_ui_egui::widgets::enabled(h.state(), "format.bold"), "edits are greyed out");
+}
+
+#[test]
+fn save_as_after_the_link_broke_downloads_a_copy_and_stays_unsaved() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (mut services, _, guard) = recorded();
+    let copies = Rc::new(RefCell::new(Vec::<(String, usize)>::new()));
+    let hosted = Rc::new(Cell::new(0));
+    let downloads = Rc::new(Cell::new(0));
+    let (c, hs, d) = (Rc::clone(&copies), Rc::clone(&hosted), Rc::clone(&downloads));
+    services.download_copy = Some(Box::new(move |name: &str, bytes: &[u8]| {
+        c.borrow_mut().push((name.to_owned(), bytes.len()));
+        Ok(())
+    }));
+    // A framing page (`?host=parent`) that would get `wordcraft:save`, and the app's own save
+    // download: neither may be used for the copy.
+    services.host_save = Some(Box::new(move |_: &str, _: &[u8], _: bool| {
+        hs.set(hs.get() + 1);
+        Ok(())
+    }));
+    services.download = Some(Box::new(move |_: &str, _: &[u8]| {
+        d.set(d.get() + 1);
+        Ok(())
+    }));
+    // An edit ticket the relay treats as read-only: the first edit breaks the link.
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, false, services);
+    settle(&relay, &mut h, &mut bob);
+    type_text(&mut h, "X");
+    settle(&relay, &mut h, &mut bob);
+    assert!(matches!(status(&h), LiveStatus::Broken(_)));
+    assert!(h.state().session.dirty, "the edit is in no save");
+    let r = h.state_mut().run("file.saveAs", json!({}));
+    assert!(r.is_ok(), "{r:?}");
+    let copies = copies.borrow().clone();
+    assert_eq!(copies.len(), 1, "one copy downloaded");
+    let (name, bytes) = &copies[0];
+    assert!(name.starts_with("plan (my copy ") && name.ends_with(").docx"), "{name}");
+    assert!(*bytes > 0);
+    assert_eq!((hosted.get(), downloads.get()), (0, 0), "no wordcraft:save to the page, no save download");
+    assert_eq!(h.state().status_msg.as_ref().map(|(m, _)| m.as_str()), Some(COPY_DOWNLOADED));
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(h.state().session.dirty, "a download can't be confirmed: still unsaved");
+    assert_eq!(guard.borrow().last(), Some(&true), "and the leave guard stays on");
 }

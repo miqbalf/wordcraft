@@ -124,6 +124,10 @@ impl WordApp {
         if let Some(r) = self.live_gate(id, &params) {
             return r;
         }
+        // A live session that ended: Save As downloads a copy itself, and the edits stay unsaved.
+        if let Some(r) = self.live_copy(id) {
+            return r;
+        }
         if id == "file.close" {
             return self.close_document(&params);
         }

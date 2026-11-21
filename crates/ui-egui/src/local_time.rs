@@ -35,6 +35,14 @@ pub(crate) fn clock_time(secs: i64) -> String {
     format!("{:02}:{:02}", local / 3600, local / 60 % 60)
 }
 
+/// The local date and time at Unix time `secs`, `YYYY-MM-DD HHMM` (in a live copy's name).
+pub(crate) fn file_stamp(secs: i64) -> String {
+    let local = secs.saturating_add(i64::from(offset_minutes(secs)) * 60);
+    let (y, m, d) = wordcraft_engine::cmd::civil_from_days(local.div_euclid(86_400));
+    let t = local.rem_euclid(86_400);
+    format!("{y:04}-{m:02}-{d:02} {:02}{:02}", t / 3600, t / 60 % 60)
+}
+
 fn stamp(date: &str, date_utc: Option<&str>, offset: impl Fn(i64) -> i32) -> String {
     let utc = date_utc.and_then(parse).filter(|t| t.timed).map(|t| Time { zone: Some(t.zone.unwrap_or(0)), ..t });
     let local_date = || parse(date).map(|t| if date.trim_end().ends_with(['Z', 'z']) { Time { zone: None, ..t } } else { t });
