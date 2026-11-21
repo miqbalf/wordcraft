@@ -315,7 +315,9 @@ async fn op_round_trip_p95() {
 /// (`CRAFT_TEST_LOAD_SECS` changes the length), every one into its own paragraph. Each client
 /// times every other client's keystrokes, from just before the typist's `run` until the
 /// keystroke is in its own document (remote apply). The spec target is a 95th percentile under
-/// 200 ms on the LAN. Printed, not asserted: AGENTS.md rule 28.
+/// 200 ms on the LAN, and the phase 1 plan makes it the test's pass condition, so it is asserted
+/// (an exception to AGENTS.md rule 28: this is an acceptance check run by hand, not CI). All
+/// five clients pump on one thread, so a sample also holds up to one lap of that loop (printed).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs relay"]
 async fn five_clients_typing_remote_apply_p95() {
@@ -395,4 +397,5 @@ async fn five_clients_typing_remote_apply_p95() {
         ms[ms.len() - 1],
         slowest_loop.as_secs_f64() * 1000.0
     );
+    assert!(at(0.95) < 200.0, "p95 remote apply {:.1} ms is over the 200 ms target", at(0.95));
 }
