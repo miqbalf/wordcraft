@@ -2,7 +2,7 @@
 //! relay and its secret, `CRAFT_TEST_RELAY` (for example `http://localhost:9444`) and
 //! `CRAFT_TEST_SECRET`, and run with `--features native-hub -- --ignored relay`.
 //! `relay_restart_resumes` also needs `CRAFT_TEST_RESTART_CMD`, a shell command that restarts
-//! that relay (for example `docker restart t9-relay`). `five_clients_typing_remote_apply_p95`
+//! that relay (for example `docker restart it-relay`). `five_clients_typing_remote_apply_p95`
 //! is the phase 1 load check; point `CRAFT_TEST_RELAY` at the deployed relay as clients reach it
 //! (for the dev stack, `http://<lan address>:8035/craft`, through Apache).
 
@@ -42,7 +42,7 @@ fn ticket(secret: &str, room: &str, uid: &str, pid: &str) -> String {
 
 /// A room no earlier run has used, so the relay starts the document from the file.
 fn fresh_room() -> String {
-    format!("t9-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+    format!("it-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
 }
 
 struct Client {
@@ -54,7 +54,7 @@ struct Client {
 impl Client {
     async fn join(relay: &str, secret: &str, room: &str, uid: &str, file: &[u8]) -> Client {
         let token = ticket(secret, room, uid, &format!("{uid}-{}", now()));
-        let hub = NativeHub::connect(relay, &token, None).await.unwrap();
+        let hub = NativeHub::connect(relay, &token, None).await.expect("connect");
         let mut s = Session::new(Document::new());
         let le = LiveEditing::start(hub, &format!("doc:{room}"), file, "plan.docx", &mut s).unwrap();
         Client { name: uid.to_owned(), s, le }
@@ -154,6 +154,12 @@ fn setup() -> (String, String, String, Vec<u8>) {
 
 /// One random edit by a client, in a random paragraph.
 fn type_somewhere(c: &mut Client, rng: &mut Rng) {
+    edit_somewhere(c, rng, true);
+}
+
+/// [`type_somewhere`], deleting nothing unless `deletes`: then everything in the document
+/// before stays in it, in order.
+fn edit_somewhere(c: &mut Client, rng: &mut Rng, deletes: bool) {
     const WORDS: [&str; 5] = ["a", "b ", "cd", "é", "xyz "];
     let paras = c.s.doc.body.len();
     let i = rng.below(paras);
@@ -166,7 +172,7 @@ fn type_somewhere(c: &mut Client, rng: &mut Rng) {
     }
     c.caret(i, at);
     match rng.below(6) {
-        0 => {
+        0 if deletes => {
             c.run("text.delete", json!({}));
         }
         1 => {
@@ -235,15 +241,23 @@ async fn relay_restart_resumes() {
         pump_all(&mut cs);
     }
     converge(&mut cs, "before the restart").await;
+    // A mark from each client, typed and shared before the restart: the restart must keep it.
+    for (k, c) in cs.iter_mut().enumerate() {
+        c.end_of(0);
+        assert!(c.run("text.insert", json!({"text": format!("<pre{k}>")})), "client {k} types before the restart");
+    }
+    converge(&mut cs, "with the marks typed before the restart").await;
+    let before: String = texts(&cs[0].s.doc).concat();
 
-    // Restart the relay while clients keep editing; edits made while not live are refused.
+    // Restart the relay while clients keep editing (adding only, so what was there before must
+    // all still be there after); edits made while not live are refused.
     let child = std::thread::spawn(move || std::process::Command::new("sh").arg("-c").arg(restart).output());
     let mut typed = 0;
     let mut held_back = 0;
     while !child.is_finished() {
         for c in cs.iter_mut() {
             let live = c.live();
-            type_somewhere(c, &mut rng);
+            edit_somewhere(c, &mut rng, false);
             if live { typed += 1 } else { held_back += 1 }
         }
         pump_all(&mut cs);
@@ -259,6 +273,9 @@ async fn relay_restart_resumes() {
     }
     until(&mut cs, 60, "every client Live again", all_live).await;
     converge(&mut cs, "after the restart").await;
+    let after: String = texts(&cs[0].s.doc).concat();
+    let mut rest = after.chars();
+    assert!(before.chars().all(|ch| rest.any(|a| a == ch)), "everything typed before the restart survives it:\n{before}\n{after}");
 
     // Editing carries on, in both directions.
     for (k, c) in cs.iter_mut().enumerate() {
