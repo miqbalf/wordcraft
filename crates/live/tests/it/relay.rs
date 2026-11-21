@@ -2,7 +2,9 @@
 //! relay and its secret, `CRAFT_TEST_RELAY` (for example `http://localhost:9444`) and
 //! `CRAFT_TEST_SECRET`, and run with `--features native-hub -- --ignored relay`.
 //! `relay_restart_resumes` also needs `CRAFT_TEST_RESTART_CMD`, a shell command that restarts
-//! that relay (for example `docker restart t9-relay`).
+//! that relay (for example `docker restart t9-relay`). `five_clients_typing_remote_apply_p95`
+//! is the phase 1 load check; point `CRAFT_TEST_RELAY` at the deployed relay as clients reach it
+//! (for the dev stack, `http://<lan address>:8035/craft`, through Apache).
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -306,5 +308,91 @@ async fn op_round_trip_p95() {
         at(0.95),
         at(0.99),
         ms[ms.len() - 1]
+    );
+}
+
+/// The phase 1 load check: five native clients each typing 8 characters a second for 60 s
+/// (`CRAFT_TEST_LOAD_SECS` changes the length), every one into its own paragraph. Each client
+/// times every other client's keystrokes, from just before the typist's `run` until the
+/// keystroke is in its own document (remote apply). The spec target is a 95th percentile under
+/// 200 ms on the LAN. Printed, not asserted: AGENTS.md rule 28.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs relay"]
+async fn five_clients_typing_remote_apply_p95() {
+    const N: usize = 5;
+    const PERIOD: Duration = Duration::from_millis(125);
+    let secs: u64 = std::env::var("CRAFT_TEST_LOAD_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+    let (relay, secret, room) = (env("CRAFT_TEST_RELAY"), env("CRAFT_TEST_SECRET"), fresh_room());
+    let file = save_bytes("plan.docx", &plain(&[""; N])).unwrap();
+    let mut cs = Vec::new();
+    for k in 0..N {
+        cs.push(Client::join(&relay, &secret, &room, &format!("typist{k}"), &file).await);
+    }
+    until(&mut cs, 30, "every client Live", all_live).await;
+
+    let keystrokes = usize::try_from(secs * 8).unwrap();
+    let para_len = |c: &Client, k: usize| c.s.doc.body[k].as_para().unwrap().text.len();
+    // sent[k][i]: when typist k started its keystroke i (its paragraph then holds i + 1 chars).
+    let mut sent: Vec<Vec<Instant>> = (0..N).map(|_| Vec::with_capacity(keystrokes)).collect();
+    // seen[j][k]: how many of typist k's keystrokes client j has been timed on.
+    let mut seen = [[0usize; N]; N];
+    let mut ms = Vec::with_capacity(N * (N - 1) * keystrokes);
+    let mut not_live_runs = 0usize;
+    let mut slowest_loop = Duration::ZERO;
+    let start = Instant::now() + Duration::from_millis(200);
+    let give_up = start + Duration::from_secs(secs + 30);
+    loop {
+        let lap = Instant::now();
+        for k in 0..N {
+            // Typists spread over the period, so not all five type in the same instant.
+            let due = start + PERIOD * u32::try_from(sent[k].len()).unwrap() + Duration::from_millis(25 * k as u64);
+            if sent[k].len() < keystrokes && Instant::now() >= due {
+                if !cs[k].live() {
+                    not_live_runs += 1;
+                }
+                cs[k].end_of(k);
+                let t = Instant::now();
+                assert!(cs[k].run("text.insert", json!({"text": "x"})), "typist {k}, keystroke {}: the edit ran:\n{}", sent[k].len(), state(&cs));
+                sent[k].push(t);
+            }
+        }
+        pump_all(&mut cs);
+        let now = Instant::now();
+        for j in 0..N {
+            for k in (0..N).filter(|&k| k != j) {
+                let have = para_len(&cs[j], k).min(sent[k].len());
+                while seen[j][k] < have {
+                    ms.push((now - sent[k][seen[j][k]]).as_secs_f64() * 1000.0);
+                    seen[j][k] += 1;
+                }
+            }
+        }
+        slowest_loop = slowest_loop.max(lap.elapsed());
+        let typed = sent.iter().all(|s| s.len() == keystrokes);
+        if typed && (0..N).all(|j| (0..N).all(|k| j == k || seen[j][k] == keystrokes)) {
+            break;
+        }
+        assert!(Instant::now() < give_up, "not every keystroke arrived:\n{}", state(&cs));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let typing = sent.iter().map(|s| s[s.len() - 1] - s[0]).max().unwrap();
+    converge(&mut cs, "after the load").await;
+    for (k, c) in cs.iter().enumerate() {
+        assert!(c.le.editable(), "typist {k} is still editable");
+        assert_eq!(texts(&c.s.doc), vec!["x".repeat(keystrokes); N], "typist {k} holds every keystroke once");
+    }
+
+    ms.sort_by(f64::total_cmp);
+    let at = |p: f64| ms[((ms.len() as f64 * p).ceil() as usize).saturating_sub(1).min(ms.len() - 1)];
+    eprintln!(
+        "load: {N} clients x {keystrokes} keystrokes over {:.1} s via {relay}; {} remote applies: min {:.1} ms, p50 {:.1} ms, p95 {:.1} ms, p99 {:.1} ms, max {:.1} ms; runs while not live {not_live_runs}; slowest pump lap {:.1} ms",
+        typing.as_secs_f64(),
+        ms.len(),
+        ms[0],
+        at(0.5),
+        at(0.95),
+        at(0.99),
+        ms[ms.len() - 1],
+        slowest_loop.as_secs_f64() * 1000.0
     );
 }
