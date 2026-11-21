@@ -240,7 +240,10 @@ impl WordApp {
                 self.status(msg.clone());
                 return Err(msg);
             }
-            if marked_saved {
+            // A host that answers each save marks the document saved when it does, not before.
+            let ticket = saves.as_ref().and_then(async_saves::AsyncSaves::take_started);
+            let host = ticket.is_some() && self.services.host_confirms_saves;
+            if marked_saved && !host {
                 self.session.dirty = false;
                 // The host page keeps the file under this name now, as a desktop save would.
                 if self.services.host_save.is_some() {
@@ -249,9 +252,17 @@ impl WordApp {
             }
             // The browser's picker writes the file later (#1315): until it says how that went,
             // the document's save isn't confirmed.
-            if let Some(ticket) = saves.as_ref().and_then(async_saves::AsyncSaves::take_started) {
+            if let Some(ticket) = ticket {
                 let document = self.session.document_id();
-                self.saves_in_flight.push(SaveInFlight { ticket, name: name.clone(), document, marked_saved });
+                let saves_revision = (host && marked_saved).then(|| self.session.rev());
+                self.saves_in_flight.push(SaveInFlight {
+                    ticket,
+                    name: name.clone(),
+                    document,
+                    marked_saved: marked_saved && !host,
+                    host,
+                    saves_revision,
+                });
                 return Ok(json!({"downloaded": name, "bytes": bytes.len(), "pendingSave": ticket}));
             }
             if copies {
@@ -345,7 +356,7 @@ impl WordApp {
     }
 
     /// Web: store a font added from bytes, or forget the removed ones ([`Services::store_font`]).
-    fn keep_web_font(&self, id: &str, params: &Value, result: &Value) {
+    pub(crate) fn keep_web_font(&self, id: &str, params: &Value, result: &Value) {
         match id {
             "font.add" => {
                 if let (Some(store), Some(file), Some(data)) =

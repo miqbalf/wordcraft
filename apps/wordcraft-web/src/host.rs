@@ -29,9 +29,17 @@
 //! In both host modes the host sends the document to edit, so no sample opens, and `?author=`
 //! names the user for comments and tracked changes. With `data-host="page"` saves are handed to
 //! the host rather than downloaded, and the host guards leaving the page. A framing page
-//! (`?host=parent`) stores no saves: Save, Save As and Export download a copy in the browser and
-//! never mark the document saved, and the frame guards leaving the page itself (`beforeunload`),
-//! with unsaved changes as `wordcraft:dirty` also tells the page.
+//! (`?host=parent`) stores no saves unless its `wordcraft:host` says `saves: true`: without it,
+//! Save, Save As and Export download a copy in the browser and never mark the document saved, and
+//! the frame guards leaving the page itself (`beforeunload`), with unsaved changes as
+//! `wordcraft:dirty` also tells the page.
+//!
+//! With `saves: true` (and the document not live: a live session saves its own file) every save
+//! goes out as `wordcraft:save` with an `id`. The document is marked saved only on
+//! `wordcraft:saved {id, name?}` (a `name` is the file's name from then on: a conflict copy or
+//! Save As), and on `wordcraft:save-failed {id, error}` it stays unsaved with "Couldn't save to
+//! Nextcloud: {error}". `wordcraft:fonts {fonts:[{name,url}]}` lists same-origin font files; each
+//! is fetched and installed like a font the user added, and the missing-font box checks again.
 //!
 //! # Live editing (`craft-live/1`, `?host=parent` only)
 //!
@@ -63,14 +71,16 @@
 //!
 //! Tickets are never logged.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::live_ticket::{Joining, Next};
 use craft_web_host::Mode;
+use craft_web_host::PendingSaves;
 use craft_web_host::live::{LiveError, LiveMessage, LiveState, Peer as HostPeer};
-use craft_web_host::web::{FileData, Host, Message};
+use craft_web_host::web::{FileData, Host, Message, fetch_font};
 use wasm_bindgen::JsCast as _;
+use wordcraft_ui_egui::async_saves::{AsyncSaves, SaveOutcome};
 use wordcraft_ui_egui::live::LiveReport;
 use wordcraft_ui_egui::{Inbox, Services, WordApp};
 
@@ -86,9 +96,31 @@ const MAX_OPEN_BYTES: u64 = 512 << 20;
 /// The longest user name taken from `?author=`.
 const MAX_AUTHOR_CHARS: usize = 200;
 
+/// What the host's messages leave for the next frame.
+pub enum HostEvent {
+    /// The host stores saves ([`Bridge::apply_saves`]).
+    Saves,
+    /// Fonts are being fetched (true) or all arrived or failed (false).
+    FontsComing(bool),
+    /// A fetched font: its file name and bytes.
+    Font(String, Vec<u8>),
+}
+
+pub type HostEvents = Rc<RefCell<Vec<HostEvent>>>;
+
+/// The saves sent to a host that answers each, by the ticket the app waits on.
+#[derive(Default)]
+struct SentSaves {
+    ids: PendingSaves,
+    tickets: Vec<(String, u64)>,
+}
+
 #[derive(Clone)]
 pub struct Bridge {
     host: Rc<Host>,
+    /// The host said `saves: true`.
+    saves: Rc<Cell<bool>>,
+    sent: Rc<RefCell<SentSaves>>,
 }
 
 impl Bridge {
@@ -96,7 +128,7 @@ impl Bridge {
     /// `data-host="page"` on the canvas, an unframed `?host=parent` page (it stays the normal app
     /// with downloads), or a parent on another origin.
     pub fn detect(canvas: &web_sys::HtmlCanvasElement) -> Option<Self> {
-        Some(Self { host: Rc::new(Host::connect(APP, canvas)?) })
+        Some(Self { host: Rc::new(Host::connect(APP, canvas)?), saves: Rc::default(), sent: Rc::default() })
     }
 
     /// The host mode of this page.
@@ -108,8 +140,16 @@ impl Bridge {
     /// the window's own leave guard reads). A page (`data-host="page"`) gets saved and exported
     /// files instead of downloads; under a framing page (`?host=parent`), which stores none, they
     /// download in the browser as copies.
-    pub fn connect(&self, services: &mut Services, inbox: Inbox, ctx: egui::Context, dirty: Rc<std::cell::Cell<bool>>) {
-        self.listen(inbox, ctx);
+    pub fn connect(
+        &self,
+        services: &mut Services,
+        inbox: Inbox,
+        ctx: egui::Context,
+        dirty: Rc<std::cell::Cell<bool>>,
+        saves: AsyncSaves,
+        events: HostEvents,
+    ) {
+        self.listen(inbox, ctx, saves, events);
         if self.host.mode() == Mode::Parent {
             services.saves_are_copies = true;
             services.host_save = None;
@@ -137,6 +177,33 @@ impl Bridge {
             if let Err(e) = host.post_live_state(&live_state(report)) {
                 log::warn!("live-state not delivered: {e}");
             }
+        }));
+    }
+
+    /// The host said it stores saves: from now on Save, Save As and Export go to it with an id and
+    /// the document is marked saved only when it answers. Called each frame; does nothing before
+    /// the host's `host` message, in page mode (which stores saves already) or twice.
+    pub fn apply_saves(&self, services: &mut Services, saves: &AsyncSaves) {
+        if !self.saves.get() || self.host.mode() != Mode::Parent || services.host_confirms_saves {
+            return;
+        }
+        services.saves_are_copies = false;
+        services.host_confirms_saves = true;
+        services.async_saves = Some(saves.clone());
+        let (bridge, saves) = (self.clone(), saves.clone());
+        services.host_save = Some(Box::new(move |name: &str, bytes: &[u8], save_as: bool| {
+            let ticket = saves.start();
+            let id = bridge.sent.borrow_mut().ids.start();
+            bridge.sent.borrow_mut().tickets.push((id.clone(), ticket));
+            let name = std::path::Path::new(name).file_name().map_or_else(|| name.to_string(), |n| n.to_string_lossy().to_string());
+            let posted = bridge.host.post_save(&name, bytes, Some(&id), save_as);
+            if let Err(e) = &posted {
+                // No answer will come.
+                bridge.sent.borrow_mut().ids.cancel(&id);
+                bridge.sent.borrow_mut().tickets.retain(|(i, _)| *i != id);
+                saves.finish(ticket, SaveOutcome::Failed(e.clone()));
+            }
+            posted
         }));
     }
 
@@ -210,14 +277,74 @@ impl Bridge {
         self.host.post_save(&name, bytes, None, save_as)
     }
 
-    /// Hear `wordcraft:open` and queue the file like a dropped one.
-    fn listen(&self, inbox: Inbox, ctx: egui::Context) {
-        self.host.listen(move |message| {
-            if let Message::Open { name, data } = message {
-                deliver_open(&inbox, &ctx, &name, &data);
+    /// Hear the host's messages: `open` queues the file like a dropped one, `host` says whether it
+    /// stores saves, `saved` and `save-failed` answer a save, `fonts` lists fonts to fetch.
+    fn listen(&self, inbox: Inbox, ctx: egui::Context, saves: AsyncSaves, events: HostEvents) {
+        let bridge = self.clone();
+        self.host.listen(move |message| match message {
+            Message::Open { name, data } => deliver_open(&inbox, &ctx, &name, &data),
+            Message::Host { saves: stores, .. } => {
+                if stores {
+                    bridge.saves.set(true);
+                    events.borrow_mut().push(HostEvent::Saves);
+                    ctx.request_repaint();
+                }
             }
+            Message::Saved { id, name } => {
+                if let Some(ticket) = bridge.answered(&id) {
+                    saves.finish(ticket, name.map_or(SaveOutcome::Saved, SaveOutcome::SavedAs));
+                    ctx.request_repaint();
+                }
+            }
+            Message::SaveFailed { id, error } => {
+                if let Some(ticket) = bridge.answered(&id) {
+                    saves.finish(ticket, SaveOutcome::Failed(error));
+                    ctx.request_repaint();
+                }
+            }
+            Message::Fonts { fonts } => fetch_fonts(fonts, events.clone(), ctx.clone()),
+            Message::AttachPdf { .. } | Message::HandoffDone { .. } => {}
         });
     }
+
+    /// The ticket of the save `id` names, once: an unknown or repeated answer has none.
+    fn answered(&self, id: &str) -> Option<u64> {
+        let mut sent = self.sent.borrow_mut();
+        if !sent.ids.finish(id) {
+            return None;
+        }
+        let at = sent.tickets.iter().position(|(i, _)| i == id)?;
+        Some(sent.tickets.remove(at).1)
+    }
+}
+
+/// The file name a font is installed under: the last part of its URL (it has the extension), else
+/// the host's name for it.
+fn font_file_name(name: &str, url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let last = path.rsplit('/').next().unwrap_or_default();
+    let decoded = js_sys::decode_uri_component(last).ok().and_then(|s| s.as_string()).unwrap_or_else(|| last.to_string());
+    if wordcraft_fonts::is_font_file_name(&decoded.to_ascii_lowercase()) { decoded } else { name.to_string() }
+}
+
+/// Fetch each font a host offered (one at a time, same-origin only, size-capped by the bridge) and
+/// leave its bytes for the next frame; a failure is logged and skipped.
+fn fetch_fonts(fonts: Vec<craft_web_host::FontRef>, events: HostEvents, ctx: egui::Context) {
+    if fonts.is_empty() {
+        return;
+    }
+    events.borrow_mut().push(HostEvent::FontsComing(true));
+    wasm_bindgen_futures::spawn_local(async move {
+        for font in fonts {
+            match fetch_font(&font).await {
+                Ok(bytes) => events.borrow_mut().push(HostEvent::Font(font_file_name(&font.name, &font.url), bytes)),
+                Err(e) => log::warn!("host font {} not fetched: {e}", font.name),
+            }
+            ctx.request_repaint();
+        }
+        events.borrow_mut().push(HostEvent::FontsComing(false));
+        ctx.request_repaint();
+    });
 }
 
 /// The file an open message carries, pushed onto the inbox for the next frame, like a dropped

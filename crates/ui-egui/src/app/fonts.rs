@@ -1,6 +1,41 @@
-use super::{QUIT, WordApp, i18n, theme};
+use super::{QUIT, WordApp, i18n, json, theme};
 
 impl WordApp {
+    /// Web: a host page offered fonts; they are being fetched. Until `false` is passed (all
+    /// arrived or failed), the missing-fonts box doesn't come up by itself.
+    pub fn host_fonts_coming(&mut self, coming: bool) {
+        self.host_fonts_coming = coming;
+    }
+
+    /// Web: install a font file a host page offered (`file` is its file name, which must name a
+    /// font) like one the user added with Add Font: it joins the font database, is kept through
+    /// [`crate::Services::store_font`], and the document lays out with it. `Ok(false)`: it was
+    /// already available (nothing changed, nothing said). A box that is open for missing fonts is
+    /// checked again, so it drops the fonts that are now present and closes when none are left.
+    pub fn install_host_font(&mut self, file: &str, bytes: &[u8]) -> Result<bool, String> {
+        let params = json!({"name": file, "data": wordcraft_engine::cmd::insert::base64_encode(bytes)});
+        // The engine says "Added …" on the status line, which a quiet background install must not.
+        let status = self.session.status.clone();
+        let result = self.session.run("font.add", &params).map_err(|e| e.to_string());
+        self.session.status = status;
+        match result {
+            Ok(added) => {
+                self.keep_web_font("font.add", &params, &added);
+                self.refresh_font_box();
+                Ok(true)
+            }
+            Err(e) if e.contains("already available") => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The missing-fonts box, if open, lists what is still missing now.
+    fn refresh_font_box(&mut self) {
+        let Some(crate::dialogs::Dialog::FontDownload { dont_show, .. }) = &self.dialog else { return };
+        let dont_show = *dont_show;
+        let fonts = crate::font_download::rows(self);
+        self.dialog = (!fonts.is_empty()).then_some(crate::dialogs::Dialog::FontDownload { fonts, dont_show });
+    }
     /// Fonts were added or removed (a command, the web shell loading stored fonts): lay out
     /// again and refresh the font lists and their previews.
     pub(crate) fn watch_fonts(&mut self, ctx: &egui::Context) {

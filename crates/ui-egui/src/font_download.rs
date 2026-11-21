@@ -101,7 +101,7 @@ impl WordApp {
 /// dialog or the File tab to close rather than replace them.
 pub(crate) fn tick(app: &mut WordApp) {
     let id = app.session.document_id();
-    if !app.font_notices || app.font_notice_seen.contains(&id) || app.dialog.is_some() || app.ui.backstage {
+    if !app.font_notices || app.host_fonts_coming || app.font_notice_seen.contains(&id) || app.dialog.is_some() || app.ui.backstage {
         return;
     }
     remember(app, id);

@@ -18,6 +18,9 @@ use std::rc::Rc;
 pub enum SaveOutcome {
     /// The file is written and closed.
     Saved,
+    /// Written and closed under another name than the one asked for (a host that keeps the file
+    /// as a conflict copy, or under the name the user picked).
+    SavedAs(String),
     /// The user cancelled the picker; nothing was written.
     Cancelled,
     /// The picker, the write or the close failed (the reason).

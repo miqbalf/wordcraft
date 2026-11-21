@@ -130,6 +130,12 @@ struct SaveInFlight {
     document: u64,
     /// Whether it marked the document saved (a Save in a format that keeps everything).
     marked_saved: bool,
+    /// A host page stores it ([`Services::host_confirms_saves`]): the document is marked saved
+    /// only when the host says so, and a failure is reported as the host's.
+    host: bool,
+    /// For a host save of a document that is saved by it: the revision that was handed over. The
+    /// host's answer marks the document saved only if nothing was typed since.
+    saves_revision: Option<u64>,
 }
 
 /// Web: the command a Save Changes prompt holds back until its picker save ends.
@@ -701,6 +707,9 @@ pub struct WordApp {
     pub(crate) font_notice_seen: Vec<u64>,
     /// Whether that box comes up by itself ([`WordApp::tell_about_font_downloads`]).
     pub(crate) font_notices: bool,
+    /// Web: a host page has offered fonts that are still being fetched ([`WordApp::host_fonts_coming`]):
+    /// the missing-fonts box waits for them, so it never names a font that is about to arrive.
+    pub(crate) host_fonts_coming: bool,
     /// Language pack installs, the missing-pack bar ([`language_packs`]).
     pub(crate) packs_rt: language_packs::Runtime,
     control_rx: Option<std::sync::mpsc::Receiver<ControlRequest>>,

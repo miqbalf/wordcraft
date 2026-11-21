@@ -269,6 +269,7 @@ impl WordApp {
             info_editing,
             shown_document,
             clipboard_published: _,
+            host_fonts_coming: _,
         } = self;
         let UiState {
             // App-wide: preferences, recent lists, and the settings the session owns while

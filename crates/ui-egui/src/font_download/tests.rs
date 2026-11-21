@@ -251,3 +251,63 @@ fn only_so_many_documents_are_remembered() {
     assert_eq!(a.font_notice_seen.len(), REMEMBERED);
     assert_eq!(a.font_notice_seen.last(), Some(&(REMEMBERED as u64 + 49)));
 }
+
+/// A font file for `family` (13 characters, so the name is replaced in place), made from a font
+/// the repository already has.
+fn font_file(family: &str) -> Vec<u8> {
+    assert_eq!(family.len(), 13);
+    let mut font = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/SourceSans3-Regular.ttf")).unwrap();
+    let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>();
+    for (from, to) in [(utf16("Source Sans 3"), utf16(family)), (b"Source Sans 3".to_vec(), family.as_bytes().to_vec())] {
+        let mut i = 0;
+        while let Some(at) = font[i..].windows(from.len()).position(|w| w == from) {
+            font[i + at..i + at + to.len()].copy_from_slice(&to);
+            i += at + to.len();
+        }
+    }
+    font
+}
+
+fn selawik_app() -> WordApp {
+    let mut a = WordApp::new(Session::new(wordcraft_doc::Document::new()), crate::Services::default());
+    a.session.run("format.font", &json!({"name": "Selawik Sans3"})).unwrap();
+    a.session.run("text.insert", &json!({"text": "Lanterns"})).unwrap();
+    a.session.path = Some("letter.docx".into());
+    a.tell_about_font_downloads();
+    a
+}
+
+/// A font the host page offered is installed like one the user added, and the box that named it
+/// as missing checks again: it closes once nothing it listed is missing.
+#[test]
+fn a_host_font_closes_the_box_that_named_it() {
+    let mut h = harness(selawik_app());
+    let Some(Dialog::FontDownload { fonts, .. }) = h.state().dialog.clone() else { panic!("no box: {:?}", shown(&h)) };
+    assert_eq!(fonts.iter().map(|f| f.font.as_str()).collect::<Vec<_>>(), ["Selawik Sans3"]);
+    let kept = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let k = kept.clone();
+    h.state_mut().services.store_font = Some(Box::new(move |name, _| k.borrow_mut().push(name.to_string())));
+
+    h.state_mut().session.dirty = false;
+    assert_eq!(h.state_mut().install_host_font("Selawik-Sans3.ttf", &font_file("Selawik Sans3")), Ok(true));
+    assert!(!h.state().session.dirty, "a font arriving is not an edit");
+    assert_eq!(*kept.borrow(), ["Selawik-Sans3.ttf"], "kept for the next visit, like an added font");
+    assert!(h.state().dialog.is_none(), "nothing the box listed is missing now");
+    assert_eq!(h.state_mut().install_host_font("Again.ttf", &font_file("Selawik Sans3")), Ok(false), "a second copy says nothing");
+    assert_eq!(kept.borrow().len(), 1);
+    assert!(h.state_mut().install_host_font("junk.ttf", b"not a font").is_err());
+    let _ = h.state_mut().run("font.remove", json!({"family": "Selawik Sans3"}));
+}
+
+/// While the host's fonts are on their way the box doesn't come up, so it never names a font
+/// that is about to arrive; it comes up afterwards for what did not.
+#[test]
+fn the_box_waits_for_the_fonts_the_host_is_sending() {
+    let mut a = selawik_app();
+    a.host_fonts_coming(true);
+    let mut h = harness(a);
+    assert!(h.state().dialog.is_none(), "{:?}", shown(&h));
+    h.state_mut().host_fonts_coming(false);
+    h.run_steps(4);
+    assert!(matches!(h.state().dialog, Some(Dialog::FontDownload { .. })), "{:?}", shown(&h));
+}

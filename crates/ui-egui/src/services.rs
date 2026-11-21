@@ -57,6 +57,13 @@ pub struct Services {
     /// exports download a copy through `download_copy` instead, and never mark the document
     /// saved (the browser can't say whether the user kept the download).
     pub saves_are_copies: bool,
+    /// Web, framed by a page that stores saves and answers each one (`?host=parent`, the host's
+    /// `saves`): `host_save` finishes later, through a ticket of `async_saves`. The document is
+    /// marked saved, and takes the name the host kept it under ([`async_saves::SaveOutcome::SavedAs`]),
+    /// only when the host says `Saved`; on a failure it stays unsaved and the status bar says
+    /// "Couldn't save to Nextcloud: {error}". Without it, `host_save` returns at once and the
+    /// document is marked saved when it returns.
+    pub host_confirms_saves: bool,
     /// Web: told whether the document has unsaved changes after each pass, for the browser's
     /// leave-page guard (`beforeunload` runs between frames and can't ask the app).
     pub on_dirty: Option<Box<dyn Fn(bool)>>,

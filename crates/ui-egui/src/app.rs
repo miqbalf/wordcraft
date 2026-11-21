@@ -112,6 +112,7 @@ impl WordApp {
             updates_rt: updates_ui::Runtime::default(),
             font_notice_seen: Vec::new(),
             font_notices: false,
+            host_fonts_coming: false,
             packs_rt: Default::default(),
             control_rx: None,
             shots: crate::control::Shots::default(),

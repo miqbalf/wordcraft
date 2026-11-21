@@ -129,7 +129,19 @@ impl WordApp {
             if let Some(i) = self.saves_in_flight.iter().position(|s| s.ticket == ticket) {
                 let save = self.saves_in_flight.swap_remove(i);
                 match &outcome {
-                    async_saves::SaveOutcome::Saved => log::info!("saved {} through the save picker", save.name),
+                    async_saves::SaveOutcome::Saved | async_saves::SaveOutcome::SavedAs(_) if save.host => {
+                        let kept_as = match &outcome {
+                            async_saves::SaveOutcome::SavedAs(name) => name.clone(),
+                            _ => save.name.clone(),
+                        };
+                        log::info!("the host stored {} as {kept_as}", save.name);
+                        if let Some(rev) = save.saves_revision {
+                            self.document_saved_by_host(save.document, rev, &kept_as);
+                        }
+                    }
+                    async_saves::SaveOutcome::Saved | async_saves::SaveOutcome::SavedAs(_) => {
+                        log::info!("saved {} through the save picker", save.name);
+                    }
                     async_saves::SaveOutcome::Cancelled | async_saves::SaveOutcome::Failed(_) => {
                         if save.marked_saved && save.document == current {
                             self.session.dirty = true;
@@ -140,9 +152,17 @@ impl WordApp {
                     }
                 }
                 if let async_saves::SaveOutcome::Failed(error) = &outcome {
-                    let msg = i18n::fmt(tl!("Couldn't download {name}: {error}"), &[("name", &save.name), ("error", error)]);
-                    log::error!("the save picker couldn't save {}: {error}", save.name);
-                    self.status(msg);
+                    let msg = if save.host {
+                        i18n::fmt(tl!("Couldn't save to Nextcloud: {error}"), &[("error", error)])
+                    } else {
+                        i18n::fmt(tl!("Couldn't download {name}: {error}"), &[("name", &save.name), ("error", error)])
+                    };
+                    log::error!("the save of {} failed: {error}", save.name);
+                    if save.host {
+                        self.status_long(msg);
+                    } else {
+                        self.status(msg);
+                    }
                 }
             }
             let Some(wait) = self.awaiting_save.take_if(|w| w.ticket == ticket) else { continue };
@@ -152,7 +172,9 @@ impl WordApp {
             }
             match outcome {
                 // Only when nothing changed since and no later save of it is still unconfirmed.
-                async_saves::SaveOutcome::Saved if !self.session.dirty && self.session.rev() == wait.rev && !self.save_unconfirmed() => {
+                async_saves::SaveOutcome::Saved | async_saves::SaveOutcome::SavedAs(_)
+                    if !self.session.dirty && self.session.rev() == wait.rev && !self.save_unconfirmed() =>
+                {
                     // A failed open was already reported by name in `execute_user`.
                     let is_open = wait.then == "file.open";
                     if let Err(e) = self.execute_held_back(&wait.then, wait.params)
@@ -162,7 +184,7 @@ impl WordApp {
                     }
                 }
                 // Edited while the picker was open (those edits may not be written yet): ask again.
-                async_saves::SaveOutcome::Saved => {
+                async_saves::SaveOutcome::Saved | async_saves::SaveOutcome::SavedAs(_) => {
                     let name = self.prompt_name();
                     self.dialog = Some(dialogs::Dialog::SaveChanges {
                         name,
@@ -181,6 +203,22 @@ impl WordApp {
                     self.save_failed(&error, wait.then, wait.params, wait.document);
                 }
             }
+        }
+    }
+
+    /// A host stored the save of `document`'s revision `rev` as `name`: that is now the document's
+    /// file, and it is saved unless something was typed since (only that document is touched).
+    fn document_saved_by_host(&mut self, document: u64, rev: u64, name: &str) {
+        let apply = |s: &mut wordcraft_engine::Session| {
+            s.path = Some(std::path::PathBuf::from(name));
+            if s.rev() == rev {
+                s.dirty = false;
+            }
+        };
+        if document == self.session.document_id() {
+            apply(&mut self.session);
+        } else {
+            let _ = self.session.with_document(document, apply);
         }
     }
 

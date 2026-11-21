@@ -5268,6 +5268,90 @@ fn a_host_save_that_fails_leaves_the_document_unsaved() {
     assert!(a.session.dirty);
 }
 
+/// A page that stores saves and answers each (`Services::host_confirms_saves`): `host_save`
+/// starts a ticket and the answer arrives later. Returns the app, the saves, the last ticket and
+/// the files the page was handed.
+fn confirming_host_app() -> (WordApp, async_saves::AsyncSaves, std::rc::Rc<std::cell::Cell<u64>>, std::rc::Rc<std::cell::RefCell<Vec<(String, bool)>>>)
+{
+    let mut a = typed();
+    let saves = async_saves::AsyncSaves::default();
+    let last = std::rc::Rc::new(std::cell::Cell::new(0));
+    let got = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let (hook, seen, files) = (saves.clone(), last.clone(), got.clone());
+    a.services.download = Some(Box::new(|_, _| Err("downloads go to the host page".into())));
+    a.services.host_save = Some(Box::new(move |name: &str, _: &[u8], save_as: bool| {
+        seen.set(hook.start());
+        files.borrow_mut().push((name.to_string(), save_as));
+        Ok(())
+    }));
+    a.services.async_saves = Some(saves.clone());
+    a.services.host_confirms_saves = true;
+    (a, saves, last, got)
+}
+
+/// With a host that answers each save, the document is marked saved only when `Saved` arrives,
+/// and the host's name (a conflict copy) becomes the document's file.
+#[test]
+fn a_confirming_host_marks_the_document_saved_only_when_it_says_so() {
+    let (mut a, saves, last, got) = confirming_host_app();
+    host_open(&mut a, "report.docx");
+    a.execute("file.save", json!({})).unwrap();
+    assert_eq!(*got.borrow(), [("report.docx".to_string(), false)]);
+    a.settle_async_saves();
+    assert!(a.session.dirty, "handing the bytes over is not saving them");
+    saves.finish(last.get(), async_saves::SaveOutcome::Saved);
+    a.settle_async_saves();
+    assert!(!a.session.dirty);
+    assert_eq!(a.session.path.as_deref(), Some(std::path::Path::new("report.docx")));
+
+    // The host kept it under another name: that is the document's file now.
+    a.run("text.insert", json!({"text": "More "})).unwrap();
+    a.execute("file.save", json!({})).unwrap();
+    saves.finish(last.get(), async_saves::SaveOutcome::SavedAs("report (conflict).docx".into()));
+    a.settle_async_saves();
+    assert!(!a.session.dirty);
+    assert_eq!(a.session.path.as_deref(), Some(std::path::Path::new("report (conflict).docx")));
+}
+
+/// A refused save leaves the document unsaved and says why, in the host's words.
+#[test]
+fn a_confirming_host_that_refuses_a_save_leaves_it_unsaved_and_says_why() {
+    let (mut a, saves, last, _) = confirming_host_app();
+    host_open(&mut a, "report.docx");
+    a.execute("file.save", json!({})).unwrap();
+    saves.finish(last.get(), async_saves::SaveOutcome::Failed("the file is locked".into()));
+    a.settle_async_saves();
+    assert!(a.session.dirty);
+    let status = a.status_msg.as_ref().map(|(s, _)| s.clone()).unwrap_or_default();
+    assert_eq!(status, "Couldn't save to Nextcloud: the file is locked");
+}
+
+/// Typing while the host stores the save: the stored file lacks it, so the document is still
+/// unsaved when the answer comes.
+#[test]
+fn edits_made_while_the_host_stores_the_save_stay_unsaved() {
+    let (mut a, saves, last, _) = confirming_host_app();
+    host_open(&mut a, "report.docx");
+    a.execute("file.save", json!({})).unwrap();
+    a.run("text.insert", json!({"text": "After "})).unwrap();
+    saves.finish(last.get(), async_saves::SaveOutcome::Saved);
+    a.settle_async_saves();
+    assert!(a.session.dirty, "what was typed after the save is not stored yet");
+}
+
+/// A copy (an export) handed to a confirming host never marks the document saved, answered or not.
+#[test]
+fn an_export_to_a_confirming_host_is_never_the_documents_save() {
+    let (mut a, saves, last, got) = confirming_host_app();
+    host_open(&mut a, "report.docx");
+    a.execute("file.exportPdf", json!({})).unwrap();
+    assert_eq!(*got.borrow(), [("report.pdf".to_string(), false)]);
+    saves.finish(last.get(), async_saves::SaveOutcome::Saved);
+    a.settle_async_saves();
+    assert!(a.session.dirty);
+    assert_eq!(a.session.path.as_deref(), Some(std::path::Path::new("report.docx")));
+}
+
 /// Macro-enabled documents and templates keep everything (#172), so once saved in this
 /// session AutoSave covers them like a .docx.
 #[test]

@@ -76,8 +76,9 @@ pub fn start() {
                     let mut services = services(inbox.clone(), cc.egui_ctx.clone(), dirty.clone(), saves.clone(), messages.clone());
                     let live_events = crate::host::LiveEvents::default();
                     let live = crate::host::Live::default();
+                    let host_events = crate::host::HostEvents::default();
                     if let Some(bridge) = &app_bridge {
-                        bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone(), dirty.clone());
+                        bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone(), dirty.clone(), saves.clone(), host_events.clone());
                         bridge.listen_live(live_events.clone(), live.joining(), cc.egui_ctx.clone());
                     }
                     let control = crate::api::install(cc.egui_ctx.clone());
@@ -109,7 +110,7 @@ pub fn start() {
                         crate::host::Bridge::set_author(&mut app, &author);
                         prefs.keep_own_author(&app.session.author, &own);
                     }
-                    Ok(Box::new(WebShell { app, inbox, messages, prefs, live, live_events }))
+                    Ok(Box::new(WebShell { app, inbox, messages, prefs, live, live_events, bridge: app_bridge, saves, host_events }))
                 }),
             )
             .await;
@@ -147,6 +148,10 @@ struct WebShell {
     /// Live editing: the parent page's `live` messages and the session's tickets (`host`).
     live: crate::host::Live,
     live_events: crate::host::LiveEvents,
+    /// The host page's bridge, when hosted: it says when saves go to the host.
+    bridge: Option<crate::host::Bridge>,
+    saves: AsyncSaves,
+    host_events: crate::host::HostEvents,
 }
 
 fn local_storage() -> Option<web_sys::Storage> {
@@ -168,6 +173,21 @@ impl eframe::App for WebShell {
             self.app.status(msg);
         }
         self.live.frame(&mut self.app, &self.live_events);
+        if let Some(bridge) = &self.bridge {
+            bridge.apply_saves(&mut self.app.services, &self.saves);
+        }
+        let arrived = std::mem::take(&mut *self.host_events.borrow_mut());
+        for event in arrived {
+            match event {
+                crate::host::HostEvent::Saves => {}
+                crate::host::HostEvent::FontsComing(coming) => self.app.host_fonts_coming(coming),
+                crate::host::HostEvent::Font(file, bytes) => {
+                    if let Err(e) = self.app.install_host_font(&file, &bytes) {
+                        log::warn!("host font {file} not installed: {e}");
+                    }
+                }
+            }
+        }
         self.app.logic(ctx);
         // Store changed preferences straight away: a reload or closed tab runs no exit code (#2132).
         if let Some(json) = self.prefs.changed(&self.app) {
