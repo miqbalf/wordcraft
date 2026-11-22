@@ -1448,3 +1448,46 @@ async fn a_close_refused_as_reopened_serves_the_room_on() {
     w.nc.lock().unwrap().close_status = None;
     reopened_window_is_saved(&mut w).await;
 }
+
+/// L1 round 1 (review I1): the second window's ticket comes while the first window is still in
+/// the room (the app notifies the worker then), the first window leaves 3 s later, and the second
+/// one, slow to load, joins 12 s after that. The worker must still be in the room: a window it
+/// was told about is waited for, whoever was in the room when the notify came.
+#[tokio::test]
+async fn a_window_announced_while_an_editor_is_in_is_waited_for() {
+    let (mut w, notify) = served_world(file(&["One", "Two"])).await;
+    w.eds[0].type_at_end(1, " and three");
+    w.run_for(10_000, 1_000).await;
+    assert_eq!(w.count("put"), 1);
+    // The second window's ticket: notified while editor0 is in the room.
+    notify.send_replace(TOKEN.to_owned());
+    assert_eq!(w.run_for(3_000, 1_000).await, Flow::Continue);
+    let at = w.eds[0].at;
+    w.relay.borrow_mut().leave(at);
+    w.eds.clear();
+    // The new window joins 12 s after the room emptied: still served, never closed.
+    assert_eq!(w.run_for(12_000, 1_000).await, Flow::Continue, "the announced window is waited for");
+    assert_eq!(w.count("close"), 0);
+    reopened_window_is_saved(&mut w).await;
+}
+
+/// L1 round 1 (review M3): the app refuses the close (a reopen), and no window ever comes. The
+/// worker waits for it once (ALONE_MS), then closes the room anyway, so the lock is not
+/// held forever.
+#[tokio::test]
+async fn a_refused_close_with_no_window_closes_after_the_wait() {
+    let mut w = world(file(&["One", "Two"]), 1).await;
+    w.nc.lock().unwrap().close_status = Some(StatusCode::CONFLICT);
+    emptied(&mut w).await;
+    assert_eq!(w.run_for(15_000, 1_000).await, Flow::Continue);
+    assert_eq!(w.count("closefail"), 1, "the first close was refused");
+    w.nc.lock().unwrap().close_status = None;
+    // Waiting for the announced window: not closed for a good while.
+    assert_eq!(w.run_for(100_000, 1_000).await, Flow::Continue, "the refused room waits for its window");
+    assert_eq!(w.count("close"), 0);
+    // Then it gives up on it and closes, saying the room was empty for the grace.
+    assert_eq!(w.run_for(60_000, 1_000).await, Flow::Done, "no window came: the room closes");
+    assert_eq!(w.count("close"), 1);
+    let idle = w.nc.lock().unwrap().close_idle.clone();
+    assert!(idle.last().and_then(|s| s.parse::<u64>().ok()).is_some_and(|s| s * 1000 >= EMPTY_GRACE_MS), "{idle:?}");
+}
