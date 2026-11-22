@@ -153,10 +153,9 @@ pub fn specs() -> Vec<CommandSpec> {
             Ok(json!({"issues": issues}))
         })
         .pure(),
-        CommandSpec::new("file.share", "Share", "File", |s, _| {
-            s.push_ui_request(json!({"open": "saveAs"}));
-            Ok(json!({"hint": "Save or export a copy (PDF, Word document) to share it."}))
-        })
+        // Share only shares through Nextcloud, which the window knows (the hosting page, or the
+        // desktop's synced folders) and handles before the engine; the engine alone has none.
+        CommandSpec::new("file.share", "Share", "File", |_, _| Ok(json!({"shared": "none", "message": craft_share::NO_NEXTCLOUD})))
         .pure(),
         CommandSpec::new("insert.quickParts", "Quick Parts", "Insert › Text", |s, v| quick_parts(s, v, wordcraft_doc::QUICK_PARTS_GALLERY)).params(
             r#"{"save"?: name (from the selection), "in"?: "document" (save into the document's own building blocks, kept in its file; else this session's), "insert"?: name, "delete"?: name} → {"parts": names (this session's, then the document's Quick Parts), "document": the document's Quick Parts}"#,

@@ -21,8 +21,9 @@ wordcraft-ui-egui = { workspace = true }
 craft-web-api = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "0.1.0" }
 # The live messages (`live`, `live-state` with its `broken` state, unprefixed `ready`,
 # craft-live/1) are on the miqbalf fork's feat/web-host-live, pinned by rev (storytold 93dac78c
-# plus those two commits, and the host saves/fonts messages) until it is merged upstream.
-craft-web-host = { git = "https://github.com/miqbalf/craft-libs", rev = "71e6ef899f551665f690970d57a204afb433c5dd", version = "0.1.0" }
+# plus those two commits, and the host saves/fonts messages) until it is merged upstream; now its
+# feat/share-hook (the `share` message, `post_share`, `shareButton`), the rev of craft-share.
+craft-web-host = { git = "https://github.com/miqbalf/craft-libs", rev = "0434267cbc03705d1a4a22986bfc533ae92b812b", version = "0.1.0" }
 egui = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }

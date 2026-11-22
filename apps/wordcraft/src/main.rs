@@ -475,6 +475,9 @@ fn services(file_dialog: file_dialogs::Hook, cancel_file_dialog: file_dialogs::C
         clipboard_rtf: Some(Box::new(clipboard::rtf)),
         clipboard_formats: Some(Box::new(clipboard::formats)),
         save_prefs: Some(Box::new(try_save_prefs)),
+        // Share: a file in a folder the Nextcloud desktop client syncs opens its sharing in the
+        // browser; any other file says "No Nextcloud connected".
+        share_route: Some(Box::new(craft_share::desktop_route)),
         ..Default::default()
     }
 }

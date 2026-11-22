@@ -1304,11 +1304,12 @@ fn a_labelled_split_button_shows_only_its_icon_when_compact() {
     }
 }
 
-/// Framed by a page that shares files itself (`Services::host_share`, Nextcloud): Share asks that
-/// page to share the document and says so in its tooltip; it does not open Export. Without the
-/// hook (the desktop, a plain web page), Share opens Export as before.
+/// The ribbon's one Share button only shares through Nextcloud: framed by a Nextcloud page that
+/// shares files (`Services::host_share`) it asks that page; with no Nextcloud (a plain web page,
+/// or the desktop with the file outside every synced folder) it says "No Nextcloud connected" in
+/// the status bar. It never opens Export or Save As.
 #[test]
-fn share_asks_a_hosting_page_that_shares_files() {
+fn share_button_only_shares_through_nextcloud() {
     use egui_kittest::kittest::Queryable;
     for hosted in [false, true] {
         let asked = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -1334,21 +1335,18 @@ fn share_asks_a_hosting_page_that_shares_files() {
         h.run_steps(3);
         h.get_by_role_and_label(egui::accesskit::Role::Button, tl!("Share")).hover();
         h.run_steps(60);
-        let (shown, hidden) = if hosted {
-            (tl!("Share with people in Nextcloud"), tl!("Export a copy to share (PDF, Word document)"))
-        } else {
-            (tl!("Export a copy to share (PDF, Word document)"), tl!("Share with people in Nextcloud"))
-        };
-        assert!(h.query_by_label(shown).is_some(), "hosted {hosted}: the tooltip says what Share does");
-        assert!(h.query_by_label(hidden).is_none(), "hosted {hosted}: not the other tooltip");
+        assert!(h.query_by_label(tl!("Share with people in Nextcloud")).is_some(), "hosted {hosted}: the tooltip says what Share does");
+        assert!(h.query_by_label(tl!("Export a copy to share (PDF, Word document)")).is_none(), "hosted {hosted}: Share is not an export");
         h.get_by_role_and_label(egui::accesskit::Role::Button, tl!("Share")).click();
         h.run_steps(3);
+        assert!(!h.state().ui.backstage, "hosted {hosted}: the export flow stays closed");
+        assert!(h.state().dialog.is_none(), "hosted {hosted}: no dialog opens");
         if hosted {
             assert_eq!(asked.get(), 1, "one click asks the page once");
-            assert!(!h.state().ui.backstage, "the export flow stays closed");
         } else {
             assert_eq!(asked.get(), 0);
-            assert!(h.state().ui.backstage && h.state().ui.backstage_page == "export", "Share opens Export");
+            let status = h.state().status_msg.as_ref().map(|m| m.0.clone());
+            assert_eq!(status.as_deref(), Some(tl!(craft_share::NO_NEXTCLOUD)), "the status bar says there is no Nextcloud");
         }
     }
 }

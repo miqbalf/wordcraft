@@ -408,3 +408,13 @@ fn a_window_view_put_back_follows_the_spelling_setting() {
     s.put_view(held);
     assert!(s.view.proofing);
 }
+
+/// Share never exports: run without a window that knows a Nextcloud (the CLI, an agent on the
+/// engine alone) it asks for no Save As or Export and only says there is no Nextcloud.
+#[test]
+fn share_without_a_window_only_says_no_nextcloud() {
+    let mut s = Session::new(wordcraft_doc::Document::from_text("Text"));
+    let r = s.run("file.share", &json!({})).unwrap();
+    assert_eq!(r, json!({"shared": "none", "message": craft_share::NO_NEXTCLOUD}));
+    assert!(s.ui_requests.is_empty(), "no Save As or Export is asked for: {:?}", s.ui_requests);
+}

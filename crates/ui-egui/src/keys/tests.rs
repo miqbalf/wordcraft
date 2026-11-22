@@ -1616,70 +1616,186 @@ fn delete_previous_sentence_shortcut_dispatches_and_can_be_reassigned() {
     assert_eq!(app.session.doc.para_at(&app.session.sel.focus).unwrap().text, "First. Second sentence.");
 }
 
-/// Framed by a page that shares files itself (`Services::host_share`, Nextcloud), every way to
-/// Share asks that page and none exports a copy: `file.share` run from the ribbon, Backstage or
-/// command search (`WordApp::run`), a shortcut the user bound to it, and the control channel
-/// (automation, `window.wordcraft`). Without the page, `file.share` keeps asking where to save a copy.
-#[test]
-fn every_share_entry_point_asks_a_hosting_page() {
-    for hosted in [false, true] {
-        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
-        let mut services = crate::Services::default();
-        if hosted {
+/// The three answers Share can get, as a test sets them up.
+#[derive(Clone, Copy, Debug)]
+enum Via {
+    /// Framed by a Nextcloud page that shares files (`Services::host_share`).
+    Page,
+    /// The desktop, the file in a folder the Nextcloud client syncs (`Services::share_route`).
+    Desktop,
+    /// No Nextcloud: a plain web page, or a desktop file outside every synced folder.
+    Nowhere,
+}
+
+/// What a Share hook saw: page requests, desktop lookups (by path).
+#[derive(Default)]
+struct Asked {
+    page: std::cell::Cell<usize>,
+    desktop: std::cell::RefCell<Vec<std::path::PathBuf>>,
+}
+
+fn share_app(via: Via, asked: &std::rc::Rc<Asked>) -> WordApp {
+    let mut services = crate::Services::default();
+    match via {
+        Via::Page => {
             let asked = asked.clone();
             services.host_share = Some(Box::new(move || {
-                asked.set(asked.get() + 1);
+                asked.page.set(asked.page.get() + 1);
                 Ok(())
             }));
+            services.host_file = Some("Plan.docx".into());
         }
-        services.host_file = Some("Plan.docx".into());
-        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Text")), services);
-        a.session.path = Some("Plan.docx".into());
+        Via::Desktop | Via::Nowhere => {
+            let asked = asked.clone();
+            services.share_route = Some(Box::new(move |path: &std::path::Path| {
+                asked.desktop.borrow_mut().push(path.to_path_buf());
+                match via {
+                    Via::Desktop => craft_share::ShareRoute::NextcloudDesktop {
+                        server: "https://cloud.example.test".into(),
+                        user: "alice".into(),
+                        remote_path: "/Docs/Plan.docx".into(),
+                    },
+                    _ => craft_share::ShareRoute::None,
+                }
+            }));
+        }
+    }
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Text")), services);
+    a.session.path = Some(if matches!(via, Via::Page) { "Plan.docx".into() } else { "/home/alice/Nextcloud/Docs/Plan.docx".into() });
+    a
+}
+
+/// Every way to Share goes through the one share function, and that only shares through
+/// Nextcloud: `file.share` run from the ribbon, Backstage or command search (`WordApp::run`), a
+/// shortcut the user bound to it, and the control channel (automation, `window.wordcraft`), for
+/// the active document and for another open one. Framed by a Nextcloud page each asks the page;
+/// on the desktop each opens the file's sharing in the browser; with no Nextcloud each says "No
+/// Nextcloud connected". None exports, opens Save As or Export, or opens a dialog.
+#[test]
+fn every_share_entry_point_goes_through_the_one_share_function() {
+    let url = craft_share::sharing_url("https://cloud.example.test", "/Docs/Plan.docx");
+    for via in [Via::Page, Via::Desktop, Via::Nowhere] {
+        let asked = std::rc::Rc::new(Asked::default());
+        let mut a = share_app(via, &asked);
         a.session.keymap = wordcraft_engine::keymap::KeyMap::from_value(&json!({"assigned": {"Mod+Shift+F12": "file.share"}}));
         let ctx = egui::Context::default();
         let mut entries = 0;
+        let check = |a: &mut WordApp, entries: usize, what: &str| {
+            match via {
+                Via::Page => assert_eq!(asked.page.get(), entries, "{via:?} {what}: asks the page once"),
+                Via::Desktop => {
+                    assert_eq!(asked.desktop.borrow().len(), entries, "{via:?} {what}: looks the file up once");
+                    assert_eq!(a.canvas.open_url.take().as_deref(), Some(url.as_str()), "{via:?} {what}: opens sharing in the browser");
+                }
+                Via::Nowhere => {
+                    assert_eq!(a.status_msg.take().map(|m| m.0).as_deref(), Some(tl!(craft_share::NO_NEXTCLOUD)), "{via:?} {what}: says so");
+                    assert!(a.canvas.open_url.is_none());
+                }
+            }
+            assert!(a.dialog.is_none() && !a.ui.backstage, "{via:?} {what}: no Save As, Export or dialog opens");
+            assert!(a.session.ui_requests.is_empty(), "{via:?} {what}: nothing asks the window for more");
+        };
         // Ribbon, Backstage and command search run it by id.
         let r = a.run("file.share", json!({}));
         entries += 1;
-        if hosted {
-            assert_eq!(r, Ok(json!({"shared": "host"})));
-        }
+        let shared = match via {
+            Via::Page => json!({"shared": "host"}),
+            Via::Desktop => json!({"shared": "browser", "url": url}),
+            Via::Nowhere => json!({"shared": "none", "message": tl!(craft_share::NO_NEXTCLOUD)}),
+        };
+        assert_eq!(r, Ok(shared.clone()), "{via:?}");
+        check(&mut a, entries, "run");
         // A shortcut the user gave it.
         assert!(dispatch(&mut a, Key::F12, Modifiers { ctrl: true, command: true, shift: true, ..Default::default() }));
         entries += 1;
-        // Automation.
+        check(&mut a, entries, "shortcut");
+        // Automation, on the active document.
         let (req, _reply) = crate::ControlRequest::new("command", json!({"command": "file.share"}));
         let _ = crate::control::handle(&mut a, &ctx, &req);
         entries += 1;
-        if hosted {
-            assert_eq!(asked.get(), entries, "each entry point asks the page once");
-            assert!(a.dialog.is_none() && !a.ui.backstage, "no Save As or Export opens");
-        } else {
-            assert_eq!(asked.get(), 0);
+        check(&mut a, entries, "control channel");
+    }
+}
+
+/// Automation can name another open document: Share goes through the same function, for that
+/// document's file. On the desktop that is its own synced file; a framing page shares only the
+/// file it opened, and an untitled document has no file, so both say "No Nextcloud connected".
+#[test]
+fn share_on_another_open_document_shares_that_documents_file() {
+    let ctx = egui::Context::default();
+    for via in [Via::Page, Via::Desktop] {
+        let asked = std::rc::Rc::new(Asked::default());
+        let mut a = share_app(via, &asked);
+        let first = a.session.document_id();
+        a.session.add_document(wordcraft_doc::Document::from_text("Other"));
+        assert_ne!(a.session.document_id(), first);
+        let (req, _rx) = crate::ControlRequest::new("command", json!({"command": "file.share", "doc": first}));
+        let crate::control::Outcome::Done(reply) = crate::control::handle(&mut a, &ctx, &req) else { panic!("a reply") };
+        assert_eq!(reply["ok"], true, "{reply}");
+        match via {
+            Via::Page => {
+                // The active window shows another document, but the one named is the page's file.
+                assert_eq!(asked.page.get(), 1, "{reply}");
+            }
+            _ => {
+                assert_eq!(asked.desktop.borrow().as_slice(), [std::path::PathBuf::from("/home/alice/Nextcloud/Docs/Plan.docx")], "{reply}");
+                assert!(a.canvas.open_url.take().is_some());
+            }
         }
+        // The new document has no file: nothing to share.
+        let (req, _rx) = crate::ControlRequest::new("command", json!({"command": "file.share"}));
+        let _ = crate::control::handle(&mut a, &ctx, &req);
+        assert_eq!(a.status_msg.take().map(|m| m.0).as_deref(), Some(tl!(craft_share::NO_NEXTCLOUD)), "{via:?}");
+        assert_eq!(asked.page.get(), usize::from(matches!(via, Via::Page)), "{via:?}: the page is not asked for a file it didn't open");
+        assert_eq!(asked.desktop.borrow().len(), usize::from(matches!(via, Via::Desktop)), "{via:?}: an untitled document is not looked up");
     }
 }
 
 /// The page shares the file it opened in the frame. Another document in the window (a new one, or
-/// the opened file saved under another name) is not that file: Share says so and asks nothing.
+/// the opened file saved under another name) is not that file: Share says "No Nextcloud
+/// connected" and asks nothing.
 #[test]
 fn share_is_only_for_the_file_the_page_opened() {
-    let asked = std::rc::Rc::new(std::cell::Cell::new(0));
-    let mut services = crate::Services::default();
-    let counter = asked.clone();
-    services.host_share = Some(Box::new(move || {
-        counter.set(counter.get() + 1);
-        Ok(())
-    }));
-    services.host_file = Some("Plan.docx".into());
-    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Text")), services);
+    let asked = std::rc::Rc::new(Asked::default());
+    let mut a = share_app(Via::Page, &asked);
     for other in [None, Some("Plan copy.docx")] {
         a.session.path = other.map(Into::into);
-        assert!(a.run("file.share", json!({})).is_err(), "{other:?}: refused with the reason");
-        assert!(!a.host_share_offered());
+        assert_eq!(a.share_route(), craft_share::ShareRoute::None, "{other:?}");
+        let r = a.run("file.share", json!({})).unwrap();
+        assert_eq!(r["shared"], "none", "{other:?}");
+        assert_eq!(a.status_msg.take().map(|m| m.0).as_deref(), Some(tl!(craft_share::NO_NEXTCLOUD)));
     }
-    assert_eq!(asked.get(), 0, "the page is not asked to share another file");
+    assert_eq!(asked.page.get(), 0, "the page is not asked to share another file");
     a.session.path = Some("Plan.docx".into());
-    assert!(a.run("file.share", json!({})).is_ok());
-    assert_eq!(asked.get(), 1);
+    assert_eq!(a.share_route(), craft_share::ShareRoute::NextcloudWebHost);
+    assert_eq!(a.run("file.share", json!({})), Ok(json!({"shared": "host"})));
+    assert_eq!(asked.page.get(), 1);
+}
+
+/// A plain web page (no hosting page) and a desktop build without the lookup have no Nextcloud:
+/// Share says so, exports nothing and opens nothing.
+#[test]
+fn share_without_nextcloud_only_says_so() {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Text")), crate::Services::default());
+    for path in [None, Some("/tmp/Plan.docx")] {
+        a.session.path = path.map(Into::into);
+        assert_eq!(a.share_route(), craft_share::ShareRoute::None);
+        assert_eq!(a.run("file.share", json!({})).unwrap()["shared"], "none");
+        assert_eq!(a.status_msg.take().map(|m| m.0).as_deref(), Some(tl!(craft_share::NO_NEXTCLOUD)));
+        assert!(a.dialog.is_none() && !a.ui.backstage && a.canvas.open_url.is_none() && a.session.ui_requests.is_empty());
+    }
+}
+
+/// A page that failed to get the request: Share says it couldn't open sharing.
+#[test]
+fn share_says_when_the_page_did_not_get_the_request() {
+    let services = crate::Services {
+        host_share: Some(Box::new(|| Err("no same-origin parent".into()))),
+        host_file: Some("Plan.docx".into()),
+        ..Default::default()
+    };
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Text")), services);
+    a.session.path = Some("Plan.docx".into());
+    let e = a.run("file.share", json!({})).unwrap_err();
+    assert!(e.contains("no same-origin parent"), "{e}");
 }

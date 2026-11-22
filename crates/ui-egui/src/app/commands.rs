@@ -3,6 +3,7 @@ use super::{
     file_dialogs, i18n, json, keeps_everything, keytips, now_ms, options, panes, paste_picture, printing, push_recent_font, system_clipboard,
     table_pen, theme, widgets, zotero,
 };
+use craft_share::{ShareAction, ShareRoute};
 
 impl WordApp {
     /// `run` for a command a mouse drag on a table sends: the view stays where it is.
@@ -316,8 +317,8 @@ impl WordApp {
         if let Some(r) = self.ui_command(id, &params) {
             return r;
         }
-        if let Some(r) = self.share_with_host(id) {
-            return r;
+        if id == "file.share" {
+            return self.share();
         }
         // Hosted: the page opens, creates and closes files, so these are refused (and hidden).
         // Web: Save these pages as PDF downloads the PDF of the print settings.
@@ -465,40 +466,64 @@ impl WordApp {
         }
     }
 
-    /// The one host-share hook: whether a host shares files ([`Services::host_share`]). A web page
-    /// (`share: true`) sets it today; a desktop host that shares through Nextcloud can set the same
-    /// hook later, and every Share entry point follows without other changes.
-    pub fn host_shares(&self) -> bool {
-        self.services.host_share.is_some()
+    /// Where Share goes for the shown document ([`WordApp::share_route_for`]).
+    pub fn share_route(&self) -> ShareRoute {
+        self.share_route_for(self.session.path.as_deref())
     }
 
-    /// Framed by a page that shares files itself ([`Services::host_share`], Nextcloud): Share
-    /// (`file.share`, from the ribbon, a shortcut, command search or automation) is that page's
-    /// sharing, never an exported copy. `None` for another command or without such a page.
-    ///
-    /// The page shares the one file it opened in the frame, whatever document the window shows:
-    /// a document opened or made inside the frame is not that file, so Share is not offered for it
-    /// (see [`WordApp::host_share_offered`]) and is refused here.
-    pub(crate) fn share_with_host(&self, id: &str) -> Option<Result<Value, String>> {
-        if id != "file.share" {
-            return None;
+    /// Where Share goes for the document saved at `path` (`None`: untitled), from the one hook
+    /// the platform set:
+    /// - web, framed by a Nextcloud page that shares files ([`Services::host_share`]): that page,
+    ///   but only for the file it opened in the frame ([`Services::host_file`]). A document
+    ///   opened or made inside the frame is not that file;
+    /// - desktop ([`Services::share_route`]): the Nextcloud account whose synced folder holds the
+    ///   file;
+    /// - anything else (a plain web page, an untitled document, a file outside every synced
+    ///   folder): [`ShareRoute::None`].
+    pub fn share_route_for(&self, path: Option<&std::path::Path>) -> ShareRoute {
+        if self.services.host_share.is_some() {
+            let name = path.and_then(|p| p.file_name()).map(|n| n.to_string_lossy());
+            let opened = self.services.host_file.as_deref().is_some_and(|f| name.as_deref() == Some(f));
+            return if opened { ShareRoute::NextcloudWebHost } else { ShareRoute::None };
         }
-        let share = self.services.host_share.as_ref()?;
-        if !self.host_share_offered() {
-            return Some(Err(tl!("Share works only for the file opened from Nextcloud.").to_string()));
+        match (&self.services.share_route, path) {
+            (Some(route), Some(path)) => route(path),
+            _ => ShareRoute::None,
         }
-        Some(share().map(|()| json!({"shared": "host"})))
     }
 
-    /// Whether Share can send the shown document to the host: it is the file the host opened in the
-    /// frame (the document's file name is still the host's), not a new or other document.
-    pub fn host_share_offered(&self) -> bool {
-        self.host_shares() && self.services.host_file.as_deref().is_some_and(|f| self.session.path.as_deref().and_then(|p| p.file_name()).is_some_and(|n| n.to_string_lossy() == f))
+    /// Share the shown document: the one function every Share entry point runs (`file.share`
+    /// from the ribbon, command search, a shortcut, automation).
+    pub(crate) fn share(&mut self) -> Result<Value, String> {
+        let path = self.session.path.clone();
+        self.share_file(path.as_deref())
+    }
+
+    /// Share the document saved at `path` through Nextcloud, and do nothing else: never an
+    /// export, a download or a dialog. The hosting page opens its sharing for the file; on the
+    /// desktop the browser opens the file's sharing in Nextcloud Files; with no Nextcloud the
+    /// status bar says "No Nextcloud connected".
+    pub(crate) fn share_file(&mut self, path: Option<&std::path::Path>) -> Result<Value, String> {
+        match self.share_route_for(path).action() {
+            ShareAction::PostToHost => {
+                let post = self.services.host_share.as_ref().ok_or_else(|| tl!(craft_share::NO_NEXTCLOUD).to_string())?;
+                post().map_err(|e| i18n::fmt(tl!("Couldn't open sharing: {error}"), &[("error", e.as_str())]))?;
+                Ok(json!({"shared": "host"}))
+            }
+            ShareAction::OpenUrl(url) => {
+                self.canvas.open_url = Some(url.clone());
+                Ok(json!({"shared": "browser", "url": url}))
+            }
+            ShareAction::Notice(text) => {
+                let message = tl!(text).to_string();
+                self.status(message.clone());
+                Ok(json!({"shared": "none", "message": message}))
+            }
+        }
     }
 
     /// User commands can ask for a supported Save As target or an opening password (#55).
     /// Scripts and agents use [`WordApp::execute`], which never opens these dialogs.
-
     pub(crate) fn execute_user(&mut self, id: &str, params: Value) -> Result<Value, String> {
         // Legacy Word files are import-only (#2445). Only a user's implicit Save asks for
         // a supported target; scripts and explicitly supplied paths keep their normal errors.

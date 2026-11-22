@@ -24,6 +24,8 @@ wordcraft-layout = { workspace = true }
 wordcraft-render = { workspace = true }
 wordcraft-engine = { workspace = true }
 wordcraft-zotero = { workspace = true }
+# Share: where it goes for a document (`ShareRoute`) and "No Nextcloud connected".
+craft-share = { workspace = true }
 # Live co-editing: the session pump and its hub trait; the host connects the transport.
 wordcraft-live = { workspace = true }
 craft-collab = { workspace = true }

@@ -1592,6 +1592,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-share"
+version = "0.1.0"
+source = "git+https://github.com/miqbalf/craft-libs?rev=0434267cbc03705d1a4a22986bfc533ae92b812b#0434267cbc03705d1a4a22986bfc533ae92b812b"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "craft-sheet"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=93dac78c93a7f1fd66e2022edeb089233b1dc45a#93dac78c93a7f1fd66e2022edeb089233b1dc45a"
@@ -1671,7 +1679,7 @@ dependencies = [
 [[package]]
 name = "craft-web-host"
 version = "0.1.0"
-source = "git+https://github.com/miqbalf/craft-libs?rev=71e6ef899f551665f690970d57a204afb433c5dd#71e6ef899f551665f690970d57a204afb433c5dd"
+source = "git+https://github.com/miqbalf/craft-libs?rev=0434267cbc03705d1a4a22986bfc533ae92b812b#0434267cbc03705d1a4a22986bfc533ae92b812b"
 dependencies = [
  "serde_json",
  "wasm-bindgen",
@@ -7848,6 +7856,7 @@ dependencies = [
  "clipboard-win",
  "craft-print",
  "craft-proof",
+ "craft-share",
  "craft-update",
  "dispatch2",
  "eframe",
@@ -7969,6 +7978,7 @@ dependencies = [
  "craft-font-store",
  "craft-mime",
  "craft-proof",
+ "craft-share",
  "craft-ssip",
  "craft-zip",
  "encoding_rs",
@@ -8145,6 +8155,7 @@ dependencies = [
  "chrono",
  "craft-collab",
  "craft-i18n",
+ "craft-share",
  "craft-ui",
  "craft-update",
  "craft-window",
