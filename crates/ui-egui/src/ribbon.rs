@@ -225,8 +225,11 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                             let tip = if hosted { tl!("Share with people in Nextcloud") } else { tl!("Export a copy to share (PDF, Word document)") };
                             if resp.on_hover_text(tip).clicked() {
                                 if hosted {
+                                    let offered = app.host_share_offered();
                                     if let Err(e) = app.run("file.share", json!({})) {
-                                        app.status_long(crate::i18n::fmt(tl!("Couldn't open sharing: {error}"), &[("error", e.as_str())]));
+                                        // Another document than the page's file: the refusal says why.
+                                        let line = if offered { crate::i18n::fmt(tl!("Couldn't open sharing: {error}"), &[("error", e.as_str())]) } else { e };
+                                        app.status_long(line);
                                     }
                                 } else {
                                     let _ = app.run("ui.backstage", json!({"value": true, "page": "export"}));

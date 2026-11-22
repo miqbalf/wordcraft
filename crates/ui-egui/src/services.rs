@@ -79,6 +79,9 @@ pub struct Services {
     /// such as Nextcloud): the ribbon's Share asks that page to share the open document instead
     /// of opening Export. An error means the page didn't get the request.
     pub host_share: Option<Box<dyn Fn() -> Result<(), String>>>,
+    /// Web, framed by a page (`?host=parent`): the name of the file the page opened in the frame.
+    /// The page shares that file, so Share is offered only while the window shows it.
+    pub host_file: Option<String>,
     /// Web: told whether the document has unsaved changes after each pass, for the browser's
     /// leave-page guard (`beforeunload` runs between frames and can't ask the app).
     pub on_dirty: Option<Box<dyn Fn(bool)>>,

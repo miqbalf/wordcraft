@@ -184,8 +184,10 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
         _ => {
             let Some(id) = p.get("command").or(p.get("id")).and_then(Value::as_str) else { return err("missing `command`") };
             let params = p.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}));
-            if let Some(r) = app.share_with_host(id) {
-                return reply::<String, String>(Ok(r));
+            // The hosting page shares only the file it opened, which is the active document when
+            // it is shown at all; another open document is never that file.
+            if id == "file.share" && app.host_shares() {
+                return err(tl!("Share works only for the file opened from Nextcloud."));
             }
             if id.starts_with("ui.") {
                 return err(format!("`{id}` works on the window: make the document active first (view.switchWindows {{\"id\": {doc}}})"));

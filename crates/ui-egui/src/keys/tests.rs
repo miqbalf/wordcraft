@@ -1632,7 +1632,9 @@ fn every_share_entry_point_asks_a_hosting_page() {
                 Ok(())
             }));
         }
+        services.host_file = Some("Plan.docx".into());
         let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Text")), services);
+        a.session.path = Some("Plan.docx".into());
         a.session.keymap = wordcraft_engine::keymap::KeyMap::from_value(&json!({"assigned": {"Mod+Shift+F12": "file.share"}}));
         let ctx = egui::Context::default();
         let mut entries = 0;
@@ -1656,4 +1658,28 @@ fn every_share_entry_point_asks_a_hosting_page() {
             assert_eq!(asked.get(), 0);
         }
     }
+}
+
+/// The page shares the file it opened in the frame. Another document in the window (a new one, or
+/// the opened file saved under another name) is not that file: Share says so and asks nothing.
+#[test]
+fn share_is_only_for_the_file_the_page_opened() {
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut services = crate::Services::default();
+    let counter = asked.clone();
+    services.host_share = Some(Box::new(move || {
+        counter.set(counter.get() + 1);
+        Ok(())
+    }));
+    services.host_file = Some("Plan.docx".into());
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Text")), services);
+    for other in [None, Some("Plan copy.docx")] {
+        a.session.path = other.map(Into::into);
+        assert!(a.run("file.share", json!({})).is_err(), "{other:?}: refused with the reason");
+        assert!(!a.host_share_offered());
+    }
+    assert_eq!(asked.get(), 0, "the page is not asked to share another file");
+    a.session.path = Some("Plan.docx".into());
+    assert!(a.run("file.share", json!({})).is_ok());
+    assert_eq!(asked.get(), 1);
 }
