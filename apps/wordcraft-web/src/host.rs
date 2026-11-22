@@ -110,6 +110,8 @@ pub enum HostEvent {
     Font(String, Vec<u8>),
     /// The host shares files itself ([`Bridge::apply_share`]).
     Share,
+    /// The host opened this file in the frame (the name it is shared under).
+    Opened(String),
 }
 
 pub type HostEvents = Rc<RefCell<Vec<HostEvent>>>;
@@ -312,7 +314,11 @@ impl Bridge {
     fn listen(&self, inbox: Inbox, ctx: egui::Context, saves: AsyncSaves, events: HostEvents) {
         let bridge = self.clone();
         self.host.listen(move |message| match message {
-            Message::Open { name, data } => deliver_open(&inbox, &ctx, &name, &data),
+            Message::Open { name, data } => {
+                if let Some(name) = deliver_open(&inbox, &ctx, &name, &data) {
+                    events.borrow_mut().push(HostEvent::Opened(name));
+                }
+            }
             Message::Host { saves: stores, .. } => {
                 if stores {
                     bridge.saves.set(true);
@@ -425,18 +431,20 @@ fn fetch_fonts(fonts: Vec<craft_web_host::FontRef>, events: HostEvents, ctx: egu
 /// file. A host's file is untrusted input: an oversized one is refused before it is copied into
 /// the app's memory (the data's own length, not the host's claim). The crate has cleaned the name
 /// (and cut it to 255 characters); a blank one comes as `document` and becomes `Document.docx`.
-fn deliver_open(inbox: &Inbox, ctx: &egui::Context, name: &str, data: &FileData) {
+/// Returns the name it is opened under, or `None` when it was refused.
+fn deliver_open(inbox: &Inbox, ctx: &egui::Context, name: &str, data: &FileData) -> Option<String> {
     let name = if name == "document" { DEFAULT_NAME } else { name }.to_string();
     let FileData::Bytes(array) = data else {
         log::warn!("host file {name} came as a File; WordCraft reads bytes only; not opened");
-        return;
+        return None;
     };
     if data.size() > MAX_OPEN_BYTES as f64 {
         log::warn!("host file is {} bytes, over the {} MiB host open limit; not opened", data.size(), MAX_OPEN_BYTES >> 20);
-        return;
+        return None;
     }
-    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, array.to_vec()));
+    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name.clone(), array.to_vec()));
     ctx.request_repaint();
+    Some(name)
 }
 
 /// What the parent's `live` messages brought, for the next frame.
@@ -501,6 +509,7 @@ impl Live {
             .and_then(|hub| app.start_live(Box::new(hub), &message.room, bytes, &message.file_name, access));
         match started {
             Ok(()) => {
+                app.services.host_file = Some(message.file_name.clone());
                 self.joining.borrow_mut().joined(&message.room, access);
                 if let Some(ticket) = self.pending.take() {
                     app.live_refresh_ticket(ticket);

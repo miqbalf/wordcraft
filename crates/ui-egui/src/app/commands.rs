@@ -382,11 +382,6 @@ impl WordApp {
         }
     }
 
-    /// User commands can ask for a supported Save As target or an opening password (#55).
-    /// Scripts and agents use [`WordApp::execute`], which never opens these dialogs.
-    /// Framed by a page that shares files itself ([`Services::host_share`], Nextcloud): Share
-    /// (`file.share`, from the ribbon, a shortcut, command search or automation) is that page's
-    /// sharing, never an exported copy. `None` for another command or without such a page.
     /// The one host-share hook: whether a host shares files ([`Services::host_share`]). A web page
     /// (`share: true`) sets it today; a desktop host that shares through Nextcloud can set the same
     /// hook later, and every Share entry point follows without other changes.
@@ -394,13 +389,32 @@ impl WordApp {
         self.services.host_share.is_some()
     }
 
+    /// Framed by a page that shares files itself ([`Services::host_share`], Nextcloud): Share
+    /// (`file.share`, from the ribbon, a shortcut, command search or automation) is that page's
+    /// sharing, never an exported copy. `None` for another command or without such a page.
+    ///
+    /// The page shares the one file it opened in the frame, whatever document the window shows:
+    /// a document opened or made inside the frame is not that file, so Share is not offered for it
+    /// (see [`WordApp::host_share_offered`]) and is refused here.
     pub(crate) fn share_with_host(&self, id: &str) -> Option<Result<Value, String>> {
         if id != "file.share" {
             return None;
         }
         let share = self.services.host_share.as_ref()?;
+        if !self.host_share_offered() {
+            return Some(Err(tl!("Share works only for the file opened from Nextcloud.").to_string()));
+        }
         Some(share().map(|()| json!({"shared": "host"})))
     }
+
+    /// Whether Share can send the shown document to the host: it is the file the host opened in the
+    /// frame (the document's file name is still the host's), not a new or other document.
+    pub fn host_share_offered(&self) -> bool {
+        self.host_shares() && self.services.host_file.as_deref().is_some_and(|f| self.session.path.as_deref().and_then(|p| p.file_name()).is_some_and(|n| n.to_string_lossy() == f))
+    }
+
+    /// User commands can ask for a supported Save As target or an opening password (#55).
+    /// Scripts and agents use [`WordApp::execute`], which never opens these dialogs.
 
     pub(crate) fn execute_user(&mut self, id: &str, params: Value) -> Result<Value, String> {
         // Legacy Word files are import-only (#2445). Only a user's implicit Save asks for

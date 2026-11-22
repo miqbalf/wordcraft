@@ -181,6 +181,7 @@ impl eframe::App for WebShell {
         for event in arrived {
             match event {
                 crate::host::HostEvent::Saves | crate::host::HostEvent::Share => {}
+                crate::host::HostEvent::Opened(name) => self.app.services.host_file = Some(name),
                 crate::host::HostEvent::FontsComing(coming) => self.app.host_fonts_coming(coming),
                 crate::host::HostEvent::Font(file, bytes) => {
                     if let Err(e) = self.app.install_host_font(&file, &bytes) {
