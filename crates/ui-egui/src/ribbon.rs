@@ -221,17 +221,15 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, share));
                             // Framed by a page that shares files itself (Nextcloud), Share asks that
                             // page; elsewhere it exports a copy to send.
-                            let hosted = app.services.host_share.is_some();
+                            let hosted = app.host_shares();
                             let tip = if hosted { tl!("Share with people in Nextcloud") } else { tl!("Export a copy to share (PDF, Word document)") };
                             if resp.on_hover_text(tip).clicked() {
-                                match app.services.host_share.as_ref().map(|share| share()) {
-                                    Some(Ok(())) => {}
-                                    Some(Err(e)) => {
-                                        app.status_long(crate::i18n::fmt(tl!("Couldn't open sharing: {error}"), &[("error", e.as_str())]))
+                                if hosted {
+                                    if let Err(e) = app.run("file.share", json!({})) {
+                                        app.status_long(crate::i18n::fmt(tl!("Couldn't open sharing: {error}"), &[("error", e.as_str())]));
                                     }
-                                    None => {
-                                        let _ = app.run("ui.backstage", json!({"value": true, "page": "export"}));
-                                    }
+                                } else {
+                                    let _ = app.run("ui.backstage", json!({"value": true, "page": "export"}));
                                 }
                             }
                             ui.add_space(6.0);
