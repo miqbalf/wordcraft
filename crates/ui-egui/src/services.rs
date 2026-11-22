@@ -75,6 +75,10 @@ pub struct Services {
     /// "Couldn't save to Nextcloud: {error}". Without it, `host_save` returns at once and the
     /// document is marked saved when it returns.
     pub host_confirms_saves: bool,
+    /// Web, framed by a page that shares files itself (`?host=parent` whose `host` says `share`,
+    /// such as Nextcloud): the ribbon's Share asks that page to share the open document instead
+    /// of opening Export. An error means the page didn't get the request.
+    pub host_share: Option<Box<dyn Fn() -> Result<(), String>>>,
     /// Web: told whether the document has unsaved changes after each pass, for the browser's
     /// leave-page guard (`beforeunload` runs between frames and can't ask the app).
     pub on_dirty: Option<Box<dyn Fn(bool)>>,

@@ -1303,3 +1303,50 @@ fn a_labelled_split_button_shows_only_its_icon_when_compact() {
         }
     }
 }
+
+/// Framed by a page that shares files itself (`Services::host_share`, Nextcloud): Share asks that
+/// page to share the document and says so in its tooltip; it does not open Export. Without the
+/// hook (the desktop, a plain web page), Share opens Export as before.
+#[test]
+fn share_asks_a_hosting_page_that_shares_files() {
+    use egui_kittest::kittest::Queryable;
+    for hosted in [false, true] {
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut services = crate::Services::default();
+        if hosted {
+            let asked = asked.clone();
+            services.host_share = Some(Box::new(move || {
+                asked.set(asked.get() + 1);
+                Ok(())
+            }));
+        }
+        let app = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Text")), services);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, tl!("Share")).hover();
+        h.run_steps(60);
+        let (shown, hidden) = if hosted {
+            (tl!("Share with people in Nextcloud"), tl!("Export a copy to share (PDF, Word document)"))
+        } else {
+            (tl!("Export a copy to share (PDF, Word document)"), tl!("Share with people in Nextcloud"))
+        };
+        assert!(h.query_by_label(shown).is_some(), "hosted {hosted}: the tooltip says what Share does");
+        assert!(h.query_by_label(hidden).is_none(), "hosted {hosted}: not the other tooltip");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, tl!("Share")).click();
+        h.run_steps(3);
+        if hosted {
+            assert_eq!(asked.get(), 1, "one click asks the page once");
+            assert!(!h.state().ui.backstage, "the export flow stays closed");
+        } else {
+            assert_eq!(asked.get(), 0);
+            assert!(h.state().ui.backstage && h.state().ui.backstage_page == "export", "Share opens Export");
+        }
+    }
+}

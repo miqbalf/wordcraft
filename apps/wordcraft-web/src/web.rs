@@ -175,11 +175,12 @@ impl eframe::App for WebShell {
         self.live.frame(&mut self.app, &self.live_events);
         if let Some(bridge) = &self.bridge {
             bridge.apply_saves(&mut self.app.services, &self.saves);
+            bridge.apply_share(&mut self.app.services);
         }
         let arrived = std::mem::take(&mut *self.host_events.borrow_mut());
         for event in arrived {
             match event {
-                crate::host::HostEvent::Saves => {}
+                crate::host::HostEvent::Saves | crate::host::HostEvent::Share => {}
                 crate::host::HostEvent::FontsComing(coming) => self.app.host_fonts_coming(coming),
                 crate::host::HostEvent::Font(file, bytes) => {
                     if let Err(e) = self.app.install_host_font(&file, &bytes) {
