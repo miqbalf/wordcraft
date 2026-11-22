@@ -220,11 +220,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                             }
                             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, share));
                             // Share only shares through Nextcloud: the hosting page, or the browser at
-                            // the synced file's sharing; with no Nextcloud the status bar says so.
-                            if resp.on_hover_text(tl!("Share with people in Nextcloud")).clicked()
-                                && let Err(e) = app.run("file.share", json!({}))
-                            {
-                                app.status_long(e);
+                            // the synced file's sharing; with no Nextcloud, or a failed request, the
+                            // status bar says so (`WordApp::share_file`).
+                            if resp.on_hover_text(tl!("Share with people in Nextcloud")).clicked() {
+                                let _ = app.run("file.share", json!({}));
                             }
                             ui.add_space(6.0);
                             let track = app.session.doc.settings.track_changes;

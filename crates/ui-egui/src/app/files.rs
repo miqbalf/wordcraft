@@ -528,10 +528,17 @@ impl WordApp {
         let Some(inbox) = self.services.host_open.clone() else { return };
         let files = std::mem::take(&mut *inbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
         for (name, bytes) in files {
+            // One file per frame: a second one beside it would take Save and Share away from
+            // the file the page now shows.
+            if self.host_document.is_some_and(|d| self.session.is_open(d)) {
+                self.status_long(tl!(super::commands::HOSTED_ONE_FILE));
+                continue;
+            }
             self.opening_from_host = true;
             let r = self.run("file.open", json!({"path": name, "data": wordcraft_engine::cmd::insert::base64_encode(&bytes)}));
             self.opening_from_host = false;
             if r.is_ok() {
+                self.host_document = Some(self.session.document_id());
                 self.ui.backstage = false;
             }
         }

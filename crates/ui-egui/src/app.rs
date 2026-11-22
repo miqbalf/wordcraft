@@ -165,6 +165,7 @@ impl WordApp {
             windows: windows::Windows::new(shown_document),
             print_document: None,
             opening_from_host: false,
+            host_document: None,
             canvas,
             controls,
             dialog,

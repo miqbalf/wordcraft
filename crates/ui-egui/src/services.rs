@@ -76,12 +76,9 @@ pub struct Services {
     /// document is marked saved when it returns.
     pub host_confirms_saves: bool,
     /// Web, framed by a page that shares files itself (`?host=parent` whose `host` says `share`,
-    /// such as Nextcloud): Share asks that page to open its sharing for the file it opened
-    /// ([`Self::host_file`]). An error means the page didn't get the request.
+    /// such as Nextcloud): Share asks that page to open its sharing for the document it sent
+    /// ([`WordApp::host_document`]). An error means the page didn't get the request.
     pub host_share: Option<Box<dyn Fn() -> Result<(), String>>>,
-    /// Web, framed by a page (`?host=parent`): the name of the file the page opened in the frame.
-    /// The page shares that file, so Share goes to the page only while the window shows it.
-    pub host_file: Option<String>,
     /// Desktop: where Share goes for a document saved at this path (`craft_share::desktop_route`:
     /// the Nextcloud account whose synced folder holds it, else no Nextcloud). Without it, and
     /// without [`Self::host_share`], Share says "No Nextcloud connected".

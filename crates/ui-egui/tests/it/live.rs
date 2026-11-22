@@ -664,3 +664,26 @@ fn hosted_save_as_page_while_live_offers_the_export_formats_and_no_refusal() {
     assert_eq!(*copies.borrow(), ["plan.odt".to_string()], "the chosen format downloads");
     assert_eq!(other.get(), 0);
 }
+
+/// Hosted and live, another document shown in the window ends the link for the page's file.
+/// Shown again, that file still belongs to the room: Save stays refused (no plain save to a page
+/// in live mode), and a copy still downloads.
+#[test]
+fn hosted_live_file_shown_again_after_another_document_still_refuses_save() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
+    let (services, copies, other) = hosted();
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    let live = h.state().session.document_id();
+    h.state_mut().session.add_document(Document::from_text("Letters"));
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert!(h.state().live_link().is_none(), "the link stopped");
+    h.state_mut().session.switch_document(live).unwrap();
+    h.step();
+    assert!(h.state_mut().run("file.save", json!({})).is_err(), "Save stays refused for the room's file");
+    assert_eq!(other.get(), 0, "nothing went to the page");
+    h.state_mut().run("file.saveAs", json!({"path": "plan.odt"})).unwrap();
+    assert_eq!(copies.borrow().last().map(String::as_str), Some("plan.odt"), "a copy still downloads");
+}

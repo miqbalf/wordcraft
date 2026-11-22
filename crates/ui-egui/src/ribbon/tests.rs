@@ -1321,9 +1321,9 @@ fn share_button_only_shares_through_nextcloud() {
                 Ok(())
             }));
         }
-        services.host_file = Some("Plan.docx".into());
         let mut app = WordApp::new(Session::new(wordcraft_doc::Document::from_text("Text")), services);
         app.session.path = Some("Plan.docx".into());
+        app.host_document = Some(app.session.document_id());
         let mut h = egui_kittest::Harness::builder().with_size(vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
             |ui, app: &mut WordApp| {
                 let ctx = ui.ctx().clone();

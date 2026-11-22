@@ -469,9 +469,12 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
             let w = text_width(ui.painter(), &shown, &font, track, t.text);
             if available > 24.0 {
                 let rect = Rect::from_center_size(pos2(cx, full.center().y), vec2(w + 8.0, control_h));
-                let response = ui.interact(rect, ui.scope_id().with("document_name"), Sense::click()).on_hover_text(tl!("Rename Document"));
-                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &title));
-                if response.clicked() {
+                // Hosted, the page names the file: the title is only a title.
+                let renames = !app.hosted_hides("file.rename");
+                let response = ui.interact(rect, ui.scope_id().with("document_name"), if renames { Sense::click() } else { Sense::hover() });
+                let response = if renames { response.on_hover_text(tl!("Rename Document")) } else { response };
+                response.widget_info(|| egui::WidgetInfo::labeled(if renames { egui::Role::Button } else { egui::Role::Label }, true, &title));
+                if renames && response.clicked() {
                     let _ = app.run("file.rename", json!({}));
                 }
 

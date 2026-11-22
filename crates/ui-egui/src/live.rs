@@ -41,9 +41,9 @@ pub const ENDED_UNSAVED_BECAUSE: &str = "Live editing ended. Download a copy to 
 pub const NOT_SAVING: &str = "Changes are not being saved right now. Download a copy to keep them.";
 /// Save and Save As while live: the document service writes the file for everyone.
 pub const SAVED_FOR_YOU: &str = "While the file is edited live, it is saved for everyone automatically.";
-/// The status line after Save As downloaded a copy of a document whose live session ended.
 /// The notice when another document is shown in the window and the live link stops.
 pub const LEFT_LIVE: &str = "Another document is shown, so this file is no longer edited live here. Reopen the file to edit it live.";
+/// The status line after Save As downloaded a copy of a document whose live session ended.
 pub const COPY_DOWNLOADED: &str = "A copy was downloaded. Check it, then reopen the file.";
 /// How often the host hears the state when nothing changed, in milliseconds.
 const REPORT_MS: f64 = 1000.0;
@@ -92,6 +92,10 @@ pub enum LiveMode {
     Linked(Box<LiveLink>),
     /// The room speaks a newer protocol: nothing is shared and nothing may be edited.
     Newer,
+    /// The link stopped because another document was shown ([`LEFT_LIVE`]). `document` (the
+    /// room's file) still belongs to the room, whose page saves it: Save stays refused for it,
+    /// and copies stay allowed.
+    Left { document: u64 },
 }
 
 /// A running link and what the window keeps about it.
@@ -181,6 +185,8 @@ impl WordApp {
             self.sync_document();
         }
         let document = self.session.document_id();
+        // The room's file is the page's document: its Share asks the page.
+        self.host_document = Some(document);
         self.live = Some(LiveMode::Linked(Box::new(LiveLink {
             editing,
             document,
@@ -330,6 +336,8 @@ impl WordApp {
                 _ => link.editing.allows(id),
             },
             Some(LiveMode::Newer) => self.session.registry.get(id).is_none_or(|spec| !spec.mutates),
+            // A plain save of the room's file would go round the page's live save.
+            Some(LiveMode::Left { document }) => id != "file.save" || self.session.document_id() != *document,
         }
     }
 
@@ -350,6 +358,7 @@ impl WordApp {
             Some(LiveMode::Linked(_)) if unsaved_live => tl!(NOT_SAVING),
             Some(LiveMode::Linked(_)) if dirty => tl!(ENDED_UNSAVED),
             Some(LiveMode::Linked(_)) => tl!(ENDED),
+            Some(LiveMode::Left { .. }) => tl!(LEFT_LIVE),
             _ => tl!(NEWER),
         };
         self.status_long(why);
@@ -378,7 +387,9 @@ impl WordApp {
         if self.session.document_id() != link.document {
             // Another document is shown: this one is no longer edited live.
             if let Some(LiveMode::Linked(old)) = self.live.take() {
+                let document = old.document;
                 old.editing.stop(&mut self.session);
+                self.live = Some(LiveMode::Left { document });
             }
             self.status_long(tl!(LEFT_LIVE));
             return;
@@ -389,6 +400,9 @@ impl WordApp {
         // (the window follows it on its own, as after any command).
         if self.session.document_id() != document {
             link.document = self.session.document_id();
+            if self.host_document == Some(document) {
+                self.host_document = Some(link.document);
+            }
         }
         let mut notices: Vec<String> = link.editing.take_notices().iter().map(|n| tl!(n.as_str()).to_string()).collect();
         if let LiveStatus::Live { saved_at: Some(etag) } = link.editing.status()
@@ -442,6 +456,8 @@ impl WordApp {
         let link = match &self.live {
             None => return None,
             Some(LiveMode::Newer) => return Some((tl!(NEWER).to_string(), None)),
+            Some(LiveMode::Left { document }) if self.session.document_id() == *document => return Some((tl!(LEFT_LIVE).to_string(), None)),
+            Some(LiveMode::Left { .. }) => return None,
             Some(LiveMode::Linked(link)) => link,
         };
         Some(match link.editing.status() {

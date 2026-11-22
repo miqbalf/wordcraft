@@ -5475,6 +5475,90 @@ fn hosted_frames_leave_opening_creating_and_closing_to_the_page() {
     assert!(!crate::backstage::hosted_hides_page(&b, "open"));
 }
 
+/// Hosted, the frame edits the one document the page sent. A second `open` from the page does
+/// not open beside it (whose Save would write over the page's current file): it is refused
+/// with a reason, and Save still writes the page's document.
+#[test]
+fn hosted_a_second_open_from_the_page_is_refused() {
+    let (mut a, handed, _) = hosted_app("plan.docx");
+    let document = a.session.document_id();
+    let docx = wordcraft_engine::io::save_bytes("other.docx", &typed().session.doc).unwrap();
+    a.services.host_open.as_ref().unwrap().lock().unwrap().push(("other.docx".into(), docx));
+    a.drain_inbox();
+    assert_eq!(a.session.document_id(), document, "the second file did not open");
+    assert_eq!(a.session.documents().len(), 1, "nothing opened beside it");
+    assert_eq!(
+        a.status_msg.as_ref().map(|(m, _)| m.as_str()),
+        Some("This window already edits a file from Nextcloud. Open other files from Nextcloud Files.")
+    );
+    a.run("file.save", json!({})).unwrap();
+    assert_eq!(*handed.borrow(), [("plan.docx".to_string(), false)]);
+}
+
+/// Hosted, only the document the page sent saves to the page, by identity: another document
+/// shown in the frame (here one with a file name of its own, as a mail merge result saved under
+/// a name) never does; its Save is a downloaded copy.
+#[test]
+fn hosted_save_goes_to_the_page_only_for_the_pages_document() {
+    let (mut a, handed, copies) = hosted_app("plan.docx");
+    let page = a.session.document_id();
+    a.session.add_document(typed().session.doc.clone());
+    a.session.path = Some("letters.docx".into());
+    a.run("file.save", json!({})).unwrap();
+    assert!(handed.borrow().is_empty(), "another document never reaches the page: {:?}", handed.borrow());
+    assert_eq!(copy_names(&copies), ["letters.docx"], "it downloads");
+    a.session.switch_document(page).unwrap();
+    a.run("file.save", json!({})).unwrap();
+    assert_eq!(*handed.borrow(), [("plan.docx".to_string(), false)]);
+}
+
+/// Hosted, the page names the file: Rename and Close Document are hidden and refused, so the
+/// frame's document stays the page's file (Save and Share follow it).
+#[test]
+fn hosted_rename_and_close_document_are_the_pages() {
+    let (mut a, handed, _) = hosted_app("plan.docx");
+    for id in ["file.rename", "file.closeDocument"] {
+        assert!(a.hosted_hides(id) && !crate::widgets::enabled(&a, id), "{id} is hidden");
+    }
+    assert!(a.run("file.rename", json!({"name": "Budget"})).is_err());
+    assert!(a.run("file.closeDocument", json!({})).is_err());
+    assert!(control_execute(&mut a, json!({"command": "file.rename", "params": {"name": "Budget"}}))["ok"] == false);
+    assert_eq!(a.session.path.as_deref(), Some(std::path::Path::new("plan.docx")), "the name is unchanged");
+    assert!(a.has_document(), "the document is still open");
+    a.run("file.save", json!({})).unwrap();
+    assert_eq!(*handed.borrow(), [("plan.docx".to_string(), false)]);
+}
+
+/// Hosted, automation aimed at another open document gets the frame's refusals too: it can't
+/// open, create or close files there, and can't save one (Save, Save As, exports) except from
+/// the window, where Save goes to the page only for the page's document.
+#[test]
+fn hosted_commands_on_another_document_get_the_same_refusals() {
+    let (mut a, handed, copies) = hosted_app("plan.docx");
+    let page = a.session.document_id();
+    a.session.add_document(typed().session.doc.clone());
+    let other = a.session.document_id();
+    a.session.switch_document(page).unwrap();
+    let dir = scratch("hosted-other-doc");
+    let path = |n: &str| dir.join(n).to_string_lossy().into_owned();
+    for (id, params) in [
+        ("file.open", json!({"path": "x.docx", "data": ""})),
+        ("file.new", json!({})),
+        ("file.saveAs", json!({"path": path("letters.docx")})),
+        ("file.save", json!({"path": path("letters.docx")})),
+        ("file.exportPdf", json!({"path": path("letters.pdf")})),
+        ("file.rename", json!({"name": "Budget"})),
+    ] {
+        let r = control_execute(&mut a, json!({"command": id, "params": params, "doc": other}));
+        assert_eq!(r["ok"], false, "{id}: {r}");
+    }
+    a.session.switch_document(other).unwrap();
+    assert_eq!(a.session.path, None, "the other document took no file name");
+    assert!(handed.borrow().is_empty() && copies.borrow().is_empty());
+    assert!(!dir.join("letters.docx").exists() && !dir.join("letters.pdf").exists(), "nothing was written");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Macro-enabled documents and templates keep everything (#172), so once saved in this
 /// session AutoSave covers them like a .docx.
 #[test]

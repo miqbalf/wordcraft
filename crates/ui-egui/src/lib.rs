@@ -692,6 +692,10 @@ pub struct WordApp {
     pub recipient_list_pending: bool,
     /// Hosted: the document the page sent is being opened, which `file.open` allows then only.
     pub(crate) opening_from_host: bool,
+    /// Hosted: the open document the page sent (by document id), set when the page's `open`
+    /// arrives or its live session starts. Only this document's Save goes to the page and only
+    /// its Share asks the page; the frame takes no second file from the page.
+    pub host_document: Option<u64>,
     /// The font database's [`generation`](wordcraft_fonts::FontDb::generation) last seen: when
     /// fonts are added or removed (by any route) the font lists and the layout are refreshed.
     font_generation: u64,

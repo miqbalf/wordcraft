@@ -187,9 +187,19 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
             // Share for this document's own file, through the same function as the window's.
             if id == "file.share" {
                 return match app.session.with_document(doc, |s| s.path.clone()) {
-                    Ok(path) => reply(Ok::<_, String>(app.share_file(path.as_deref()))),
+                    Ok(path) => reply(Ok::<_, String>(app.share_file(doc, path.as_deref()))),
                     Err(e) => err(e),
                 };
+            }
+            // Hosted, the same refusals as the window's: the page opens, creates, names and
+            // closes files ...
+            if let Some(Err(e)) = app.hosted_refusal(id) {
+                return err(e);
+            }
+            // ... and a document's file is written only from the window, where Save goes to the
+            // page for the page's document alone and everything else downloads a copy.
+            if app.services.hosted && writes_a_file(id) {
+                return err(format!("`{id}` saves a file: make the document active first (view.switchWindows {{\"id\": {doc}}})"));
             }
             if id.starts_with("ui.") {
                 return err(format!("`{id}` works on the window: make the document active first (view.switchWindows {{\"id\": {doc}}})"));
@@ -431,4 +441,10 @@ fn handle_request(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) 
             }
         }
     }
+}
+
+/// Commands that write the document out to a file (Save, Save As, a template, the exports,
+/// Save these pages as PDF).
+fn writes_a_file(id: &str) -> bool {
+    matches!(id, "file.save" | "file.saveAs" | "file.saveTemplate" | "file.printPdf") || id.starts_with("file.export")
 }

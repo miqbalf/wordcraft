@@ -1643,7 +1643,6 @@ fn share_app(via: Via, asked: &std::rc::Rc<Asked>) -> WordApp {
                 asked.page.set(asked.page.get() + 1);
                 Ok(())
             }));
-            services.host_file = Some("Plan.docx".into());
         }
         Via::Desktop | Via::Nowhere => {
             let asked = asked.clone();
@@ -1662,6 +1661,10 @@ fn share_app(via: Via, asked: &std::rc::Rc<Asked>) -> WordApp {
     }
     let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Text")), services);
     a.session.path = Some(if matches!(via, Via::Page) { "Plan.docx".into() } else { "/home/alice/Nextcloud/Docs/Plan.docx".into() });
+    if matches!(via, Via::Page) {
+        // The document the page sent.
+        a.host_document = Some(a.session.document_id());
+    }
     a
 }
 
@@ -1751,14 +1754,17 @@ fn share_on_another_open_document_shares_that_documents_file() {
     }
 }
 
-/// The page shares the file it opened in the frame. Another document in the window (a new one, or
-/// the opened file saved under another name) is not that file: Share says "No Nextcloud
-/// connected" and asks nothing.
+/// The page shares the document it sent to the frame, by identity. Another document in the
+/// window (a new one, or one with a file name of its own) is not that file: Share says "No
+/// Nextcloud connected" and asks nothing. The page's document keeps Share whatever its name
+/// (a legacy .doc saved as .docx).
 #[test]
 fn share_is_only_for_the_file_the_page_opened() {
     let asked = std::rc::Rc::new(Asked::default());
     let mut a = share_app(Via::Page, &asked);
-    for other in [None, Some("Plan copy.docx")] {
+    let page = a.session.document_id();
+    a.session.add_document(wordcraft_doc::Document::from_text("Other"));
+    for other in [None, Some("Plan.docx")] {
         a.session.path = other.map(Into::into);
         assert_eq!(a.share_route(), craft_share::ShareRoute::None, "{other:?}");
         let r = a.run("file.share", json!({})).unwrap();
@@ -1766,10 +1772,13 @@ fn share_is_only_for_the_file_the_page_opened() {
         assert_eq!(a.status_msg.take().map(|m| m.0).as_deref(), Some(tl!(craft_share::NO_NEXTCLOUD)));
     }
     assert_eq!(asked.page.get(), 0, "the page is not asked to share another file");
+    a.session.switch_document(page).unwrap();
     a.session.path = Some("Plan.docx".into());
     assert_eq!(a.share_route(), craft_share::ShareRoute::NextcloudWebHost);
     assert_eq!(a.run("file.share", json!({})), Ok(json!({"shared": "host"})));
-    assert_eq!(asked.page.get(), 1);
+    a.session.path = Some("Plan (converted).docx".into());
+    assert_eq!(a.run("file.share", json!({})), Ok(json!({"shared": "host"})), "the same document under a new name");
+    assert_eq!(asked.page.get(), 2);
 }
 
 /// A plain web page (no hosting page) and a desktop build without the lookup have no Nextcloud:
@@ -1789,13 +1798,29 @@ fn share_without_nextcloud_only_says_so() {
 /// A page that failed to get the request: Share says it couldn't open sharing.
 #[test]
 fn share_says_when_the_page_did_not_get_the_request() {
-    let services = crate::Services {
-        host_share: Some(Box::new(|| Err("no same-origin parent".into()))),
-        host_file: Some("Plan.docx".into()),
-        ..Default::default()
-    };
+    let services = crate::Services { host_share: Some(Box::new(|| Err("no same-origin parent".into()))), ..Default::default() };
     let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Text")), services);
     a.session.path = Some("Plan.docx".into());
+    a.host_document = Some(a.session.document_id());
     let e = a.run("file.share", json!({})).unwrap_err();
     assert!(e.contains("no same-origin parent"), "{e}");
+    // Every entry point says so on the status bar, not only the ribbon's button.
+    a.session.keymap = wordcraft_engine::keymap::KeyMap::from_value(&json!({"assigned": {"Mod+Shift+F12": "file.share"}}));
+    for entry in ["run", "shortcut", "control channel"] {
+        a.status_msg = None;
+        match entry {
+            "run" => {
+                let _ = a.run("file.share", json!({}));
+            }
+            "shortcut" => {
+                dispatch(&mut a, Key::F12, Modifiers { ctrl: true, command: true, shift: true, ..Default::default() });
+            }
+            _ => {
+                let (req, _rx) = crate::ControlRequest::new("command", json!({"command": "file.share"}));
+                let _ = crate::control::handle(&mut a, &egui::Context::default(), &req);
+            }
+        }
+        let shown = a.status_msg.as_ref().map(|m| m.0.clone()).unwrap_or_default();
+        assert!(shown.contains("no same-origin parent"), "{entry}: {shown:?}");
+    }
 }

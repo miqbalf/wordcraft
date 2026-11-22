@@ -132,9 +132,10 @@ impl WordApp {
     }
 
     /// Hosted (`Services::hosted`): whether a web save goes to the page. Only a plain Save of the
-    /// document the page sent does, under the name Save gives it; everything else is a copy.
+    /// document the page sent ([`WordApp::host_document`]) does, under the name Save gives it; everything else is a copy.
     fn hosted_save_goes_to_page(&self, id: &str, params: &Value) -> bool {
         id == "file.save"
+            && self.host_document == Some(self.session.document_id())
             && self.session.path.is_some()
             && params.get("path").and_then(Value::as_str).is_none_or(|p| p == self.web_save_name("file.save"))
     }
@@ -468,23 +469,21 @@ impl WordApp {
 
     /// Where Share goes for the shown document ([`WordApp::share_route_for`]).
     pub fn share_route(&self) -> ShareRoute {
-        self.share_route_for(self.session.path.as_deref())
+        self.share_route_for(self.session.document_id(), self.session.path.as_deref())
     }
 
-    /// Where Share goes for the document saved at `path` (`None`: untitled), from the one hook
-    /// the platform set:
+    /// Where Share goes for open document `document`, saved at `path` (`None`: untitled), from
+    /// the one hook the platform set:
     /// - web, framed by a Nextcloud page that shares files ([`Services::host_share`]): that page,
-    ///   but only for the file it opened in the frame ([`Services::host_file`]). A document
-    ///   opened or made inside the frame is not that file;
+    ///   but only for the document it sent ([`WordApp::host_document`]). Another document in the
+    ///   frame is not the page's file;
     /// - desktop ([`Services::share_route`]): the Nextcloud account whose synced folder holds the
     ///   file;
     /// - anything else (a plain web page, an untitled document, a file outside every synced
     ///   folder): [`ShareRoute::None`].
-    pub fn share_route_for(&self, path: Option<&std::path::Path>) -> ShareRoute {
+    pub fn share_route_for(&self, document: u64, path: Option<&std::path::Path>) -> ShareRoute {
         if self.services.host_share.is_some() {
-            let name = path.and_then(|p| p.file_name()).map(|n| n.to_string_lossy());
-            let opened = self.services.host_file.as_deref().is_some_and(|f| name.as_deref() == Some(f));
-            return if opened { ShareRoute::NextcloudWebHost } else { ShareRoute::None };
+            return if self.host_document == Some(document) { ShareRoute::NextcloudWebHost } else { ShareRoute::None };
         }
         match (&self.services.share_route, path) {
             (Some(route), Some(path)) => route(path),
@@ -495,19 +494,27 @@ impl WordApp {
     /// Share the shown document: the one function every Share entry point runs (`file.share`
     /// from the ribbon, command search, a shortcut, automation).
     pub(crate) fn share(&mut self) -> Result<Value, String> {
-        let path = self.session.path.clone();
-        self.share_file(path.as_deref())
+        let (document, path) = (self.session.document_id(), self.session.path.clone());
+        self.share_file(document, path.as_deref())
     }
 
-    /// Share the document saved at `path` through Nextcloud, and do nothing else: never an
-    /// export, a download or a dialog. The hosting page opens its sharing for the file; on the
-    /// desktop the browser opens the file's sharing in Nextcloud Files; with no Nextcloud the
-    /// status bar says "No Nextcloud connected".
-    pub(crate) fn share_file(&mut self, path: Option<&std::path::Path>) -> Result<Value, String> {
-        match self.share_route_for(path).action() {
+    /// Share open document `document`, saved at `path`, through Nextcloud, and do nothing else:
+    /// never an export, a download or a dialog. The hosting page opens its sharing for the file;
+    /// on the desktop the browser opens the file's sharing in Nextcloud Files; with no Nextcloud
+    /// the status bar says "No Nextcloud connected". A page that didn't get the request is said
+    /// on the status bar too, whichever entry point asked.
+    pub(crate) fn share_file(&mut self, document: u64, path: Option<&std::path::Path>) -> Result<Value, String> {
+        match self.share_route_for(document, path).action() {
             ShareAction::PostToHost => {
-                let post = self.services.host_share.as_ref().ok_or_else(|| tl!(craft_share::NO_NEXTCLOUD).to_string())?;
-                post().map_err(|e| i18n::fmt(tl!("Couldn't open sharing: {error}"), &[("error", e.as_str())]))?;
+                let posted = match self.services.host_share.as_ref() {
+                    Some(post) => post(),
+                    None => Err(tl!(craft_share::NO_NEXTCLOUD).to_string()),
+                };
+                if let Err(e) = posted {
+                    let message = i18n::fmt(tl!("Couldn't open sharing: {error}"), &[("error", e.as_str())]);
+                    self.status_long(message.clone());
+                    return Err(message);
+                }
                 Ok(json!({"shared": "host"}))
             }
             ShareAction::OpenUrl(url) => {
@@ -1317,10 +1324,14 @@ fn add_saved(r: &mut Value, saved: Option<Result<(), String>>) {
 
 /// Hosted (`Services::hosted`): the commands the framing page does instead (it opens, creates and
 /// closes files), hidden and refused in the frame.
-pub(crate) const HOSTED_HIDDEN: [&str; 4] = ["file.new", "file.newFromTemplate", "file.open", "file.close"];
+pub(crate) const HOSTED_HIDDEN: [&str; 6] = ["file.new", "file.newFromTemplate", "file.open", "file.close", "file.closeDocument", "file.rename"];
 
 /// What a hosted frame says when one of [`HOSTED_HIDDEN`] or a dropped document is refused.
 pub const HOSTED_REFUSED: &str = "Open and create documents in Nextcloud Files.";
+/// What a hosted frame says when Rename is refused: the page names the file.
+pub const HOSTED_RENAME: &str = "Rename the file in Nextcloud Files.";
+/// What a hosted frame says when the page sends a second file: the frame edits one.
+pub const HOSTED_ONE_FILE: &str = "This window already edits a file from Nextcloud. Open other files from Nextcloud Files.";
 
 impl WordApp {
     /// Whether Save As is File › Export: a copy in a chosen format that never becomes the
@@ -1342,8 +1353,9 @@ impl WordApp {
         if !self.hosted_hides(id) || self.opening_from_host {
             return None;
         }
-        self.status_long(tl!(HOSTED_REFUSED));
-        Some(Err(tl!(HOSTED_REFUSED).to_string()))
+        let why = tl!(if id == "file.rename" { HOSTED_RENAME } else { HOSTED_REFUSED });
+        self.status_long(why);
+        Some(Err(why.to_string()))
     }
 }
 
