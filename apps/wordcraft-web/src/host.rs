@@ -23,6 +23,10 @@
 //!     is now that file; the next Save sends its name with `false`.
 //!   - Save As or Export to a format that doesn't (PDF, Markdown, plain text), Export as PDF and
 //!     Export Page as PNG: `false`. They are copies; the document's file stays the same.
+//! - Share (`?host=parent` only): `wordcraft:ready` also says `shareButton: true`, so the page
+//!   can hide a Share button of its own. When the page's `wordcraft:host` says `share: true`, the
+//!   ribbon's Share posts `wordcraft:share {}` to the page, which opens its sharing for the open
+//!   file, instead of opening File › Export. Without `share: true` Share exports as before.
 //! - `wordcraft:dirty` whenever unsaved changes appear or go away, `wordcraft:failed` when the
 //!   app couldn't start.
 //!
@@ -104,6 +108,8 @@ pub enum HostEvent {
     FontsComing(bool),
     /// A fetched font: its file name and bytes.
     Font(String, Vec<u8>),
+    /// The host shares files itself ([`Bridge::apply_share`]).
+    Share,
 }
 
 pub type HostEvents = Rc<RefCell<Vec<HostEvent>>>;
@@ -120,6 +126,8 @@ pub struct Bridge {
     host: Rc<Host>,
     /// The host said `saves: true`.
     saves: Rc<Cell<bool>>,
+    /// The host said `share: true`.
+    share: Rc<Cell<bool>>,
     sent: Rc<RefCell<SentSaves>>,
 }
 
@@ -128,7 +136,7 @@ impl Bridge {
     /// `data-host="page"` on the canvas, an unframed `?host=parent` page (it stays the normal app
     /// with downloads), or a parent on another origin.
     pub fn detect(canvas: &web_sys::HtmlCanvasElement) -> Option<Self> {
-        Some(Self { host: Rc::new(Host::connect(APP, canvas)?), saves: Rc::default(), sent: Rc::default() })
+        Some(Self { host: Rc::new(Host::connect(APP, canvas)?), saves: Rc::default(), share: Rc::default(), sent: Rc::default() })
     }
 
     /// The host mode of this page.
@@ -149,6 +157,9 @@ impl Bridge {
         saves: AsyncSaves,
         events: HostEvents,
     ) {
+        if self.host.mode() == Mode::Parent {
+            listen_share(self.share.clone(), events.clone(), ctx.clone());
+        }
         self.listen(inbox, ctx, saves, events);
         if self.host.mode() == Mode::Parent {
             services.saves_are_copies = true;
@@ -207,6 +218,16 @@ impl Bridge {
         }));
     }
 
+    /// The host said it shares files: from now on the ribbon's Share posts `wordcraft:share` to it.
+    /// Called each frame; does nothing before the host's `host` message, outside parent mode or
+    /// twice.
+    pub fn apply_share(&self, services: &mut wordcraft_ui_egui::Services) {
+        if !self.share.get() || self.host.mode() != Mode::Parent || services.host_share.is_some() {
+            return;
+        }
+        services.host_share = Some(Box::new(|| post_to_parent(&[("type", "wordcraft:share".into())])));
+    }
+
     /// Hear the parent's `live` messages: the first fetches the file and joins, later ones are
     /// ticket refreshes. They wait in `events` for the next frame ([`Live::frame`]).
     pub fn listen_live(&self, events: LiveEvents, joining: Rc<RefCell<Joining>>, ctx: egui::Context) {
@@ -260,10 +281,19 @@ impl Bridge {
     }
 
     pub fn post_ready(&self) {
-        let _ = self.host.post_ready(env!("CARGO_PKG_VERSION"), false);
-        // A live host waits for the unprefixed `ready` before it sends `live`.
         if self.host.mode() == Mode::Parent {
+            // `craft-web-host`'s `ready`, plus `shareButton`: the ribbon has its own Share button.
+            let _ = post_to_parent(&[
+                ("type", "wordcraft:ready".into()),
+                ("version", craft_web_host::VERSION.into()),
+                ("appVersion", env!("CARGO_PKG_VERSION").into()),
+                ("file", false.into()),
+                ("shareButton", true.into()),
+            ]);
+            // A live host waits for the unprefixed `ready` before it sends `live`.
             let _ = self.host.post_live_ready();
+        } else {
+            let _ = self.host.post_ready(env!("CARGO_PKG_VERSION"), false);
         }
     }
 
@@ -315,6 +345,50 @@ impl Bridge {
         }
         let at = sent.tickets.iter().position(|(i, _)| i == id)?;
         Some(sent.tickets.remove(at).1)
+    }
+}
+
+/// The framing parent and this page's origin, when the parent is on the same origin (the only one
+/// heard and answered, as `craft-web-host` does).
+fn same_origin_parent() -> Option<(web_sys::Window, web_sys::Window, String)> {
+    let window = web_sys::window()?;
+    let parent = window.parent().ok().flatten()?;
+    if js_sys::Object::is(&parent, &window) {
+        return None;
+    }
+    let origin = window.location().origin().ok()?;
+    // Reading another origin's location throws.
+    (parent.location().origin().ok()? == origin).then_some((window, parent, origin))
+}
+
+/// Post `fields` as one object to the same-origin parent, addressed to this origin only.
+fn post_to_parent(fields: &[(&str, wasm_bindgen::JsValue)]) -> Result<(), String> {
+    let (_, parent, origin) = same_origin_parent().ok_or("no same-origin parent")?;
+    let message = js_sys::Object::new();
+    for (key, value) in fields {
+        js_sys::Reflect::set(&message, &(*key).into(), value).map_err(|_| "couldn't build the message".to_string())?;
+    }
+    parent.post_message(&message, &origin).map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))
+}
+
+/// Hear `share: true` in the same-origin parent's `wordcraft:host` (`craft-web-host` reads the
+/// other fields of that message, not this one).
+fn listen_share(share: Rc<Cell<bool>>, events: HostEvents, ctx: egui::Context) {
+    let Some((window, parent, origin)) = same_origin_parent() else { return };
+    let on_message = wasm_bindgen::closure::Closure::<dyn Fn(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+        if event.origin() != origin || !event.source().is_some_and(|s| js_sys::Object::is(&s, &parent)) {
+            return;
+        }
+        let data = event.data();
+        let field = |key: &str| js_sys::Reflect::get(&data, &key.into()).unwrap_or(wasm_bindgen::JsValue::UNDEFINED);
+        if field("type").as_string().as_deref() == Some("wordcraft:host") && field("share").as_bool() == Some(true) && !share.get() {
+            share.set(true);
+            events.borrow_mut().push(HostEvent::Share);
+            ctx.request_repaint();
+        }
+    });
+    if window.add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref()).is_ok() {
+        on_message.forget();
     }
 }
 
