@@ -5399,7 +5399,11 @@ fn hosted_copies_download_and_only_save_goes_to_the_page() {
         ("file.saveAs", json!({"path": "report copy.docx"})),
         ("file.exportPdf", json!({})),
         ("file.exportPng", json!({})),
-        ("file.printPdf", { let mut p = a.ui.print.params(); p["path"] = json!("report.pdf"); p }),
+        ("file.printPdf", {
+            let mut p = a.ui.print.params();
+            p["path"] = json!("report.pdf");
+            p
+        }),
     ] {
         let r = a.run(id, params).unwrap_or_else(|e| panic!("{id}: {e}"));
         assert!(r.get("pendingSave").is_none(), "{id}: no save waits on the page");

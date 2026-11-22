@@ -115,9 +115,9 @@ mod clock;
 mod services;
 mod state;
 
+pub use app::HOSTED_REFUSED;
 use app::control_click_as_secondary;
 pub(crate) use app::works_without_document;
-pub use app::HOSTED_REFUSED;
 pub use clock::now_ms;
 pub use services::{HostSaveFn, Inbox, Services};
 pub use state::{AutoSaveBlock, DefaultApp, SaveChoice, keeps_everything};
