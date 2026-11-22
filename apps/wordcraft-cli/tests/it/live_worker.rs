@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
@@ -25,8 +25,8 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use tokio::sync::watch;
 use wordcraft_cli::live_worker::{
-    Clock, Config, ENDED_KIND, FileGot, Flow, Grant, HubTicket, NOTICE_KIND, Nextcloud, OpenError, QUIET_MS, Room, RoomFiles, Rooms, SAVE_GIVE_UP_MS,
-    Secret, Spawn, listen, router, serve_grant, service_ticket,
+    Clock, Config, EMPTY_GRACE_MS, ENDED_KIND, FileGot, Flow, Grant, HubTicket, NOTICE_KIND, Nextcloud, OpenError, QUIET_MS, Room, RoomFiles, Rooms,
+    SAVE_GIVE_UP_MS, Secret, Spawn, listen, router, serve_grant, service_ticket,
 };
 use wordcraft_doc::{Document, Paragraph, Pos, para_block};
 use wordcraft_engine::io::{open_bytes, save_bytes};
@@ -290,6 +290,8 @@ struct Nc {
     name: Option<String>,
     /// Answer the room's close with this status.
     close_status: Option<StatusCode>,
+    /// The `idle` each close sent (`""` when none), in order.
+    close_idle: Vec<String>,
 }
 
 type NcState = Arc<Mutex<Nc>>;
@@ -372,11 +374,15 @@ async fn nc_copy(State(nc): State<NcState>, Path(room): Path<String>, h: HeaderM
     json_response(json!({"name": name}))
 }
 
-async fn nc_room(State(nc): State<NcState>, Path((room, what)): Path<(String, String)>, h: HeaderMap) -> Response {
+async fn nc_room(State(nc): State<NcState>, Path((room, what)): Path<(String, String)>, uri: Uri, h: HeaderMap) -> Response {
     if !signed(&h, &room) {
         return deny(&nc);
     }
     let mut n = nc.lock().unwrap();
+    if what == "close" {
+        let idle = uri.query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("idle=")).unwrap_or("");
+        n.close_idle.push(idle.to_owned());
+    }
     if what == "close"
         && let Some(status) = n.close_status
     {
@@ -1357,4 +1363,88 @@ async fn a_room_the_app_did_not_close_is_not_marked_closed() {
         w.eds[0].pump();
     }
     assert!(!matches!(w.eds[0].le.status(), LiveStatus::Broken(_)), "{:?}", w.eds[0].le.status());
+}
+
+/// [`world`] with one editor, keeping the notify channel: sending on it is the app notifying the
+/// worker again for this room (another ticket into it).
+async fn served_world(bytes: Vec<u8>) -> (World, watch::Sender<String>) {
+    let (nc, base) = nextcloud(bytes.clone()).await;
+    let relay: Shared = Rc::default();
+    let clock = Arc::new(TestClock(AtomicU64::new(0)));
+    let (notify, token) = watch::channel(TOKEN.to_owned());
+    let files = RoomFiles::new(Arc::new(Nextcloud::new(&base, worker_secret()).unwrap()), ROOM.into(), token);
+    let worker = Room::open(Relay::connect(&relay, SERVICE_UID), files, clock.clone()).await.unwrap();
+    let ed = editor(&relay, "editor0", &bytes);
+    let mut w = World { relay, nc, clock, worker, eds: vec![ed], base };
+    for _ in 0..3 {
+        w.tick(0).await;
+    }
+    assert!(w.eds[0].le.editable(), "editor live: {:?}", w.eds[0].le.status());
+    (w, notify)
+}
+
+/// The last editor leaves the room after one saved edit.
+async fn emptied(w: &mut World) {
+    w.eds[0].type_at_end(1, " and three");
+    w.run_for(10_000, 1_000).await;
+    assert_eq!(w.count("put"), 1);
+    let at = w.eds[0].at;
+    w.relay.borrow_mut().leave(at);
+    w.eds.clear();
+}
+
+/// A window opened on the file joins the room, types, and its edit is saved; then it leaves and
+/// the room is closed after the grace, as ever.
+async fn reopened_window_is_saved(w: &mut World) {
+    assert!(w.relay.borrow().ended().is_empty(), "the editors' session was never ended");
+    let bytes = w.file(FILE);
+    let ed = editor(&w.relay, "editor9", &bytes);
+    w.eds.push(ed);
+    for _ in 0..3 {
+        w.tick(0).await;
+    }
+    assert!(w.eds[0].le.editable(), "the reopened window edits: {:?}", w.eds[0].le.status());
+    w.eds[0].type_at_end(1, " and four");
+    assert_eq!(w.run_for(10_000, 1_000).await, Flow::Continue);
+    assert_eq!(w.file_texts(), ["One", "Two and three and four"], "the reopened window's edit is saved");
+    let at = w.eds[0].at;
+    w.relay.borrow_mut().leave(at);
+    w.eds.clear();
+    assert_eq!(w.run_for(60_000, 1_000).await, Flow::Done, "the worker leaves the room once it is empty again");
+    assert_eq!(w.count("close"), 1);
+}
+
+/// L1: the file is reopened 3 s after its last editor left, while the worker waits out its empty
+/// grace: the app's ticket joins this room and notifies the worker again. The worker serves the
+/// room on until the new window (slow to load) is in, so that window's edits are saved.
+#[tokio::test]
+async fn a_reopen_while_the_room_is_empty_is_served() {
+    let (mut w, notify) = served_world(file(&["One", "Two"])).await;
+    emptied(&mut w).await;
+    assert_eq!(w.run_for(3_000, 1_000).await, Flow::Continue);
+    notify.send_replace(TOKEN.to_owned());
+    // The new window takes a while to join (8 s in the e2e probe): the room stays open meanwhile.
+    assert_eq!(w.run_for(20_000, 1_000).await, Flow::Continue, "the reopened room is served on");
+    assert_eq!(w.count("close"), 0);
+    reopened_window_is_saved(&mut w).await;
+    // The close says how long the room had been empty, for the app's reopen check.
+    let idle = w.nc.lock().unwrap().close_idle.clone();
+    assert_eq!(idle.len(), 1);
+    assert!(idle[0].parse::<u64>().is_ok_and(|s| s * 1000 >= EMPTY_GRACE_MS), "idle seconds sent: {idle:?}");
+}
+
+/// L1: the reopen's ticket raced the close, so the app refuses the close (409: a ticket into the
+/// room was handed out since it emptied). The worker does not leave: it serves the room on, and
+/// the window that ticket was for edits and is saved.
+#[tokio::test]
+async fn a_close_refused_as_reopened_serves_the_room_on() {
+    let mut w = world(file(&["One", "Two"]), 1).await;
+    w.nc.lock().unwrap().close_status = Some(StatusCode::CONFLICT);
+    emptied(&mut w).await;
+    assert_eq!(w.run_for(20_000, 1_000).await, Flow::Continue, "a refused close does not end the room");
+    assert_eq!(w.count("closefail"), 1, "asked once, refused");
+    let marker = w.relay.borrow().saved_marker.clone().map(|(_, v)| v).unwrap_or_default();
+    assert!(marker["closed"].as_bool() != Some(true), "not marked closed: {marker}");
+    w.nc.lock().unwrap().close_status = None;
+    reopened_window_is_saved(&mut w).await;
 }
