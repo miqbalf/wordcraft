@@ -324,6 +324,10 @@ impl WordApp {
                     self.run("file.saveAs", json!({"path": path}))
                 };
                 match &r {
+                    Ok(_) if self.services.hosted => {
+                        self.clear_export_error();
+                        self.status(crate::i18n::fmt(tl!("Downloaded {name}"), &[("name", &crate::i18n::isolate_path(&path))]));
+                    }
                     Ok(_) => {
                         self.clear_export_error();
                         self.status(crate::i18n::fmt(tl!("Exported {path}"), &[("path", &crate::i18n::isolate_path(&path))]));
@@ -339,7 +343,8 @@ impl WordApp {
                 let mut params = settings;
                 params["path"] = json!(path);
                 let r = self.run("file.printPdf", params);
-                if r.is_ok() {
+                // The browser's download already said where the PDF went.
+                if r.as_ref().is_ok_and(|v| v.get("downloaded").is_none()) {
                     self.status(crate::i18n::fmt(tl!("Exported {path}"), &[("path", &crate::i18n::isolate_path(&path))]));
                 }
                 r
@@ -357,7 +362,9 @@ impl WordApp {
                 // otherwise dropped: a failed write (no permission, disk full, a bad path) left the
                 // Save As page sitting there with nothing to say why, since its own render loop
                 // skips the status bar while Backstage is open. `fail_save_as` reaches both.
-                let result = picked.map(|path| self.run("file.save", json!({"path": path})));
+                // Hosted, Save As downloads a copy and never writes over the page's file.
+                let id = if self.save_as_is_export() { "file.saveAs" } else { "file.save" };
+                let result = picked.map(|path| self.run(id, json!({"path": path})));
                 let saved = matches!(&result, Some(Ok(v)) if v.get("saved").and_then(Value::as_bool) == Some(true) || v.get("downloaded").is_some());
                 if saved {
                     self.ui.backstage = false;

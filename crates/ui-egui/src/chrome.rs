@@ -50,6 +50,11 @@ fn qat_button(ui: &mut Ui, app: &mut WordApp, icon: &str, tip: &str, id: &str, e
 const QAT_MENU: [&str; 10] =
     ["file.new", "file.open", "file.save", "file.print", "edit.undo", "edit.redo", "edit.repeat", "review.spelling", "view.readMode", "insert.table"];
 
+/// The Quick Access Toolbar's commands as shown: hosted, without what the page does itself.
+pub(crate) fn qat_ids(app: &WordApp) -> Vec<&str> {
+    app.session.ribbon.qat().into_iter().filter(|id| !app.hosted_hides(id)).collect()
+}
+
 /// Match the toolbar's enabled state for keyboard activation too.
 pub(crate) fn qat_enabled(app: &WordApp, id: &str) -> bool {
     match id {
@@ -65,7 +70,7 @@ pub(crate) fn qat_enabled(app: &WordApp, id: &str) -> bool {
 /// The Quick Access Toolbar (#379): the user's commands (Save, Undo, Redo until customized), each
 /// with a right-click menu, then the menu button that customizes it (#376).
 fn quick_access(ui: &mut Ui, app: &mut WordApp) {
-    let ids: Vec<String> = app.session.ribbon.qat().into_iter().map(str::to_string).collect();
+    let ids: Vec<String> = qat_ids(app).into_iter().map(str::to_string).collect();
     for (index, id) in ids.iter().enumerate() {
         let id = id.as_str();
         let tip = match id {
@@ -215,6 +220,9 @@ pub(crate) fn qat_menu(ui: &mut Ui, app: &mut WordApp) {
     ui.label(egui::RichText::new(tl!("Customize Quick Access Toolbar")).font(semibold(12.0)));
     ui.separator();
     for id in QAT_MENU {
+        if app.hosted_hides(id) {
+            continue;
+        }
         let Some(label) = app.session.registry.get(id).map(|s| tl!(s.label).to_string()) else { continue };
         let on = app.session.ribbon.qat().contains(&id);
         let mark = egui::RichText::new("✓");

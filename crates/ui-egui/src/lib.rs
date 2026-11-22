@@ -117,6 +117,7 @@ mod state;
 
 use app::control_click_as_secondary;
 pub(crate) use app::works_without_document;
+pub use app::HOSTED_REFUSED;
 pub use clock::now_ms;
 pub use services::{HostSaveFn, Inbox, Services};
 pub use state::{AutoSaveBlock, DefaultApp, SaveChoice, keeps_everything};
@@ -689,6 +690,8 @@ pub struct WordApp {
     /// Web: a recipient list was asked for (Select Recipients › Use an Existing List…), so the
     /// next text file from the picker loads as recipients instead of opening (#240).
     pub recipient_list_pending: bool,
+    /// Hosted: the document the page sent is being opened, which `file.open` allows then only.
+    pub(crate) opening_from_host: bool,
     /// The font database's [`generation`](wordcraft_fonts::FontDb::generation) last seen: when
     /// fonts are added or removed (by any route) the font lists and the layout are refreshed.
     font_generation: u64,

@@ -75,6 +75,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     if !has_document && !works_without_document(&app.ui.backstage_page) {
         app.ui.backstage_page = "home".into();
     }
+    // Hosted: the page opens, creates and closes files, so those pages aren't here.
+    if hosted_hides_page(app, &app.ui.backstage_page) {
+        app.ui.backstage_page = if has_document { "info" } else { "options" }.into();
+    }
     let mac = app.integrated_titlebar;
     crate::rtl::start_panel("backstage_nav")
         .exact_size(200.0)
@@ -139,6 +143,9 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             egui::ScrollArea::vertical().id_salt("backstage_nav_scroll").auto_shrink([false, false]).show(ui, |ui| {
                 let top = ui.cursor().top();
                 for (id, label, icon) in PAGES {
+                    if hosted_hides_page(app, id) {
+                        continue;
+                    }
                     // No document open (#1129): Info, Save, Save As, Print and Export are greyed out.
                     let on = has_document || works_without_document(id);
                     let (r, resp) = ui.add_enabled_ui(on, |ui| ui.allocate_exact_size(vec2(200.0, 38.0), Sense::click())).inner;
@@ -288,7 +295,7 @@ fn recovery_page(app: &mut WordApp, ui: &mut Ui) {
 /// Opens a side-menu page, as a click on it (or its keytip) does. Without a document only the
 /// pages that work without one open.
 pub(crate) fn go_to_page(app: &mut WordApp, id: &str) {
-    if !app.has_document() && !works_without_document(id) {
+    if (!app.has_document() && !works_without_document(id)) || hosted_hides_page(app, id) {
         return;
     }
     match id {
@@ -317,6 +324,11 @@ pub(crate) fn go_to_page(app: &mut WordApp, id: &str) {
         }
         _ => app.ui.backstage_page = id.into(),
     }
+}
+
+/// Hosted (`Services::hosted`): Home, New, Open (with Recent) and Close are the page's own.
+pub(crate) fn hosted_hides_page(app: &WordApp, page: &str) -> bool {
+    app.services.hosted && matches!(page, "home" | "new" | "open" | "close")
 }
 
 /// The Backstage pages that work while no document is open (#1129).
@@ -832,6 +844,10 @@ fn open_page(app: &mut WordApp, ui: &mut Ui) {
 /// Save As: Browse… asks where to save. It has no recent-documents list: clicking one of those
 /// opens it, which is not what Save As is for.
 fn save_as_page(app: &mut WordApp, ui: &mut Ui) {
+    if app.save_as_is_export() {
+        save_as_export_page(app, ui);
+        return;
+    }
     heading(ui, "Save As");
     let error = ui.ctx().data(|d| d.get_temp::<String>(save_as_error_id())).unwrap_or_default();
     if !error.is_empty() {
@@ -855,6 +871,36 @@ fn save_as_page(app: &mut WordApp, ui: &mut Ui) {
     {
         let _ = app.run("ui.saveAsTemplate", json!({}));
     }
+}
+
+/// Save As as File › Export ([`WordApp::save_as_is_export`]): the same formats through the same
+/// flow (`export_dialog`), plus a Word template. Only the delivery is the platform's: hosted in a
+/// browser page the copy downloads to the user's computer, live or not; on the desktop the file
+/// dialog writes it. The document's file and state stay as they were.
+fn save_as_export_page(app: &mut WordApp, ui: &mut Ui) {
+    heading(ui, "Save As");
+    ui.label(tl!("Save a copy in another format. Printing goes through a PDF you can print from any viewer."));
+    ui.add_space(12.0);
+    crate::print_page::export_formats(app, ui);
+    if ui.add(egui::Button::new(egui::RichText::new(tl!("Word template (*.dotx)")).font(medium(13.5))).min_size(vec2(320.0, 34.0))).clicked() {
+        let _ = download_copy_as(app, "dotx");
+    }
+}
+
+/// Download a copy of the document in `format` (an Export format or `dotx`), as the hosted Save
+/// As page's Download a copy does. The document's file and state don't change.
+pub(crate) fn download_copy_as(app: &mut WordApp, format: &str) -> Result<serde_json::Value, String> {
+    if format == "dotx" {
+        let name = format!("{}.dotx", app.title_stem());
+        let r = app.run("file.saveAs", json!({"path": name}));
+        match &r {
+            Ok(_) => app.export_error.clear(),
+            Err(e) => app.export_error = e.clone(),
+        }
+        return r;
+    }
+    app.export_dialog(format);
+    if app.export_error.is_empty() { Ok(json!({"downloaded": true})) } else { Err(app.export_error.clone()) }
 }
 
 fn info_page(app: &mut WordApp, ui: &mut Ui) {

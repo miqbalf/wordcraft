@@ -109,11 +109,11 @@ impl WordApp {
         r
     }
 
-    /// Hand a web save or export to where it goes: a copy downloaded in the browser when the
-    /// framing page keeps no saves, the host page, or the browser download. `save_as` is what
-    /// the host page is told (`Services::host_save`).
-    fn deliver_web_save(&self, name: &str, bytes: &[u8], save_as: bool) -> Result<(), String> {
-        if self.services.saves_are_copies {
+    /// Hand a web save or export to where it goes: a copy downloaded in the browser (`copy`: the
+    /// framing page keeps no saves, or a hosted page gets only plain Saves), the host page, or the
+    /// browser download. `save_as` is what the host page is told (`Services::host_save`).
+    fn deliver_web_save(&self, name: &str, bytes: &[u8], save_as: bool, copy: bool) -> Result<(), String> {
+        if copy {
             return match &self.services.download_copy {
                 Some(copy) => copy(name, bytes),
                 None => Err("this window can't download files".to_owned()),
@@ -126,6 +126,35 @@ impl WordApp {
         }
     }
 
+    /// Hosted (`Services::hosted`): whether a web save goes to the page. Only a plain Save of the
+    /// document the page sent does, under the name Save gives it; everything else is a copy.
+    fn hosted_save_goes_to_page(&self, id: &str, params: &Value) -> bool {
+        id == "file.save"
+            && self.session.path.is_some()
+            && params.get("path").and_then(Value::as_str).is_none_or(|p| p == self.web_save_name("file.save"))
+    }
+
+    /// Web: File › Print › Save these pages as PDF (`file.printPdf`) builds the PDF of the print
+    /// settings and downloads it as a copy; the engine writes no file in the browser.
+    fn download_print_pdf(&mut self, params: &Value) -> Result<Value, String> {
+        let name = params.get("path").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("{}.pdf", self.title_stem()));
+        let name = std::path::Path::new(&name).file_name().map_or(name.clone(), |n| n.to_string_lossy().into_owned());
+        let name = if name.to_ascii_lowercase().ends_with(".pdf") { name } else { format!("{name}.pdf") };
+        let (bytes, plan) = self.session.print_pdf(params).map_err(|e| e.to_string())?;
+        let delivered = match (&self.services.download_copy, &self.services.download) {
+            (Some(copy), _) => copy(&name, &bytes),
+            (None, Some(download)) => download(&name, &bytes),
+            (None, None) => Err("this window can't download files".to_owned()),
+        };
+        if let Err(e) = delivered {
+            let msg = i18n::fmt(tl!("Couldn't download {name}: {error}"), &[("name", &name), ("error", &e)]);
+            self.status(msg.clone());
+            return Err(msg);
+        }
+        self.status(i18n::fmt(tl!("Downloaded {name}"), &[("name", &name)]));
+        Ok(json!({"downloaded": name, "bytes": bytes.len(), "pages": plan.pages.len(), "copy": true}))
+    }
+
     /// Run a command for a script or an agent (control channel, MCP bridge): never asks first.
     /// UI-level commands (`ui.*`) are handled here, the rest by the engine.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
@@ -136,13 +165,17 @@ impl WordApp {
         if let Some(r) = self.ui_command(id, &params) {
             return r;
         }
+        // Hosted: the page opens, creates and closes files, so these are refused (and hidden).
+        if let Some(r) = self.hosted_refusal(id) {
+            return r;
+        }
         // Live editing: an engine command it doesn't allow now is refused here, before any
         // save, download or close below could act on it.
         if let Some(r) = self.live_gate(id, &params) {
             return r;
         }
         // A live session that ended: Save As downloads a copy itself, and the edits stay unsaved.
-        if let Some(r) = self.live_copy(id) {
+        if let Some(r) = self.live_copy(id, &params) {
             return r;
         }
         if id == "file.close" {
@@ -168,20 +201,33 @@ impl WordApp {
             }
             return r;
         }
+        // Web: Save these pages as PDF downloads the PDF of the print settings.
+        if id == "file.printPdf" && (self.services.download_copy.is_some() || self.services.download.is_some()) {
+            return self.download_print_pdf(&params);
+        }
         // Web: saving and exporting become downloads.
         if self.services.download.is_some() && matches!(id, "file.save" | "file.saveAs" | "file.exportPdf" | "file.exportPng") {
+            // Hosted, everything but a plain Save of the page's document is a downloaded copy
+            // that changes nothing about the document: not its file, stamps, password or state.
+            let hosted_copy = self.services.hosted && !self.hosted_save_goes_to_page(id, &params);
             let name = params.get("path").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| self.web_save_name(id));
             // Inspect only the suffix bytes: no full-name allocation or UTF-8 slicing.
             let has_pdf_suffix = name.as_bytes().last_chunk::<4>().is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".pdf"));
             let name = if id == "file.exportPdf" && !has_pdf_suffix { format!("{name}.pdf") } else { name };
             // A save with a password encrypts this and later saves (`file.save`'s `password`).
+            let mut copy_password = None;
             if matches!(id, "file.save" | "file.saveAs")
                 && let Some(pw) = params.get("password").filter(|v| !v.is_null())
             {
                 if !wordcraft_engine::io::can_encrypt(&name) || pw.as_str().is_none_or(str::is_empty) {
                     return Err("only Word documents (.docx, .docm, .dotx, .dotm) and OpenDocument text files (.odt, .ott) can be saved with a password, and it can't be empty".into());
                 }
-                self.session.run("file.encrypt", &json!({"password": pw})).map_err(|e| e.to_string())?;
+                if hosted_copy {
+                    // The copy alone is encrypted; the document's own saves are not.
+                    copy_password = pw.as_str().map(str::to_string);
+                } else {
+                    self.session.run("file.encrypt", &json!({"password": pw})).map_err(|e| e.to_string())?;
+                }
             }
             // Like a failed native save, a failed serialization or delivery keeps the save stamps.
             let before_stamp = (
@@ -196,10 +242,26 @@ impl WordApp {
                 self.session.stamp_save();
             }
             // Word documents are encrypted with the document's password, if it has one.
-            let password =
-                if matches!(id, "file.save" | "file.saveAs") { self.session.password.as_ref().map(wordcraft_engine::Password::as_str) } else { None };
+            let password = if copy_password.is_some() {
+                copy_password.as_deref()
+            } else if matches!(id, "file.save" | "file.saveAs") {
+                self.session.password.as_ref().map(wordcraft_engine::Password::as_str)
+            } else {
+                None
+            };
             let opts = wordcraft_engine::cmd::file::export_options(&self.session, &params);
-            let bytes = match wordcraft_engine::io::save_bytes_with(&name, &self.session.doc, password, &opts) {
+            let saved_bytes = wordcraft_engine::io::save_bytes_with(&name, &self.session.doc, password, &opts);
+            if hosted_copy {
+                // The copy carries the save's stamps; the document keeps its own.
+                (
+                    self.session.doc.settings.zoom,
+                    self.session.doc.core.last_modified_by,
+                    self.session.doc.core.created,
+                    self.session.doc.core.modified,
+                    self.session.doc.core.revision,
+                ) = before_stamp.clone();
+            }
+            let bytes = match saved_bytes {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     (
@@ -219,14 +281,14 @@ impl WordApp {
             }
             // An export is a copy, and so is a save in a format that doesn't keep everything (a
             // page image, plain text): the document itself still has unsaved changes.
-            let copies = self.services.saves_are_copies;
+            let copies = self.services.saves_are_copies || hosted_copy;
             let marked_saved = !copies && matches!(id, "file.save" | "file.saveAs") && keeps_everything(&name);
             // Save As tells the host page the document is now this file, which it only is when the
             // save marks it saved. A Save under a name the page never sent (an untitled document,
             // an imported .doc saved as .docx) is a new file too, never an overwrite.
             let opened_name = self.session.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
             let new_file = id == "file.saveAs" || opened_name.as_deref() != Some(name.as_str());
-            let delivered = self.deliver_web_save(&name, &bytes, marked_saved && new_file);
+            let delivered = self.deliver_web_save(&name, &bytes, marked_saved && new_file, copies);
             if let Err(e) = delivered {
                 (
                     self.session.doc.settings.zoom,
@@ -264,6 +326,10 @@ impl WordApp {
                     saves_revision,
                 });
                 return Ok(json!({"downloaded": name, "bytes": bytes.len(), "pendingSave": ticket}));
+            }
+            if hosted_copy {
+                self.status(i18n::fmt(tl!("Downloaded {name}"), &[("name", &name)]));
+                return Ok(json!({"downloaded": name, "bytes": bytes.len(), "copy": true}));
             }
             if copies {
                 self.status_long(i18n::fmt(
@@ -478,7 +544,9 @@ impl WordApp {
         // The open document goes to the front of the recent list after every command. The recent
         // commands (`ui.recentRemove`, `ui.recentClear`) return from `ui_command` before this
         // runs, so taking a document off the list is never undone by the re-add (#2716).
-        if let Some(p) = self.session.path.as_ref().map(|p| p.to_string_lossy().to_string())
+        // Hosted: the page's file names are not kept in the browser's shared storage.
+        if !self.services.hosted
+            && let Some(p) = self.session.path.as_ref().map(|p| p.to_string_lossy().to_string())
             && self.ui.recent.first() != Some(&p)
         {
             self.ui.recent.retain(|r| *r != p);
@@ -1167,6 +1235,38 @@ fn add_saved(r: &mut Value, saved: Option<Result<(), String>>) {
     };
     if let Some(Err(e)) = saved {
         r["saveError"] = json!(e);
+    }
+}
+
+/// Hosted (`Services::hosted`): the commands the framing page does instead (it opens, creates and
+/// closes files), hidden and refused in the frame.
+pub(crate) const HOSTED_HIDDEN: [&str; 4] = ["file.new", "file.newFromTemplate", "file.open", "file.close"];
+
+/// What a hosted frame says when one of [`HOSTED_HIDDEN`] or a dropped document is refused.
+pub const HOSTED_REFUSED: &str = "Open and create documents in Nextcloud Files.";
+
+impl WordApp {
+    /// Whether Save As is File › Export: a copy in a chosen format that never becomes the
+    /// document's file (the Save As page shows the Export formats, and its Browse saves a copy).
+    /// The one switch for it: today only a hosted frame (`Services::hosted`), where the copy
+    /// downloads; the desktop is to follow, writing the copy through its file dialog.
+    pub fn save_as_is_export(&self) -> bool {
+        self.services.hosted
+    }
+
+    /// Whether the page hosting the frame does command `id` instead ([`HOSTED_HIDDEN`]).
+    pub fn hosted_hides(&self, id: &str) -> bool {
+        self.services.hosted && HOSTED_HIDDEN.contains(&id)
+    }
+
+    /// The refusal of a command the hosting page does instead, said on the status bar. The
+    /// document the page sends is opened by the frame itself ([`Self::open_from_host`]).
+    pub(crate) fn hosted_refusal(&mut self, id: &str) -> Option<Result<Value, String>> {
+        if !self.hosted_hides(id) || self.opening_from_host {
+            return None;
+        }
+        self.status_long(tl!(HOSTED_REFUSED));
+        Some(Err(tl!(HOSTED_REFUSED).to_string()))
     }
 }
 

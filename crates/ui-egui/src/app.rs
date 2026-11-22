@@ -22,6 +22,7 @@ mod pictures;
 mod prefs;
 
 pub(crate) use commands::works_without_document;
+pub use commands::HOSTED_REFUSED;
 pub(crate) use frame::STATUS_MS;
 pub(crate) use input::control_click_as_secondary;
 
@@ -163,6 +164,7 @@ impl WordApp {
             parked: Default::default(),
             windows: windows::Windows::new(shown_document),
             print_document: None,
+            opening_from_host: false,
             canvas,
             controls,
             dialog,

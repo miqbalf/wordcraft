@@ -12,9 +12,16 @@
 //! - `wordcraft:open` (from the host): `{ name, bytes }`. It opens like a document picked with
 //!   File › Open or dropped on the window; a file over [`MAX_OPEN_BYTES`] is refused before it is
 //!   copied.
+//! - `?host=parent` only: a plain Save of the document the page sent is the one thing that goes
+//!   to the page. Save As (the same page as File › Export), Export, Save these pages as PDF and a
+//!   Word template download to the user's computer (an `<a download>`, no network), and never
+//!   change which file the document is. So WordCraft sends the page `saveAs: false`, apart from
+//!   a Save of an opened Word 97-2003 file, which is written as a new .docx (`saveAs: true`).
+//!   New, Open, Close and Recent are hidden, and a dropped document is refused.
 //! - `wordcraft:save` (to the host): `{ name, saveAs, bytes }` for every file WordCraft would
-//!   otherwise download. The host stores it and reports failures itself. `saveAs` says whether
-//!   the file becomes the document's file:
+//!   otherwise download (`data-host="page"`; under `?host=parent` only Save, above). The host
+//!   stores it and reports failures itself. `saveAs` says whether the file becomes the
+//!   document's file:
 //!   - Save: `false`. It writes the opened file under its own name and format, as the desktop
 //!     app does. A name the parent never sent (an untitled document, an imported .doc saved as
 //!     .docx) is a new file: `true`, as for Save As.
@@ -149,8 +156,18 @@ impl Bridge {
         saves: AsyncSaves,
         events: HostEvents,
     ) {
-        self.listen(inbox, ctx, saves, events);
+        // A framing page sends the one document the frame edits; drops and the picker may not
+        // open another there ([`Services::hosted`]).
+        let opens = if self.host.mode() == Mode::Parent {
+            let opens = Inbox::default();
+            services.host_open = Some(opens.clone());
+            opens
+        } else {
+            inbox
+        };
+        self.listen(opens, ctx, saves, events);
         if self.host.mode() == Mode::Parent {
+            services.hosted = true;
             services.saves_are_copies = true;
             services.host_save = None;
             services.download = Some(Box::new(|name: &str, bytes: &[u8]| {

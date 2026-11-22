@@ -53,6 +53,17 @@ pub struct Services {
     /// under its own name and format, as on the desktop, and a Save or Save As that keeps
     /// everything makes that name the document's file, so the next Save goes to it.
     pub host_save: Option<HostSaveFn>,
+    /// Web, framed by a page that keeps the user's files (`?host=parent`, such as Nextcloud). Only
+    /// a plain Save of the opened document goes to that page ([`Self::host_save`]); Save As,
+    /// Export, Save these pages as PDF, a template and a Save of a document the page never sent
+    /// are copies that download to the user's computer through [`Self::download_copy`], with no
+    /// network, and never change which file the document is. The page opens and creates files
+    /// itself, so New, Open and Close are hidden and refused, a dropped document is refused, and
+    /// the Recent list is neither shown nor recorded.
+    pub hosted: bool,
+    /// Web, hosted (`?host=parent`): the document the page sends, kept apart from [`Self::inbox`]
+    /// (the picker and drops), which may not open documents while hosted.
+    pub host_open: Option<Inbox>,
     /// Web, framed by a page that does not store saves (`?host=parent`): Save, Save As and the
     /// exports download a copy through `download_copy` instead, and never mark the document
     /// saved (the browser can't say whether the user kept the download).

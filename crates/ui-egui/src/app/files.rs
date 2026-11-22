@@ -485,6 +485,7 @@ impl WordApp {
     /// Files that arrived asynchronously (web picker, drops): documents open, pictures insert,
     /// recipient lists (CSV/TSV, spreadsheets, or a text file asked for as one) load as recipients.
     pub(crate) fn drain_inbox(&mut self) {
+        self.open_from_host();
         let Some(inbox) = self.services.inbox.clone() else { return };
         let files = std::mem::take(&mut *inbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
         let mut placed_picture = false;
@@ -507,9 +508,29 @@ impl WordApp {
                 let r = self.insert_or_change_picture(json!({"data": wordcraft_engine::cmd::insert::base64_encode(&bytes)}));
                 placed_picture = Self::placed_in_text(&r);
                 r
+            } else if self.services.hosted {
+                // The page opens documents; one dropped or picked here would show beside the
+                // page's file and end its live link.
+                self.status_long(tl!(super::commands::HOSTED_REFUSED));
+                Err(tl!(super::commands::HOSTED_REFUSED).to_string())
             } else {
                 self.run("file.open", json!({"path": name, "data": wordcraft_engine::cmd::insert::base64_encode(&bytes)}))
             };
+            if r.is_ok() {
+                self.ui.backstage = false;
+            }
+        }
+    }
+
+    /// Hosted: open the document the page sent ([`Services::host_open`]), the one `file.open`
+    /// the frame allows.
+    pub(crate) fn open_from_host(&mut self) {
+        let Some(inbox) = self.services.host_open.clone() else { return };
+        let files = std::mem::take(&mut *inbox.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        for (name, bytes) in files {
+            self.opening_from_host = true;
+            let r = self.run("file.open", json!({"path": name, "data": wordcraft_engine::cmd::insert::base64_encode(&bytes)}));
+            self.opening_from_host = false;
             if r.is_ok() {
                 self.ui.backstage = false;
             }

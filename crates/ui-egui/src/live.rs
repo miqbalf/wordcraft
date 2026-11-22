@@ -42,6 +42,8 @@ pub const NOT_SAVING: &str = "Changes are not being saved right now. Download a 
 /// Save and Save As while live: the document service writes the file for everyone.
 pub const SAVED_FOR_YOU: &str = "While the file is edited live, it is saved for everyone automatically.";
 /// The status line after Save As downloaded a copy of a document whose live session ended.
+/// The notice when another document is shown in the window and the live link stops.
+pub const LEFT_LIVE: &str = "Another document is shown, so this file is no longer edited live here. Reopen the file to edit it live.";
 pub const COPY_DOWNLOADED: &str = "A copy was downloaded. Check it, then reopen the file.";
 /// How often the host hears the state when nothing changed, in milliseconds.
 const REPORT_MS: f64 = 1000.0;
@@ -241,8 +243,20 @@ impl WordApp {
     /// in the browser, named `<stem> (my copy <date> <time>).<ext>`, whatever page frames the app,
     /// because the host page may not keep a save. The browser can't say whether the user kept
     /// it, so the document stays unsaved and the leave guard stays on. `None` for anything else.
-    pub(crate) fn live_copy(&mut self, id: &str) -> Option<Result<Value, String>> {
-        if id != "file.saveAs" || self.live_link().is_none() || self.live_saves() {
+    ///
+    /// Hosted (`Services::hosted`), a copy downloads in every live state, as it writes nothing
+    /// shared: Save As without a name is this copy, and one with a name (Export, the Save As page)
+    /// goes on to the web save, which downloads it in its own format.
+    pub(crate) fn live_copy(&mut self, id: &str, params: &Value) -> Option<Result<Value, String>> {
+        if id != "file.saveAs" || self.live_link().is_none() {
+            return None;
+        }
+        let hosted = self.services.hosted;
+        if hosted && params.get("path").and_then(Value::as_str).is_some() {
+            return None;
+        }
+        let saving = self.live_saves();
+        if saving && !hosted {
             return None;
         }
         let file =
@@ -253,6 +267,10 @@ impl WordApp {
             download(&name, &bytes).map(|()| bytes.len())
         });
         Some(match delivered {
+            Ok(bytes) if saving => {
+                self.status(i18n::fmt(tl!("Downloaded {name}"), &[("name", &name)]));
+                Ok(serde_json::json!({"downloaded": name, "bytes": bytes, "copy": true}))
+            }
             Ok(bytes) => {
                 self.status_long(tl!(COPY_DOWNLOADED));
                 Ok(serde_json::json!({"downloaded": name, "bytes": bytes, "copy": true}))
@@ -308,7 +326,7 @@ impl WordApp {
             // while the service saves, and is how edits are kept once the link has ended.
             Some(LiveMode::Linked(link)) => match id {
                 "file.save" => false,
-                "file.saveAs" => !self.live_saves(),
+                "file.saveAs" => self.services.hosted || !self.live_saves(),
                 _ => link.editing.allows(id),
             },
             Some(LiveMode::Newer) => self.session.registry.get(id).is_none_or(|spec| !spec.mutates),
@@ -362,6 +380,7 @@ impl WordApp {
             if let Some(LiveMode::Linked(old)) = self.live.take() {
                 old.editing.stop(&mut self.session);
             }
+            self.status_long(tl!(LEFT_LIVE));
             return;
         }
         let document = self.session.document_id();

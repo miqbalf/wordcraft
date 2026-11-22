@@ -586,3 +586,81 @@ fn a_room_with_no_document_service_says_nothing_is_saved_and_allows_a_copy() {
     assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"));
     assert!(has_label(&h, NOT_SAVING));
 }
+
+/// A hosted frame (`?host=parent`, a page that stores saves): its copies, its saves to the page
+/// and its save-picker downloads, as made.
+fn hosted() -> (Services, Rc<RefCell<Vec<String>>>, Rc<Cell<usize>>) {
+    let copies = Rc::new(RefCell::new(Vec::<String>::new()));
+    let other = Rc::new(Cell::new(0));
+    let (c, p, d) = (Rc::clone(&copies), Rc::clone(&other), Rc::clone(&other));
+    let services = Services {
+        hosted: true,
+        download_copy: Some(Box::new(move |name: &str, _: &[u8]| {
+            c.borrow_mut().push(name.to_owned());
+            Ok(())
+        })),
+        host_save: Some(Box::new(move |_: &str, _: &[u8], _: bool| {
+            p.set(p.get() + 1);
+            Ok(())
+        })),
+        download: Some(Box::new(move |_: &str, _: &[u8]| {
+            d.set(d.get() + 1);
+            Ok(())
+        })),
+        pick_save: Some(Box::new(|name: &str| Some(name.to_owned()))),
+        ..Services::default()
+    };
+    (services, copies, other)
+}
+
+#[test]
+fn hosted_copies_download_in_their_format_while_live_and_after_the_link_ends() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
+    let (services, copies, other) = hosted();
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert!(matches!(status(&h), LiveStatus::Live { .. }), "the service saves the file");
+    assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "a copy writes nothing shared");
+    for (id, params) in [("file.saveAs", json!({"path": "plan.pdf"})), ("file.exportPng", json!({})), ("file.saveAs", json!({}))] {
+        let r = h.state_mut().run(id, params);
+        assert!(r.is_ok(), "{id}: {r:?}");
+    }
+    assert_eq!(h.state_mut().run("file.save", json!({})), Err(SAVED_FOR_YOU.to_string()), "Save stays the service's");
+    {
+        let copies = copies.borrow();
+        assert_eq!(copies[..2], ["plan.pdf".to_string(), "plan.png".to_string()]);
+        assert!(copies[2].starts_with("plan (my copy ") && copies[2].ends_with(").docx"), "{copies:?}");
+    }
+    assert!(matches!(status(&h), LiveStatus::Live { .. }), "copies don't touch the link");
+
+    assert!(h.state_mut().live_end("The live session was restarted. Reopen the file."));
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    h.state_mut().run("file.saveAs", json!({"path": "plan.odt"})).unwrap();
+    assert_eq!(copies.borrow().last().map(String::as_str), Some("plan.odt"), "the chosen format, not a .docx");
+    assert_eq!(other.get(), 0, "nothing went to the page or the save picker");
+}
+
+#[test]
+fn hosted_save_as_page_while_live_offers_the_export_formats_and_no_refusal() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
+    let (services, copies, other) = hosted();
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    h.state_mut().run("ui.backstage", json!({"value": true, "page": "saveAs"})).unwrap();
+    h.step();
+    h.step();
+    assert!(!has_label(&h, SAVED_FOR_YOU), "no refusal on the page");
+    assert!(!has_label(&h, "Browse…"));
+    for label in ["Word document (*.docx)", "OpenDocument Text (*.odt)", "PDF document (*.pdf)", "Word template (*.dotx)"] {
+        assert!(has_label(&h, label), "{label} is offered");
+    }
+    h.get_by_label("OpenDocument Text (*.odt)").click();
+    h.step();
+    h.step();
+    assert_eq!(*copies.borrow(), ["plan.odt".to_string()], "the chosen format downloads");
+    assert_eq!(other.get(), 0);
+}

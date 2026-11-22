@@ -5352,6 +5352,125 @@ fn an_export_to_a_confirming_host_is_never_the_documents_save() {
     assert_eq!(a.session.path.as_deref(), Some(std::path::Path::new("report.docx")));
 }
 
+/// What a hosted frame (`Services::hosted`, `?host=parent`) handed out: plain Saves to the page
+/// (name, Save As) and copies downloaded to the user's computer (name, bytes).
+type Handed = std::rc::Rc<std::cell::RefCell<Vec<(String, bool)>>>;
+type Copies = std::rc::Rc<std::cell::RefCell<Vec<(String, Vec<u8>)>>>;
+
+/// A hosted frame whose page stores saves, with the document the page sent open and edited.
+fn hosted_app(name: &str) -> (WordApp, Handed, Copies) {
+    let mut a = app();
+    let (handed, copies) = (Handed::default(), Copies::default());
+    let (h, c) = (handed.clone(), copies.clone());
+    a.services.hosted = true;
+    a.services.download = Some(Box::new(|_, _| Err("the save picker is never used here".into())));
+    a.services.download_copy = Some(Box::new(move |name: &str, bytes: &[u8]| {
+        c.borrow_mut().push((name.to_string(), bytes.to_vec()));
+        Ok(())
+    }));
+    a.services.host_save = Some(Box::new(move |name: &str, _: &[u8], save_as: bool| {
+        h.borrow_mut().push((name.to_string(), save_as));
+        Ok(())
+    }));
+    a.services.pick_save = Some(Box::new(|name: &str| Some(name.to_string())));
+    a.services.host_open = Some(Inbox::default());
+    a.services.inbox = Some(Inbox::default());
+    let bytes = wordcraft_engine::io::save_bytes_with(name, &typed().session.doc, None, &Default::default()).unwrap();
+    a.services.host_open.as_ref().unwrap().lock().unwrap().push((name.to_string(), bytes));
+    a.drain_inbox();
+    assert_eq!(a.session.path.as_deref(), Some(std::path::Path::new(name)), "the page's document opened");
+    a.run("text.insert", json!({"text": "Edited "})).unwrap();
+    assert!(a.session.dirty);
+    (a, handed, copies)
+}
+
+fn copy_names(copies: &Copies) -> Vec<String> {
+    copies.borrow().iter().map(|(n, _)| n.clone()).collect()
+}
+
+/// Hosted, Save As, the exports and Save these pages as PDF download copies and send the page
+/// nothing; the document keeps its file and its unsaved changes. Only Save goes to the page.
+#[test]
+fn hosted_copies_download_and_only_save_goes_to_the_page() {
+    let (mut a, handed, copies) = hosted_app("report.docx");
+    let revision = a.session.doc.core.revision;
+    for (id, params) in [
+        ("file.saveAs", json!({"path": "report.odt"})),
+        ("file.saveAs", json!({"path": "report copy.docx"})),
+        ("file.exportPdf", json!({})),
+        ("file.exportPng", json!({})),
+        ("file.printPdf", { let mut p = a.ui.print.params(); p["path"] = json!("report.pdf"); p }),
+    ] {
+        let r = a.run(id, params).unwrap_or_else(|e| panic!("{id}: {e}"));
+        assert!(r.get("pendingSave").is_none(), "{id}: no save waits on the page");
+    }
+    assert_eq!(copy_names(&copies), ["report.odt", "report copy.docx", "report.pdf", "report.png", "report.pdf"]);
+    assert!(copies.borrow()[4].1.starts_with(b"%PDF"), "the print settings' PDF");
+    assert!(handed.borrow().is_empty(), "no copy reaches the page: {:?}", handed.borrow());
+    assert_eq!(a.session.path.as_deref(), Some(std::path::Path::new("report.docx")), "Save As never targets another file");
+    assert!(a.session.dirty, "a copy is not a save");
+    assert_eq!(a.session.doc.core.revision, revision, "nor stamped as one");
+
+    a.run("file.save", json!({})).unwrap();
+    assert_eq!(*handed.borrow(), [("report.docx".to_string(), false)], "Save writes the opened file in its own format");
+    assert_eq!(copies.borrow().len(), 5, "and downloads nothing");
+}
+
+/// Hosted, an .odt document saves as .odt, and the next Save after a copy still goes to it.
+#[test]
+fn hosted_save_after_an_export_still_writes_the_opened_file() {
+    let (mut a, handed, copies) = hosted_app("notes.odt");
+    a.run("file.saveAs", json!({"path": "notes.docx"})).unwrap();
+    a.run("file.save", json!({})).unwrap();
+    assert_eq!(copy_names(&copies), ["notes.docx"]);
+    assert_eq!(*handed.borrow(), [("notes.odt".to_string(), false)]);
+}
+
+/// Hosted Save As (File › Save As, which is File › Export here, and its Word template) and the
+/// Save As key download a copy in the chosen format; nothing overwrites the page's file.
+#[test]
+fn hosted_save_as_page_downloads_the_chosen_format() {
+    let (mut a, handed, copies) = hosted_app("plan.docx");
+    crate::backstage::download_copy_as(&mut a, "odt").unwrap();
+    crate::backstage::download_copy_as(&mut a, "md").unwrap();
+    crate::backstage::download_copy_as(&mut a, "dotx").unwrap();
+    a.save_as_dialog();
+    a.run("file.saveAs", json!({})).unwrap();
+    assert_eq!(copy_names(&copies), ["plan.odt", "plan.md", "plan.dotx", "plan.docx", "plan.docx"]);
+    assert!(handed.borrow().is_empty(), "{:?}", handed.borrow());
+    assert_eq!(a.session.path.as_deref(), Some(std::path::Path::new("plan.docx")));
+    assert!(a.session.dirty);
+}
+
+/// Hosted, New, Open and Close are the page's: hidden, refused with a reason, and a dropped
+/// document doesn't open beside the page's one. Pictures still drop in. Outside a host they stay.
+#[test]
+fn hosted_frames_leave_opening_creating_and_closing_to_the_page() {
+    let (mut a, _, _) = hosted_app("plan.docx");
+    let document = a.session.document_id();
+    for id in ["file.new", "file.open", "file.close"] {
+        assert!(a.hosted_hides(id) && !crate::widgets::enabled(&a, id), "{id} is hidden");
+        let e = a.run(id, json!({})).unwrap_err();
+        assert_eq!(e, crate::app::HOSTED_REFUSED, "{id}");
+        assert!(crate::chrome::qat_ids(&a).iter().all(|q| *q != id), "{id} is off the toolbar");
+    }
+    for page in ["home", "new", "open", "close"] {
+        assert!(crate::backstage::hosted_hides_page(&a, page), "{page}");
+    }
+    let docx = wordcraft_engine::io::save_bytes("other.docx", &typed().session.doc).unwrap();
+    a.services.inbox.as_ref().unwrap().lock().unwrap().push(("other.docx".into(), docx));
+    a.drain_inbox();
+    assert_eq!(a.session.document_id(), document, "the dropped document did not open");
+    assert_eq!(a.status_msg.as_ref().map(|(m, _)| m.as_str()), Some(crate::app::HOSTED_REFUSED));
+    assert!(a.ui.recent.is_empty(), "the page's file names are not recorded: {:?}", a.ui.recent);
+
+    let b = typed();
+    for id in ["file.new", "file.open", "file.close"] {
+        assert!(!b.hosted_hides(id) && crate::widgets::enabled(&b, id), "{id} outside a host");
+    }
+    assert!(!crate::backstage::hosted_hides_page(&b, "open"));
+}
+
 /// Macro-enabled documents and templates keep everything (#172), so once saved in this
 /// session AutoSave covers them like a .docx.
 #[test]

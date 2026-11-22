@@ -26,7 +26,8 @@ pub fn enabled(app: &WordApp, id: &str) -> bool {
     }
     match app.session.registry.get(id) {
         // Live editing greys out what it can't share now, and every edit while it can't take one.
-        Some(_) => app.session.why_disabled(id).is_none() && app.live_allows(id),
+        // Hosted, the page opens, creates and closes files itself.
+        Some(_) => app.session.why_disabled(id).is_none() && app.live_allows(id) && !app.hosted_hides(id),
         // Zotero: one command at a time, and only in the desktop app.
         None if id.starts_with("ui.zotero.") => app.zotero.busy.is_none() && !cfg!(target_arch = "wasm32"),
         None if id == "ui.linkTextBox" => enabled(app, "shape.link"),
