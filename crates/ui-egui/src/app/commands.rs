@@ -316,6 +316,9 @@ impl WordApp {
         if let Some(r) = self.ui_command(id, &params) {
             return r;
         }
+        if let Some(r) = self.share_with_host(id) {
+            return r;
+        }
         // Hosted: the page opens, creates and closes files, so these are refused (and hidden).
         // Web: Save these pages as PDF downloads the PDF of the print settings.
         if let Some(r) = self.web_file_command(id, &params) {
@@ -464,6 +467,24 @@ impl WordApp {
 
     /// User commands can ask for a supported Save As target or an opening password (#55).
     /// Scripts and agents use [`WordApp::execute`], which never opens these dialogs.
+    /// Framed by a page that shares files itself ([`Services::host_share`], Nextcloud): Share
+    /// (`file.share`, from the ribbon, a shortcut, command search or automation) is that page's
+    /// sharing, never an exported copy. `None` for another command or without such a page.
+    /// The one host-share hook: whether a host shares files ([`Services::host_share`]). A web page
+    /// (`share: true`) sets it today; a desktop host that shares through Nextcloud can set the same
+    /// hook later, and every Share entry point follows without other changes.
+    pub fn host_shares(&self) -> bool {
+        self.services.host_share.is_some()
+    }
+
+    pub(crate) fn share_with_host(&self, id: &str) -> Option<Result<Value, String>> {
+        if id != "file.share" {
+            return None;
+        }
+        let share = self.services.host_share.as_ref()?;
+        Some(share().map(|()| json!({"shared": "host"})))
+    }
+
     pub(crate) fn execute_user(&mut self, id: &str, params: Value) -> Result<Value, String> {
         // Legacy Word files are import-only (#2445). Only a user's implicit Save asks for
         // a supported target; scripts and explicitly supplied paths keep their normal errors.

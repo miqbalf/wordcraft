@@ -1615,3 +1615,45 @@ fn delete_previous_sentence_shortcut_dispatches_and_can_be_reassigned() {
     assert!(!app.session.sel.is_collapsed());
     assert_eq!(app.session.doc.para_at(&app.session.sel.focus).unwrap().text, "First. Second sentence.");
 }
+
+/// Framed by a page that shares files itself (`Services::host_share`, Nextcloud), every way to
+/// Share asks that page and none exports a copy: `file.share` run from the ribbon, Backstage or
+/// command search (`WordApp::run`), a shortcut the user bound to it, and the control channel
+/// (automation, `window.wordcraft`). Without the page, `file.share` keeps asking where to save a copy.
+#[test]
+fn every_share_entry_point_asks_a_hosting_page() {
+    for hosted in [false, true] {
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut services = crate::Services::default();
+        if hosted {
+            let asked = asked.clone();
+            services.host_share = Some(Box::new(move || {
+                asked.set(asked.get() + 1);
+                Ok(())
+            }));
+        }
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Text")), services);
+        a.session.keymap = wordcraft_engine::keymap::KeyMap::from_value(&json!({"assigned": {"Mod+Shift+F12": "file.share"}}));
+        let ctx = egui::Context::default();
+        let mut entries = 0;
+        // Ribbon, Backstage and command search run it by id.
+        let r = a.run("file.share", json!({}));
+        entries += 1;
+        if hosted {
+            assert_eq!(r, Ok(json!({"shared": "host"})));
+        }
+        // A shortcut the user gave it.
+        assert!(dispatch(&mut a, Key::F12, Modifiers { ctrl: true, command: true, shift: true, ..Default::default() }));
+        entries += 1;
+        // Automation.
+        let (req, _reply) = crate::ControlRequest::new("command", json!({"command": "file.share"}));
+        let _ = crate::control::handle(&mut a, &ctx, &req);
+        entries += 1;
+        if hosted {
+            assert_eq!(asked.get(), entries, "each entry point asks the page once");
+            assert!(a.dialog.is_none() && !a.ui.backstage, "no Save As or Export opens");
+        } else {
+            assert_eq!(asked.get(), 0);
+        }
+    }
+}
