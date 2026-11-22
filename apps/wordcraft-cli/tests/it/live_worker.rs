@@ -25,8 +25,8 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use tokio::sync::watch;
 use wordcraft_cli::live_worker::{
-    Clock, Config, EMPTY_GRACE_MS, ENDED_KIND, FileGot, Flow, Grant, HubTicket, NOTICE_KIND, Nextcloud, OpenError, QUIET_MS, Room, RoomFiles, Rooms,
-    SAVE_GIVE_UP_MS, Secret, Spawn, listen, router, serve_grant, service_ticket,
+    CONFLICT_TEXT, Clock, Config, EMPTY_GRACE_MS, ENDED_KIND, FileGot, Flow, Grant, HubTicket, NOTICE_KIND, Nextcloud, OpenError, QUIET_MS, Room,
+    RoomFiles, Rooms, SAVE_GIVE_UP_MS, Secret, Spawn, listen, router, serve_grant, service_ticket,
 };
 use wordcraft_doc::{Document, Paragraph, Pos, para_block};
 use wordcraft_engine::io::{open_bytes, save_bytes};
@@ -292,7 +292,18 @@ struct Nc {
     close_status: Option<StatusCode>,
     /// The `idle` each close sent (`""` when none), in order.
     close_idle: Vec<String>,
+    /// The next this many writes that go through are answered only after [`LATE_BY`]: the file
+    /// is written at once, the answer comes after the worker gave up waiting for it.
+    late_puts: u32,
+    /// Answer the room's close only after [`LATE_BY`] (it is never carried out).
+    close_late: bool,
+    /// A close notifies the worker again for this room first (a ticket handed out meanwhile).
+    notify_on_close: Option<Arc<watch::Sender<String>>>,
 }
+
+/// How late a late answer comes, and how long the impatient worker waits for one.
+const LATE_BY: std::time::Duration = std::time::Duration::from_millis(1_500);
+const IMPATIENT: std::time::Duration = std::time::Duration::from_millis(300);
 
 type NcState = Arc<Mutex<Nc>>;
 
@@ -339,18 +350,26 @@ async fn nc_put(State(nc): State<NcState>, Path(room): Path<String>, h: HeaderMa
     if let Some(d) = slow {
         tokio::time::sleep(d).await;
     }
-    let mut n = nc.lock().unwrap();
-    let if_match = h.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).unwrap_or("").trim_matches('"').to_owned();
-    if if_match != etag_of(&n.files[FILE]) {
-        n.calls.push("put412");
-        return (StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response();
+    let late = {
+        let mut n = nc.lock().unwrap();
+        let if_match = h.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).unwrap_or("").trim_matches('"').to_owned();
+        if if_match != etag_of(&n.files[FILE]) {
+            n.calls.push("put412");
+            return (StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response();
+        }
+        if let Some(status) = n.put_status.or(n.put_status_after_copy.filter(|_| n.calls.contains(&"copy"))) {
+            n.calls.push("putfail");
+            return (status, "no").into_response();
+        }
+        n.calls.push("put");
+        n.files.insert(FILE.into(), body.to_vec());
+        let late = n.late_puts > 0;
+        n.late_puts = n.late_puts.saturating_sub(1);
+        late
+    };
+    if late {
+        tokio::time::sleep(LATE_BY).await;
     }
-    if let Some(status) = n.put_status.or(n.put_status_after_copy.filter(|_| n.calls.contains(&"copy"))) {
-        n.calls.push("putfail");
-        return (status, "no").into_response();
-    }
-    n.calls.push("put");
-    n.files.insert(FILE.into(), body.to_vec());
     json_response(json!({"etag": etag_of(&body)}))
 }
 
@@ -377,6 +396,19 @@ async fn nc_copy(State(nc): State<NcState>, Path(room): Path<String>, h: HeaderM
 async fn nc_room(State(nc): State<NcState>, Path((room, what)): Path<(String, String)>, uri: Uri, h: HeaderMap) -> Response {
     if !signed(&h, &room) {
         return deny(&nc);
+    }
+    if what == "close" {
+        let (late, again) = {
+            let n = nc.lock().unwrap();
+            (n.close_late, n.notify_on_close.clone())
+        };
+        if let Some(tx) = again {
+            tx.send_replace(TOKEN.to_owned());
+        }
+        if late {
+            tokio::time::sleep(LATE_BY).await;
+            return (StatusCode::GATEWAY_TIMEOUT, "late").into_response();
+        }
     }
     let mut n = nc.lock().unwrap();
     if what == "close" {
@@ -479,15 +511,32 @@ struct World {
     base: String,
 }
 
+fn nextcloud_client(base: &str, timeout: Option<std::time::Duration>) -> Arc<Nextcloud> {
+    Arc::new(match timeout {
+        Some(t) => Nextcloud::with_timeout(base, worker_secret(), t).unwrap(),
+        None => Nextcloud::new(base, worker_secret()).unwrap(),
+    })
+}
+
 fn worker_secret() -> Arc<Secret> {
     Arc::new(Secret::new("CRAFT_WORKER_SECRET", Some(WORKER_SECRET)).unwrap())
 }
 
 async fn world(bytes: Vec<u8>, editors: usize) -> World {
+    world_with(bytes, editors, None).await
+}
+
+/// [`world`] whose worker gives up a call to Nextcloud after [`IMPATIENT`] (as the real one does
+/// after 30 s), so a [`LATE_BY`] answer comes after it stopped waiting.
+async fn impatient_world(bytes: Vec<u8>, editors: usize) -> World {
+    world_with(bytes, editors, Some(IMPATIENT)).await
+}
+
+async fn world_with(bytes: Vec<u8>, editors: usize, timeout: Option<std::time::Duration>) -> World {
     let (nc, base) = nextcloud(bytes.clone()).await;
     let relay: Shared = Rc::default();
     let clock = Arc::new(TestClock(AtomicU64::new(0)));
-    let files = RoomFiles::new(Arc::new(Nextcloud::new(&base, worker_secret()).unwrap()), ROOM.into(), watch::channel(TOKEN.to_owned()).1);
+    let files = RoomFiles::new(nextcloud_client(&base, timeout), ROOM.into(), watch::channel(TOKEN.to_owned()).1);
     let worker = Room::open(Relay::connect(&relay, SERVICE_UID), files, clock.clone()).await.unwrap();
     let eds = (0..editors)
         .map(|k| {
@@ -1368,11 +1417,15 @@ async fn a_room_the_app_did_not_close_is_not_marked_closed() {
 /// [`world`] with one editor, keeping the notify channel: sending on it is the app notifying the
 /// worker again for this room (another ticket into it).
 async fn served_world(bytes: Vec<u8>) -> (World, watch::Sender<String>) {
+    served_world_with(bytes, None).await
+}
+
+async fn served_world_with(bytes: Vec<u8>, timeout: Option<std::time::Duration>) -> (World, watch::Sender<String>) {
     let (nc, base) = nextcloud(bytes.clone()).await;
     let relay: Shared = Rc::default();
     let clock = Arc::new(TestClock(AtomicU64::new(0)));
     let (notify, token) = watch::channel(TOKEN.to_owned());
-    let files = RoomFiles::new(Arc::new(Nextcloud::new(&base, worker_secret()).unwrap()), ROOM.into(), token);
+    let files = RoomFiles::new(nextcloud_client(&base, timeout), ROOM.into(), token);
     let worker = Room::open(Relay::connect(&relay, SERVICE_UID), files, clock.clone()).await.unwrap();
     let ed = editor(&relay, "editor0", &bytes);
     let mut w = World { relay, nc, clock, worker, eds: vec![ed], base };
@@ -1490,4 +1543,148 @@ async fn a_refused_close_with_no_window_closes_after_the_wait() {
     assert_eq!(w.count("close"), 1);
     let idle = w.nc.lock().unwrap().close_idle.clone();
     assert!(idle.last().and_then(|s| s.parse::<u64>().ok()).is_some_and(|s| s * 1000 >= EMPTY_GRACE_MS), "{idle:?}");
+}
+
+// ---- L2: a save answered after the worker stopped waiting -------------------------------------
+
+fn conflict_copies(w: &World) -> Vec<String> {
+    let mut names: Vec<String> = w.nc.lock().unwrap().files.keys().filter(|k| k.contains("(conflict")).cloned().collect();
+    names.sort();
+    names
+}
+
+/// L2: the server writes the file but answers after the worker's timeout (a slow Nextcloud).
+/// The worker takes the save for failed and tries again over the old ETag, which gets `412`.
+/// The file holds the worker's own bytes, so there is nothing to keep aside: no conflict copy,
+/// no notice, and saving goes on from the version that landed.
+#[tokio::test]
+async fn a_save_answered_after_the_timeout_makes_no_conflict_copy() {
+    let mut w = impatient_world(file(&["One", "Two"]), 1).await;
+    w.nc.lock().unwrap().late_puts = 1;
+    w.eds[0].type_at_end(0, " fish");
+    w.run_for(20_000, 1_000).await;
+    assert_eq!(w.count("put"), 1, "the first save landed, its answer came too late");
+    assert_eq!(conflict_copies(&w), Vec::<String>::new(), "no conflict copy of the worker's own save");
+    assert_eq!(w.count("copy"), 0);
+    assert_eq!(w.relay.borrow().notices(), Vec::<String>::new(), "no conflict notice");
+    assert_eq!(w.file_texts(), ["One fish", "Two"]);
+    assert_eq!(w.eds[0].saved_at().as_deref(), Some(etag_of(&w.file(FILE)).as_str()), "the editor is told the version that landed");
+    assert!(w.worker.saving_stopped().is_none());
+
+    // Saving goes on normally from there: no second 412.
+    let stale = w.count("put412");
+    w.eds[0].type_at_end(1, " more");
+    w.run_for(10_000, 1_000).await;
+    assert_eq!(w.count("put412"), stale, "the next save is over the right version");
+    assert_eq!(w.file_texts(), ["One fish", "Two more"]);
+    assert_eq!(conflict_copies(&w), Vec::<String>::new());
+}
+
+/// L2: as above, but more was typed before the worker tried again, so the retry writes other
+/// bytes than the late save did. The late save is still recognised, and the retry goes over it.
+#[tokio::test]
+async fn a_late_save_then_more_edits_makes_no_conflict_copy() {
+    let mut w = impatient_world(file(&["One", "Two"]), 1).await;
+    w.nc.lock().unwrap().late_puts = 1;
+    w.eds[0].type_at_end(0, " fish");
+    // Saved after QUIET_MS and the checkpoint's acknowledgement: the write lands, its answer is late.
+    w.run_for(8_000, 1_000).await;
+    assert_eq!(w.count("put"), 1, "the first save landed late");
+    w.eds[0].type_at_end(1, " more");
+    w.run_for(20_000, 1_000).await;
+    assert_eq!(conflict_copies(&w), Vec::<String>::new(), "no conflict copy of the worker's own save");
+    assert_eq!(w.relay.borrow().notices(), Vec::<String>::new());
+    assert_eq!(w.file_texts(), ["One fish", "Two more"], "the later edit is saved over the late save");
+    assert_eq!(w.eds[0].saved_at().as_deref(), Some(etag_of(&w.file(FILE)).as_str()));
+}
+
+/// L2: a late save, and then a real change outside the session before the worker tries again.
+/// That change is not the worker's: it is still copied aside, as ever.
+#[tokio::test]
+async fn a_change_outside_after_a_late_save_is_still_kept_aside() {
+    let mut w = impatient_world(file(&["One", "Two"]), 1).await;
+    w.nc.lock().unwrap().late_puts = 1;
+    w.eds[0].type_at_end(0, " fish");
+    // Saved after QUIET_MS and the checkpoint's acknowledgement: the write lands, its answer is late.
+    w.run_for(8_000, 1_000).await;
+    assert_eq!(w.count("put"), 1, "the first save landed late");
+    let outside = file(&["Changed outside"]);
+    w.nc.lock().unwrap().files.insert(FILE.into(), outside.clone());
+    w.run_for(20_000, 1_000).await;
+    let copy = "Plan (conflict 2026-11-21 1403).docx";
+    assert_eq!(conflict_copies(&w), [copy], "the outside change is kept aside");
+    assert_eq!(w.file(copy), outside);
+    assert_eq!(w.relay.borrow().notices(), [format!("{CONFLICT_TEXT} {copy}.")]);
+    assert_eq!(w.file_texts(), ["One fish", "Two"], "the session's document is saved over it");
+}
+
+/// L2: a real outside change is copied aside, and the write over it then lands late. Trying that
+/// write again must not copy the worker's own bytes aside a second time.
+#[tokio::test]
+async fn a_late_write_after_a_conflict_copy_makes_no_second_copy() {
+    let mut w = impatient_world(file(&["One", "Two"]), 1).await;
+    w.eds[0].type_at_end(0, " fish");
+    w.run_for(10_000, 1_000).await;
+    assert_eq!(w.count("put"), 1);
+    let outside = file(&["Changed outside"]);
+    {
+        let mut n = w.nc.lock().unwrap();
+        n.files.insert(FILE.into(), outside.clone());
+        n.late_puts = 1;
+    }
+    w.eds[0].type_at_end(1, " more");
+    w.run_for(30_000, 1_000).await;
+    let copy = "Plan (conflict 2026-11-21 1403).docx";
+    assert_eq!(conflict_copies(&w), [copy], "one copy: the outside version only");
+    assert_eq!(w.file(copy), outside);
+    assert_eq!(w.relay.borrow().notices(), [format!("{CONFLICT_TEXT} {copy}.")], "told once, once the write is known to have landed");
+    assert_eq!(w.file_texts(), ["One fish", "Two more"]);
+    assert!(w.worker.saving_stopped().is_none());
+}
+
+/// L1 parked minor (R2-M1): two windows are announced one after the other; one joins and leaves
+/// soon, the other is slow. The first join must not use up the slow window's mark: the room is
+/// still served when it joins, within ALONE_MS of its ticket.
+#[tokio::test]
+async fn each_announced_window_is_waited_for() {
+    let (mut w, notify) = served_world(file(&["One", "Two"])).await;
+    emptied(&mut w).await;
+    assert_eq!(w.run_for(3_000, 1_000).await, Flow::Continue);
+    // Window B's ticket, then window C's a turn later.
+    notify.send_replace(TOKEN.to_owned());
+    assert_eq!(w.tick(1_000).await, Flow::Continue);
+    notify.send_replace(TOKEN.to_owned());
+    assert_eq!(w.run_for(2_000, 1_000).await, Flow::Continue);
+    // C joins, stays a while, leaves.
+    let bytes = w.file(FILE);
+    w.eds.push(editor(&w.relay, "editorC", &bytes));
+    assert_eq!(w.run_for(15_000, 1_000).await, Flow::Continue);
+    let at = w.eds[0].at;
+    w.relay.borrow_mut().leave(at);
+    w.eds.clear();
+    // B is slow: it joins 40 s after C left, well within ALONE_MS of its ticket.
+    assert_eq!(w.run_for(40_000, 1_000).await, Flow::Continue, "the slow window is still waited for");
+    assert_eq!(w.count("close"), 0);
+    reopened_window_is_saved(&mut w).await;
+}
+
+/// L1 parked minor (R2-M3): the close takes longer than the worker waits (a slow server), and a
+/// ticket into the room is handed out meanwhile. The worker must not leave that window a room
+/// nobody serves: it serves the room on.
+#[tokio::test]
+async fn a_notify_during_a_close_that_timed_out_is_served() {
+    let (mut w, notify) = served_world_with(file(&["One", "Two"]), Some(IMPATIENT)).await;
+    {
+        let mut n = w.nc.lock().unwrap();
+        n.close_late = true;
+        n.notify_on_close = Some(Arc::new(notify));
+    }
+    emptied(&mut w).await;
+    assert_eq!(w.run_for(20_000, 1_000).await, Flow::Continue, "the window announced during the close is served");
+    {
+        let mut n = w.nc.lock().unwrap();
+        n.close_late = false;
+        n.notify_on_close = None;
+    }
+    reopened_window_is_saved(&mut w).await;
 }
