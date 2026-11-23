@@ -104,6 +104,30 @@ fn a_new_document_is_not_told_about() {
     assert_eq!(shown(&h), None, "its fonts are WordCraft's choice");
 }
 
+/// Hosted (`?host=parent`) never auto-opens the box, and the dialog stays reachable by hand;
+/// standalone and desktop (not hosted) open it as before.
+#[test]
+fn a_hosted_editor_never_opens_the_box_by_itself() {
+    if aptos_installed() {
+        return;
+    }
+    let mut a = app(true);
+    a.services.hosted = true;
+    let mut h = harness(a);
+    h.run_steps(5);
+    assert_eq!(shown(&h), None, "no modal over the hosted document");
+    assert!(h.state().dialog.is_none());
+    // By hand, from the menu command.
+    let mut b = app(true);
+    b.services.hosted = true;
+    b.dialog = Some(Dialog::FontDownload { fonts: rows(&mut b), dont_show: false });
+    let h = harness(b);
+    assert_eq!(shown(&h), Some("fontDownload"), "still reachable");
+    // Not hosted: as before.
+    let h = harness(app(true));
+    assert_eq!(shown(&h), Some("fontDownload"));
+}
+
 #[test]
 fn dont_show_this_again_turns_the_box_off() {
     if aptos_installed() {

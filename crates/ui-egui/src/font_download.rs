@@ -100,6 +100,12 @@ impl WordApp {
 /// downloaded and the box hasn't been turned off. Called every frame; it waits for an open
 /// dialog or the File tab to close rather than replace them.
 pub(crate) fn tick(app: &mut WordApp) {
+    // Framed by a page (Nextcloud): the modal would swallow the first keys, Ctrl+S included, and
+    // the user can't install fonts there. Fonts are substituted silently; File and the status bar
+    // still open the box by hand.
+    if app.services.hosted {
+        return;
+    }
     let id = app.session.document_id();
     if !app.font_notices || app.host_fonts_coming || app.font_notice_seen.contains(&id) || app.dialog.is_some() || app.ui.backstage {
         return;
