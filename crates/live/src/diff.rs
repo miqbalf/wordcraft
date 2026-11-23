@@ -27,19 +27,60 @@ pub(crate) fn text_edit(have: &str, want: &str) -> Option<TextEdit> {
     Some(TextEdit { at: prefix, del, ins })
 }
 
-/// Where char `at` of `old` is in `new`, the edit between them taken as [`text_edit`] finds it:
-/// before the edit it stays, after it it moves by what the edit added or removed, and inside
-/// replaced text it goes to the start of the edit.
-pub(crate) fn follow(old: &str, new: &str, at: usize) -> usize {
-    let Some(e) = text_edit(old, new) else { return at };
-    let ins = e.ins.chars().count();
-    if at <= e.at {
-        at
-    } else if at >= e.at + e.del {
-        (at + ins).saturating_sub(e.del)
-    } else {
-        e.at
+/// The separate edits that turn `have` into `want`, in order, each `at` in `have`'s chars: a
+/// shortest char diff of the stretch [`text_edit`] finds, so two edits apart stay apart. That
+/// stretch is one edit when it is too long to diff (over about a million char pairs).
+pub(crate) fn text_edits(have: &str, want: &str) -> Vec<TextEdit> {
+    let Some(one) = text_edit(have, want) else { return Vec::new() };
+    let x: Vec<char> = have.chars().skip(one.at).take(one.del).collect();
+    let y: Vec<char> = one.ins.chars().collect();
+    let (n, m) = (x.len(), y.len());
+    if n == 0 || m == 0 || n.saturating_mul(m) > 1 << 20 {
+        return vec![one];
     }
+    // lcs[i * w + j]: the longest common subsequence of x[i..] and y[j..].
+    let w = m + 1;
+    let mut lcs = vec![0u32; (n + 1) * w];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i * w + j] = if x[i] == y[j] { lcs[(i + 1) * w + j + 1] + 1 } else { lcs[(i + 1) * w + j].max(lcs[i * w + j + 1]) };
+        }
+    }
+    let (mut out, mut cur, mut i, mut j) = (Vec::new(), None::<TextEdit>, 0, 0);
+    while i < n || j < m {
+        if i < n && j < m && x[i] == y[j] {
+            out.extend(cur.take());
+            i += 1;
+            j += 1;
+            continue;
+        }
+        let e = cur.get_or_insert_with(|| TextEdit { at: one.at + i, del: 0, ins: String::new() });
+        if j < m && (i == n || lcs[i * w + j + 1] >= lcs[(i + 1) * w + j]) {
+            e.ins.push(y[j]);
+            j += 1;
+        } else {
+            e.del += 1;
+            i += 1;
+        }
+    }
+    out.extend(cur);
+    out
+}
+
+/// Where char `at` of the old text is after `edits` (from [`text_edits`]): moved by what the
+/// edits before it added or removed; inside deleted text it goes to the start of that edit.
+pub(crate) fn follow_edits(edits: &[TextEdit], at: usize) -> usize {
+    let mut shift = 0isize;
+    for e in edits {
+        if at <= e.at {
+            break;
+        }
+        if at < e.at + e.del {
+            return e.at.saturating_add_signed(shift);
+        }
+        shift += e.ins.chars().count() as isize - e.del as isize;
+    }
+    at.saturating_add_signed(shift)
 }
 
 /// Chars `a` and `b` share at the front.
@@ -174,6 +215,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn text_edits_keep_separate_edits_apart() {
+        let e = text_edits("Alpha beta", "Apha beta!");
+        assert_eq!(e, [TextEdit { at: 1, del: 1, ins: String::new() }, TextEdit { at: 10, del: 0, ins: "!".into() }]);
+        assert_eq!(follow_edits(&e, 5), 4);
+        assert_eq!(follow_edits(&e, 2), 1);
+        assert_eq!(follow_edits(&e, 10), 9);
+        assert_eq!(text_edits("same", "same"), []);
+        assert_eq!(text_edits("abc", "xyz"), [TextEdit { at: 0, del: 3, ins: "xyz".into() }]);
+    }
+
+    #[test]
     fn text_edit_is_the_middle() {
         assert_eq!(text_edit("hello", "help"), Some(TextEdit { at: 3, del: 2, ins: "p".into() }));
         assert_eq!(text_edit("aaa", "aaaa"), Some(TextEdit { at: 3, del: 0, ins: "a".into() }));
@@ -184,10 +236,10 @@ mod tests {
     #[test]
     fn follow_moves_with_the_text_around_it() {
         // "abc|def": typing before the caret moves it, after it does not.
-        assert_eq!(follow("abcdef", "XYabcdef", 3), 5);
-        assert_eq!(follow("abcdef", "abcdefZ", 3), 3);
+        assert_eq!(follow_edits(&text_edits("abcdef", "XYabcdef"), 3), 5);
+        assert_eq!(follow_edits(&text_edits("abcdef", "abcdefZ"), 3), 3);
         // Deleting around it puts it where the deletion was.
-        assert_eq!(follow("abcdef", "af", 3), 1);
+        assert_eq!(follow_edits(&text_edits("abcdef", "af"), 3), 1);
     }
 
     #[test]

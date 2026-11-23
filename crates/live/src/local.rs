@@ -229,11 +229,12 @@ impl LiveMap {
             }
             if let Some(p) = after.body.get(*i).and_then(|b| b.as_para()) {
                 ops.out.pids.push((*i, id));
-                let (from_text, from_runs) = match src {
-                    Some(b) => (b.text, b.runs),
-                    None => (old.para(&was).map_or_else(|| p.text.clone(), |q| q.text.clone()), Vec::new()),
+                let (from_text, from_runs, from_attrs) = match src {
+                    Some(b) => (b.text, b.runs, b.attrs),
+                    None => (old.para(&was).map_or_else(|| p.text.clone(), |q| q.text.clone()), Vec::new(), map::para_attrs(p)),
                 };
-                self.moved.insert(was, Moved { from_text, from_runs, parts: vec![Part { start: 0, to: id, to_text: p.text.clone() }] });
+                let parts = vec![Part { start: 0, to: id, to_text: p.text.clone() }];
+                self.moved.insert(was, Moved { from_text, from_runs, from_attrs, parts });
             }
         }
         want
@@ -289,12 +290,15 @@ impl LiveMap {
     fn split_as_move(&mut self, ops: &mut Ops, p: u64, k: usize, tail: u64, taken: &HashSet<u64>) -> Option<u64> {
         let src = ops.live.block(p)?;
         let at = ops.at(p)?;
+        let n = src.text.chars().count();
+        if k > n {
+            return None;
+        }
         ops.remove(p);
         if ops.at(p).is_some() {
             return None;
         }
         let head = self.mint(ops.live, taken);
-        let n = src.text.chars().count();
         let part = |id: u64, from: usize, to: usize| SeedBlock {
             id,
             text: src.text.chars().skip(from).take(to - from).collect(),
@@ -305,7 +309,7 @@ impl LiveMap {
         ops.insert(at, &h);
         ops.insert(at + 1, &t);
         let parts = vec![Part { start: 0, to: head, to_text: h.text }, Part { start: k, to: tail, to_text: t.text }];
-        self.moved.insert(p, Moved { from_text: src.text, from_runs: src.runs, parts });
+        self.moved.insert(p, Moved { from_text: src.text, from_runs: src.runs, from_attrs: src.attrs, parts });
         Some(head)
     }
 

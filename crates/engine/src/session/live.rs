@@ -69,11 +69,35 @@ impl Anchor {
         Anchor { story: pos.story, pid, index, chars, text, pos: pos.clone() }
     }
 
+    /// The same character in the paragraphs from index `index` on whose texts, joined, start
+    /// like the old paragraph's text up to it: the head and the tail of the paragraph split
+    /// under it. `None` when they do not.
+    fn in_split(&self, doc: &Document, paths: &[super::Path], index: usize) -> Option<Pos> {
+        let mut old = self.text.chars();
+        let mut before = 0;
+        for path in paths.get(index..)? {
+            let text = doc.para(self.story, path).map_or("", |p| p.text.as_str());
+            let n = text.chars().count();
+            // The paragraph's text first: when it runs out, no char of the old text is used up.
+            let same = text.chars().zip(old.by_ref()).take_while(|(a, b)| a == b).count();
+            if self.chars <= before + same {
+                let off = text.char_indices().nth(self.chars - before).map_or(text.len(), |(i, _)| i);
+                return Some(Pos::new(self.story, path.clone(), off));
+            }
+            if same < n {
+                return None;
+            }
+            before += n;
+        }
+        None
+    }
+
     /// The same place in `doc`: the same character of the paragraph with the same shared id
     /// (followed through the edit to its text, see [`follow`]); when two paragraphs have that
-    /// id, the one whose text is most like the old one; when that paragraph is gone, the paragraph
-    /// now at the same index: at the same character when it starts with the same text up to
-    /// there (the head of a split), otherwise at its start. An unshared paragraph (id 0) keeps its path. The
+    /// id, the one whose text is most like the old one; when that paragraph is gone, the same
+    /// character in the paragraphs from its index on when their texts, joined, start like the
+    /// old text up to it (the head and tail of a split), otherwise the start of the paragraph now
+    /// at its index. An unshared paragraph (id 0) keeps its path. The
     /// result is clamped to the document.
     fn find(&self, doc: &Document) -> Pos {
         if self.pid == 0 {
@@ -91,17 +115,13 @@ impl Anchor {
                 let off = p.text.char_indices().nth(chars).map_or(p.text.len(), |(i, _)| i);
                 Pos::new(self.story, path.clone(), off)
             }
-            None => match paths.get(self.index.min(paths.len().saturating_sub(1))) {
-                // The paragraph now at its index, at the same character when that one starts
-                // with the same text up to it (the head of the paragraph split under it).
-                Some(path) => {
-                    let text = doc.para(self.story, path).map_or("", |p| p.text.as_str());
-                    let same = self.text.chars().zip(text.chars()).take_while(|(a, b)| a == b).count() >= self.chars;
-                    let off = if same { text.char_indices().nth(self.chars).map_or(text.len(), |(i, _)| i) } else { 0 };
-                    Pos::new(self.story, path.clone(), off)
+            None => {
+                let index = self.index.min(paths.len().saturating_sub(1));
+                match paths.get(index) {
+                    Some(path) => self.in_split(doc, &paths, index).unwrap_or_else(|| Pos::new(self.story, path.clone(), 0)),
+                    None => doc.start_of(StoryRef::Body),
                 }
-                None => doc.start_of(StoryRef::Body),
-            },
+            }
         };
         doc.clamp(&pos)
     }

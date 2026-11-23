@@ -280,6 +280,30 @@ fn apply_remote_keeps_caret_in_the_head_of_a_split() {
     assert_eq!((p.text.as_str(), &p.text[..at.off]), ("Alpha", "Alp"), "the same character of the head");
 }
 
+/// The same split, with the caret in the part that moved to the new paragraph: it stays on its
+/// character there.
+#[test]
+fn apply_remote_keeps_caret_in_the_tail_of_a_split() {
+    let mut s = Session::new(Document::from_text("Alpha beta\nEnd\n"));
+    share(&mut s);
+    let first = s.doc.para_paths(StoryRef::Body)[0].clone();
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, first, 8));
+    s.apply_remote(|d| {
+        if let Ok(body) = d.story_mut(StoryRef::Body) {
+            body.remove(0);
+            for (i, t) in ["Alpha", " beta"].into_iter().enumerate() {
+                let mut p = Paragraph::with_text(t, Default::default());
+                p.pid = 300 + i as u64;
+                body.insert(i, Arc::new(Block::Para(p)));
+            }
+        }
+    })
+    .unwrap();
+    let at = s.sel.focus.clone();
+    let p = s.doc.para_at(&at).unwrap();
+    assert_eq!((p.text.as_str(), &p.text[..at.off]), (" beta", " be"), "the same character of the tail");
+}
+
 #[test]
 fn apply_remote_keeps_caret_on_same_character() {
     let mut s = Session::new(Document::from_text("Alpha\nBravo\n"));

@@ -70,13 +70,20 @@
 //! block). It is not a removal: typing, deletes and formatting that land in the old block are
 //! forwarded into the moved paragraph instead, again by this peer only.
 //!
-//! A paragraph split inside its text (Enter, or a paste of several lines) is moved the same way,
-//! into two new paragraphs: its head and its tail. The shared document could keep the head in
+//! A paragraph split inside its text by Enter is moved the same way, into two new paragraphs:
+//! its head and its tail. (Only a new paragraph right after the head is taken for the tail; a
+//! paste of several lines, or a table, between head and tail is still a plain insert, and the
+//! tail's text is deleted from the old paragraph, with the race below.) The shared document could keep the head in
 //! the old block and move only the tail, but the tail's characters would then be deleted there,
 //! and another editor's concurrent delete or formatting in the tail would land on deleted
 //! characters and be lost (their typing would land at the end of the head). Kept whole, the old
 //! block shows every such edit, and each is forwarded to the part it falls in. A split at the end
 //! of a paragraph moves no text and keeps the paragraph's id.
+//!
+//! Two editors splitting (or moving) the same paragraph within one round trip each move it, so
+//! the merged document holds its text twice; every replica ends the same. Accepted for phase 1.
+//! Forwarding is done only by the editor that moved the paragraph: if it leaves, or its link is
+//! reset, before another editor's racing edit reaches it, that edit stays in the old block.
 //!
 //! The peer remembers the last [`REMEMBERED`] removals and moves; a race against an older one
 //! is not recovered.
@@ -221,6 +228,8 @@ struct Moved {
     from_text: String,
     /// Its runs then.
     from_runs: Vec<(usize, craft_collab::Attributes)>,
+    /// Its own attributes then.
+    from_attrs: craft_collab::Attributes,
     /// Where its text went, in order: a move has one part, a split two.
     parts: Vec<Part>,
 }
@@ -259,6 +268,15 @@ impl LiveMap {
         let ids = seed_ids(doc);
         let tables = doc.body.iter().zip(ids).filter(|(b, _)| b.as_table().is_some()).map(|(_, id)| id).collect();
         LiveMap { space, next: 0, tables, removed: Bounded::default(), moved: Bounded::default(), recovered: Bounded::default() }
+    }
+
+    /// [`LiveMap::new`] for a link set up again. Ids this peer already minted in the same
+    /// `space` are not minted again: a block undone away can leave its id in the order, and a
+    /// new block under that id would show up twice.
+    pub fn renew(&mut self, doc: &Document, space: u32) {
+        let next = (self.space == space).then_some(self.next);
+        *self = LiveMap::new(doc, space);
+        self.next = next.unwrap_or(0);
     }
 
     /// Mint new ids in `space` from now on.
@@ -313,5 +331,27 @@ impl LiveMap {
             return Err(MapError::NoSpace { command: command.to_owned() });
         }
         self.diff(live, before, after, command)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use craft_collab::LiveDoc;
+    use wordcraft_doc::Document;
+
+    use super::LiveMap;
+
+    #[test]
+    fn a_renewed_map_does_not_mint_an_id_again() {
+        let live = LiveDoc::seeded(&[]).unwrap();
+        let doc = Document::default();
+        let mut map = LiveMap::new(&doc, 7);
+        let first = map.mint(&live, &HashSet::new());
+        map.renew(&doc, 7);
+        assert_ne!(map.mint(&live, &HashSet::new()), first);
+        map.renew(&doc, 8);
+        assert_eq!(map.mint(&live, &HashSet::new()), (8 << 32) | 1, "a new space starts over");
     }
 }

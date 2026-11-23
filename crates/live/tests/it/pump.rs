@@ -355,12 +355,15 @@ fn random_command(rng: &mut Rng) -> (&'static str, Value) {
 }
 
 /// `n` editors, `steps` commands, pumps and partial deliveries interleaved at random. A
-/// quarter of the commands go straight to the session, so the pump's flush picks them up.
+/// quarter of the commands go straight to the session, so the pump's flush picks them up. The
+/// safety net is off, so the mapping alone must keep every window equal to its own replica (what
+/// the saver writes) and to the others.
 fn converge_through_pump(n: usize, seed: u64, steps: usize) {
     let relay = relay(Some(seed ^ 0x5eed));
     let bytes = file(&["Alpha beta", "Gamma", "Delta epsilon zeta", ""]);
     let mut eds: Vec<Ed> = (0..n).map(|k| Ed::open(&relay, &format!("u{k}"), Access::Edit, &bytes)).collect();
     for e in &mut eds {
+        e.le.set_verify_every(0);
         e.pump();
     }
     let mut rng = Rng(seed);
@@ -385,6 +388,10 @@ fn converge_through_pump(n: usize, seed: u64, steps: usize) {
     assert!(ran >= steps / 2, "seed {seed}: the editors went live and ran commands ({ran})");
     let mut refs: Vec<&mut Ed> = eds.iter_mut().collect();
     settle(&relay, &mut refs);
+    for (k, e) in eds.iter().enumerate() {
+        assert_eq!(e.le.drift(&e.s), None, "seed {seed}, {n} editors: editor {k} shows what its replica holds");
+        assert_eq!(e.le.repairs(), 0, "seed {seed}: the safety net never ran");
+    }
     for e in &eds[1..] {
         assert_same(&eds[0], e, &format!("seed {seed}, {n} editors"));
     }
@@ -1197,6 +1204,51 @@ fn an_edit_in_the_tail_of_a_split_lands_in_the_new_paragraph() {
     assert_eq!(texts(&a.s.doc), ["Alpha", " ", "beta delta!", "En", "YdX of "]);
 }
 
+/// Two separate edits racing a split, one in the head and one in the tail, reach the splitter
+/// together; each lands in its own part, and the split stays where it was made.
+#[test]
+fn two_edits_racing_a_split_land_in_their_own_parts() {
+    let relay = relay(None);
+    let bytes = file(&["Alpha beta", "End"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+
+    a.caret(0, 5);
+    assert!(a.run("text.newParagraph", json!({})));
+    select_range(&mut b, 0, 1, 2);
+    assert!(b.run("text.delete", json!({})), "bob deletes the \"l\"");
+    b.end_of(0);
+    assert!(b.run("text.insert", json!({"text": "!"})), "bob types at the end");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "two edits against a split");
+    assert_eq!(texts(&a.s.doc), ["Apha", " beta!", "End"]);
+}
+
+/// A paragraph's own formatting set while another editor splits it reaches both its head and
+/// its tail.
+#[test]
+fn centring_a_paragraph_while_it_is_split_centres_both_parts() {
+    let relay = relay(None);
+    let bytes = file(&["Alpha beta gamma delta", "End of the line"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+
+    a.caret(0, 5);
+    assert!(a.run("text.newParagraph", json!({})));
+    b.caret(0, 2);
+    assert!(b.run("para.alignCenter", json!({})), "bob centres the paragraph");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "centring against a split");
+    assert_eq!(texts(&a.s.doc), ["Alpha", " beta gamma delta", "End of the line"]);
+    for e in [&a, &b] {
+        let align: Vec<_> = e.s.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.props.align).collect();
+        assert_eq!(align[..2], [Some(wordcraft_doc::Align::Center); 2], "both parts are centred");
+        assert_ne!(align[2], Some(wordcraft_doc::Align::Center), "the next paragraph is not");
+    }
+}
+
 /// The safety net: a window whose body drifted from the shared copy (here, by an edit made
 /// behind the mapping's back) is found out on the periodic check and rebuilt from the shared
 /// copy; a window that did not drift is left alone.
@@ -1227,6 +1279,7 @@ fn a_drifted_window_is_rebuilt_from_the_shared_copy() {
         a.pump();
     }
     assert_eq!(a.le.drift(&a.s), None, "the periodic check rebuilt the body");
+    assert_eq!(a.le.repairs(), 1, "and counted it");
     assert_same(&a, &b, "the window shows the shared document again");
     assert_eq!(texts(&a.s.doc), ["One!", "Two"]);
 }

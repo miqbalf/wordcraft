@@ -30,6 +30,7 @@ impl LiveMap {
             .iter()
             .filter_map(|c| match c {
                 BlockChange::Text { id } if self.moved.contains(id) || self.removed.contains(id) => Some(*id),
+                BlockChange::Attrs { id } if self.moved.contains(id) => Some(*id),
                 _ => None,
             })
             .collect();
@@ -85,42 +86,48 @@ impl LiveMap {
         let (Some(tomb), Some(m)) = (live.block(old), self.moved.get(&old).cloned()) else { return };
         let mut ops = Ops::new(live);
         let from_len = m.from_text.chars().count();
-        let edit = diff::text_edit(&m.from_text, &tomb.text);
-        let ins_len = edit.as_ref().map_or(0, |e| e.ins.chars().count());
+        // Each racing edit on its own (two edits in one batch must not become one replace that
+        // pulls text across the split), with where it starts in the tombstone's text.
+        let edits = diff::text_edits(&m.from_text, &tomb.text);
+        let starts: Vec<usize> = edits.iter().map(|e| diff::follow_edits(&edits, e.at)).collect();
         // The stretch of the old text each part covers.
         let spans: Vec<(usize, usize)> =
             m.parts.iter().enumerate().map(|(i, p)| (p.start, m.parts.get(i + 1).map_or(from_len, |q| q.start).max(p.start))).collect();
         let mut touched = Vec::new();
-        for (part, (lo, hi)) in m.parts.iter().zip(&spans) {
+        for (k, (part, (lo, hi))) in m.parts.iter().zip(&spans).enumerate() {
             let Some((to, have)) = self.target(&ops, part.to) else {
                 log::warn!("live: an edit made in a moved paragraph was not forwarded: it is gone");
                 continue;
             };
             let len = have.text.chars().count();
-            let place = |at: usize| diff::follow(&part.to_text, &have.text, at.saturating_sub(*lo).min(hi - lo)).min(len);
-            if let Some(e) = &edit {
+            // This peer's own edits to the part since the move.
+            let own = diff::text_edits(&part.to_text, &have.text);
+            let place = |at: usize| diff::follow_edits(&own, at.saturating_sub(*lo).min(hi - lo)).min(len);
+            let last = k + 1 == spans.len();
+            // Last edit first, so the places of the earlier ones still hold.
+            for (e, now) in edits.iter().zip(&starts).rev() {
                 let (a, b) = (e.at.clamp(*lo, *hi), (e.at + e.del).clamp(*lo, *hi));
-                let last = spans.last().is_some_and(|s| s == &(*lo, *hi));
                 let takes_ins = !e.ins.is_empty() && e.at >= *lo && (e.at < *hi || last);
                 if a < b || takes_ins {
                     let at = place(a);
                     let end = place(b).max(at);
                     let ins = if takes_ins { e.ins.clone() } else { String::new() };
-                    ops.edit_text(to, &diff::TextEdit { at, del: end - at, ins }, &diff::attrs_at(&tomb.runs, e.at));
+                    ops.edit_text(to, &diff::TextEdit { at, del: end - at, ins }, &diff::attrs_at(&tomb.runs, *now));
                     touched.push(to);
                 }
             }
-            // Formatting changed on the chars of this part that the edit kept.
+            // Formatting changed on the chars of this part that the edits kept.
             let have_now = ops.live.block(to).map(|b| b.text).unwrap_or_default();
+            let forwarded = diff::text_edits(&have.text, &have_now);
             let mut run: Option<(usize, usize, craft_collab::Attributes)> = None;
             let mut calls = Vec::new();
             for c in *lo..*hi {
-                let kept = edit.as_ref().is_none_or(|e| c < e.at || c >= e.at + e.del);
-                let now = match &edit {
-                    Some(e) if c >= e.at + e.del => c + ins_len - e.del,
-                    _ => c,
+                let kept = edits.iter().all(|e| c < e.at || c >= e.at + e.del);
+                let p = if kept {
+                    diff::delta(&diff::attrs_at(&m.from_runs, c), &diff::attrs_at(&tomb.runs, diff::follow_edits(&edits, c)))
+                } else {
+                    None
                 };
-                let p = if kept { diff::delta(&diff::attrs_at(&m.from_runs, c), &diff::attrs_at(&tomb.runs, now)) } else { None };
                 let extends = matches!((&run, &p), (Some((_, e, q)), Some(p)) if *e == c && q == p);
                 match run.as_mut() {
                     Some((_, e, _)) if extends => *e = c + 1,
@@ -132,8 +139,8 @@ impl LiveMap {
             }
             calls.extend(run);
             for (a, b, attrs) in calls {
-                let at = diff::follow(&have.text, &have_now, place(a));
-                let end = diff::follow(&have.text, &have_now, place(b)).max(at);
+                let at = diff::follow_edits(&forwarded, place(a));
+                let end = diff::follow_edits(&forwarded, place(b)).max(at);
                 if end > at {
                     let r = ops.live.format(to, at, end - at, &attrs);
                     ops.sent(r);
@@ -144,14 +151,35 @@ impl LiveMap {
         for to in touched.iter().copied().collect::<BTreeSet<u64>>() {
             changes.push(BlockChange::Text { id: to });
         }
+        // The block's own attributes (style, alignment…) changed: to every part.
+        if let Some(delta) = diff::delta(&m.from_attrs, &tomb.attrs) {
+            let mut done = BTreeSet::new();
+            for part in &m.parts {
+                let Some((to, have)) = self.target(&ops, part.to).filter(|(to, _)| done.insert(*to)) else { continue };
+                let mut want = have.attrs.clone();
+                for (k, v) in &delta {
+                    if v.is_null() {
+                        want.remove(k);
+                    } else {
+                        want.insert(k.clone(), v.clone());
+                    }
+                }
+                if want != have.attrs {
+                    let r = ops.live.set_attrs(to, &want);
+                    ops.sent(r);
+                    changes.push(BlockChange::Attrs { id: to });
+                }
+            }
+        }
         let now: Vec<String> = m.parts.iter().map(|p| self.target(&ops, p.to).map(|(_, b)| b.text).unwrap_or_default()).collect();
         if let Some(entry) = self.moved.get_mut(&old) {
             for (p, text) in entry.parts.iter_mut().zip(now) {
-                p.start = diff::follow(&m.from_text, &tomb.text, p.start);
+                p.start = diff::follow_edits(&edits, p.start);
                 p.to_text = text;
             }
             entry.from_text = tomb.text;
             entry.from_runs = tomb.runs;
+            entry.from_attrs = tomb.attrs;
         }
         updates.extend(ops.out.updates);
     }
