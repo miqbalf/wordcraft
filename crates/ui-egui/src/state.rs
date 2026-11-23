@@ -44,6 +44,9 @@ impl SaveChoice {
 pub enum AutoSaveBlock {
     /// The web app: saving is a download, there is no file to keep writing to.
     Browser,
+    /// Framed by a page that keeps the user's files (`?host=parent`, such as Nextcloud): Save
+    /// stores the file there, so there is nothing for AutoSave to keep writing to.
+    Hosted,
     /// A new document that has never been saved.
     Unsaved,
     /// A file in a format that can't keep everything (Markdown, plain text, HTML…), by file name.
@@ -59,6 +62,7 @@ impl AutoSaveBlock {
             AutoSaveBlock::Browser => {
                 tl!("AutoSave isn't available in the browser: it can't write to your files. Save downloads a copy.").to_string()
             }
+            AutoSaveBlock::Hosted => tl!("Save (Ctrl+S) stores this file in Nextcloud").to_string(),
             AutoSaveBlock::Unsaved => tl!("Save the document to turn on AutoSave").to_string(),
             AutoSaveBlock::Format { name } => i18n::fmt(
                 tl!(
@@ -76,7 +80,7 @@ impl AutoSaveBlock {
     /// browser): the AutoSave switch asks for that file with Save's dialog, then turns AutoSave
     /// on. Save As makes copies, so it never lifts it.
     pub fn save_as_helps(&self) -> bool {
-        !matches!(self, AutoSaveBlock::Browser)
+        !matches!(self, AutoSaveBlock::Browser | AutoSaveBlock::Hosted)
     }
 }
 

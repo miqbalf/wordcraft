@@ -498,11 +498,12 @@ fn custom_dictionary(app: &mut WordApp, ui: &mut Ui) {
 fn save(app: &mut WordApp, ui: &mut Ui) {
     section(ui, "Save documents");
     // The browser can't write to the user's files, so AutoSave can't be turned on there (#176).
-    let browser = app.autosave_block() == Some(crate::AutoSaveBlock::Browser);
+    let host_block = app.autosave_block().filter(|b| matches!(b, crate::AutoSaveBlock::Browser | crate::AutoSaveBlock::Hosted));
+    let browser = host_block.is_some();
     let mut autosave = app.autosave && !browser;
     let r = ui.add_enabled_ui(!browser, |ui| ui.checkbox(&mut autosave, tl!("AutoSave documents you have saved in WordCraft"))).inner;
     if browser {
-        r.on_disabled_hover_text(crate::AutoSaveBlock::Browser.reason());
+        r.on_disabled_hover_text(host_block.map(|b| b.reason()).unwrap_or_default());
     } else if r.changed() {
         app.autosave = autosave;
         app.session.autosave = autosave;

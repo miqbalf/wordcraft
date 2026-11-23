@@ -436,6 +436,10 @@ impl WordApp {
     /// user saved to in this session, in a format that keeps everything, and never in the browser
     /// (a page can't write to the user's files; saving there is a download, #176).
     pub fn autosave_block(&self) -> Option<AutoSaveBlock> {
+        // Framed by a page that stores the file (Nextcloud): Save goes there, not to a download.
+        if self.services.hosted {
+            return Some(AutoSaveBlock::Hosted);
+        }
         if self.services.download.is_some() {
             return Some(AutoSaveBlock::Browser);
         }
@@ -448,6 +452,20 @@ impl WordApp {
             return Some(AutoSaveBlock::NotSavedHere);
         }
         None
+    }
+
+    /// Whether the host's document service saves this window's document on its own (a live
+    /// session that is linked): the AutoSave switch shows on and locked, and no save path is added.
+    pub fn saved_by_service(&self) -> bool {
+        matches!(self.live, Some(crate::live::LiveMode::Linked(_)))
+    }
+
+    /// The chrome a hosted page (`?host=parent`) drops: the community (Discord) button, which
+    /// has no place inside another product. Desktop and the plain web app are unchanged.
+    pub fn apply_hosted_chrome(&mut self) {
+        if self.services.hosted {
+            self.ui.show_discord = false;
+        }
     }
 
     /// Whether AutoSave covers the document: it is on and nothing blocks it ([`Self::autosave_block`]).

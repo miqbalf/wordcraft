@@ -746,3 +746,21 @@ fn hosted_live_file_shown_again_after_another_document_still_refuses_save() {
     h.state_mut().run("file.saveAs", json!({"path": "plan.odt"})).unwrap();
     assert_eq!(copies.borrow().last().map(String::as_str), Some("plan.odt"), "a copy still downloads");
 }
+
+/// Hosted and live (a .docx in Nextcloud): the AutoSave switch shows on and locked, with the
+/// service's tooltip, and clicking it adds no save path and changes nothing.
+#[test]
+fn hosted_live_autosave_shows_on_and_locked() {
+    let relay = MemRelay::new();
+    let services = Services { hosted: true, ..Default::default() };
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
+    h.run_steps(3);
+    let app = h.state();
+    assert!(app.saved_by_service(), "the live worker saves the file");
+    assert_eq!(app.autosave_block(), Some(wordcraft_ui_egui::AutoSaveBlock::Hosted));
+    assert!(!app.autosaves(), "this window writes no copy of its own");
+    h.get_by_label("AutoSave").click();
+    h.run_steps(2);
+    assert!(h.state().saved_by_service(), "locked: a click changes nothing");
+    assert!(!h.state().autosaves());
+}

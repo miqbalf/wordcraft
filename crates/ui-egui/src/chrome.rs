@@ -350,7 +350,9 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                     // AutoSave switch: greyed out, with the reason as its tooltip, when AutoSave can't
                     // cover the document (#196, #176); clicking it then offers Save As where that helps.
                     let block = app.autosave_block();
-                    let on = app.autosaves();
+                    // A linked live session is saved by the document service: on, and locked.
+                    let by_service = app.saved_by_service();
+                    let on = app.autosaves() || by_service;
                     let color = if block.is_some() { t.text_dim.gamma_multiply(0.6) } else { t.text_dim };
                     // The text is part of the switch (#3370): clicking it toggles AutoSave, and chrome
                     // text is not document text to select (double-clicking it copied "AutoSave").
@@ -361,6 +363,7 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                     );
                     let (r, resp) = ui.allocate_exact_size(vec2(30.0, 16.0), Sense::click());
                     let (fill, stroke, knob_fill) = match (&block, on) {
+                        (Some(_), true) if by_service => (t.accent.gamma_multiply(0.55), t.accent.gamma_multiply(0.55), t.on_accent),
                         (Some(_), _) => (t.input.gamma_multiply(0.5), t.border.gamma_multiply(0.7), t.text_dim.gamma_multiply(0.45)),
                         (None, true) => (t.accent, t.accent, t.on_accent),
                         (None, false) => (t.input, t.border_strong, t.text_dim),
@@ -368,13 +371,18 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                     ui.painter().rect(r, 8.0, fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
                     let knob = autosave_knob_x(rtl, on, r);
                     ui.painter().circle_filled(pos2(knob, r.center().y), 5.0, knob_fill);
-                    let tip = block
-                        .as_ref()
-                        .map_or_else(|| tl!("AutoSave saves every change to the file (needs a saved document)").to_string(), |b| b.reason());
+                    let tip = if by_service {
+                        tl!("Saved to Nextcloud automatically").to_string()
+                    } else {
+                        block
+                            .as_ref()
+                            .map_or_else(|| tl!("AutoSave saves every change to the file (needs a saved document)").to_string(), |b| b.reason())
+                    };
                     let text = text.on_hover_text(tip.as_str()).on_hover_cursor(egui::CursorIcon::PointingHand);
                     let resp = resp.on_hover_text(tip.as_str()).on_hover_cursor(egui::CursorIcon::PointingHand);
                     if text.clicked() || resp.clicked() {
                         match block {
+                            _ if by_service => app.status(tip.clone()),
                             None => {
                                 let _ = app.run("file.autosave", json!({}));
                             }

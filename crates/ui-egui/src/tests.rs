@@ -6427,6 +6427,60 @@ fn autosave_is_unavailable_in_the_browser() {
     assert!(err.contains("browser"), "{err}");
 }
 
+/// Framed by Nextcloud (`?host=parent`, not live, such as an .odt): the switch stays off and
+/// disabled, and says Save stores the file there, not that Save downloads a copy.
+#[test]
+fn hosted_autosave_is_blocked_with_the_nextcloud_reason() {
+    let services = Services { hosted: true, download: Some(Box::new(|_: &str, _: &[u8]| Ok(()))), ..Default::default() };
+    let mut a = WordApp::new(Session::new(wordcraft_doc::Document::new()), services);
+    a.run("text.insert", json!({"text": "Hello"})).unwrap();
+    a.session.path = Some(std::path::PathBuf::from("draft.odt"));
+    assert_eq!(a.autosave_block(), Some(AutoSaveBlock::Hosted));
+    assert!(!a.autosaves(), "the switch stays off");
+    assert!(!a.saved_by_service(), "no live session saves it");
+    let why = AutoSaveBlock::Hosted.reason();
+    assert_eq!(why, "Save (Ctrl+S) stores this file in Nextcloud");
+    assert!(!why.contains("download"), "{why}");
+    assert!(!AutoSaveBlock::Hosted.save_as_helps());
+    let err = a.run("file.autosave", json!({"value": true})).unwrap_err();
+    assert!(err.contains("Nextcloud") && !err.contains("browser"), "{err}");
+}
+
+/// Standalone browser (no host) keeps its reason, and the desktop app still autosaves a saved
+/// .docx: neither is touched by the hosted reason.
+#[test]
+fn standalone_browser_and_desktop_autosave_states_are_unchanged() {
+    let services = Services { download: Some(Box::new(|_: &str, _: &[u8]| Ok(()))), ..Default::default() };
+    let mut web = WordApp::new(Session::new(wordcraft_doc::Document::new()), services);
+    web.run("file.save", json!({"path": "draft.docx"})).unwrap();
+    assert_eq!(web.autosave_block(), Some(AutoSaveBlock::Browser));
+    assert!(!web.saved_by_service());
+    assert!(AutoSaveBlock::Browser.reason().contains("Save downloads a copy"));
+
+    let dir = scratch("autosave-desktop-state");
+    let path = dir.join("novel.docx");
+    let mut desktop = typed();
+    desktop.run("file.save", json!({"path": path.to_string_lossy()})).unwrap();
+    assert_eq!(desktop.autosave_block(), None);
+    assert!(desktop.autosaves());
+    assert!(!desktop.saved_by_service());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The community (Discord) button is dropped when hosted, and kept on the desktop app and the
+/// plain web app.
+#[test]
+fn the_discord_button_is_hidden_only_when_hosted() {
+    let new = |hosted: bool| WordApp::new(Session::new(wordcraft_doc::Document::new()), Services { hosted, ..Default::default() });
+    let mut hosted = new(true);
+    assert!(hosted.ui.show_discord, "shown until the host is known");
+    hosted.apply_hosted_chrome();
+    assert!(!hosted.ui.show_discord);
+    let mut standalone = new(false);
+    standalone.apply_hosted_chrome();
+    assert!(standalone.ui.show_discord, "standalone and desktop keep it");
+}
+
 /// Cancelling the Open picker (Mod+O) left the document as it was but turned AutoSave off.
 #[test]
 fn cancelling_open_keeps_autosave() {
