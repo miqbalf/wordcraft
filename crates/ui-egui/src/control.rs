@@ -4,6 +4,8 @@
 //! - `engine.execute {command, params, doc?}`: run any command (engine or `ui.*`)
 //! - `engine.commands {search?}`: engine and app print commands with enablement and parameters
 //! - `document.inspect`: document structure; `ui.inspect`: UI state, canvas geometry, perf
+//! - `document.bytes {name}`: the active document as that file's bytes (base64 `data`), a copy
+//!   that changes nothing (a host page's Convert to .docx)
 //! - `ui.wheel {x, y, dx?, dy, unit?, phase?}`: a mouse-wheel / trackpad scroll at a window point.
 //! - `ui.click {x, y, button?, count?, shift?, cmd?}`, `ui.move {x, y}`, `ui.drag {x, y, toX, toY}`:
 //!   real pointer input in screen points (reaches every widget)
@@ -236,5 +238,7 @@ mod screenshot_tests {
     }
 }
 
+#[cfg(test)]
+mod bytes_tests;
 #[cfg(test)]
 mod doc_tests;
