@@ -357,6 +357,11 @@ fn random_command(rng: &mut Rng) -> (&'static str, Value) {
 /// `n` editors, `steps` commands, pumps and partial deliveries interleaved at random. A
 /// quarter of the commands go straight to the session, so the pump's flush picks them up.
 fn converge_through_pump(n: usize, seed: u64, steps: usize) {
+    converge_with(n, seed, steps, random_command);
+}
+
+/// [`converge_through_pump`] with commands drawn by `command`.
+fn converge_with(n: usize, seed: u64, steps: usize, command: fn(&mut Rng) -> (&'static str, Value)) {
     let relay = relay(Some(seed ^ 0x5eed));
     let bytes = file(&["Alpha beta", "Gamma", "Delta epsilon zeta", ""]);
     let mut eds: Vec<Ed> = (0..n).map(|k| Ed::open(&relay, &format!("u{k}"), Access::Edit, &bytes)).collect();
@@ -374,7 +379,7 @@ fn converge_through_pump(n: usize, seed: u64, steps: usize) {
             continue;
         }
         random_selection(&mut e.s, &mut rng);
-        let (id, params) = random_command(&mut rng);
+        let (id, params) = command(&mut rng);
         if rng.below(4) == 0 {
             let _ = e.s.run(id, &params);
         } else {
@@ -1098,4 +1103,265 @@ fn a_settled_window_goes_on_after_the_room_lost_its_history() {
     settle(&relay, &mut [&mut a]);
     assert!(a.le.take_history_lost(), "told the room lost its history");
     assert!(a.le.editable(), "holding a settled document, it does not wait: {:?}", a.le.status());
+}
+
+/// Body block `i`, a paragraph.
+fn para(ed: &Ed, i: usize) -> &wordcraft_doc::Paragraph {
+    ed.s.doc.body[i].as_para().unwrap()
+}
+
+/// Whether the char at byte `at` of paragraph `i` is bold.
+fn bold_at(ed: &Ed, i: usize, at: usize) -> bool {
+    let p = para(ed, i);
+    let mut start = 0;
+    for r in &p.runs {
+        if at < start + r.len {
+            return r.props.bold == Some(true);
+        }
+        start += r.len;
+    }
+    false
+}
+
+fn objects(d: &Document) -> usize {
+    d.body.iter().filter_map(|b| b.as_para()).map(|p| p.objects.len()).sum()
+}
+
+fn select(ed: &mut Ed, block: usize, from: usize, to: usize) {
+    ed.s.sel = Selection { anchor: Pos::body(block, from), focus: Pos::body(block, to) };
+}
+
+#[test]
+fn cut_and_paste_are_shared() {
+    let relay = relay(None);
+    let bytes = file(&["Alpha beta gamma", "Second"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(a.le.allows("edit.cut") && a.le.allows("edit.paste") && a.le.allows("edit.pasteText"));
+    assert!(!a.le.allows("edit.pasteSpecial"), "Paste Special stays off");
+    select(&mut a, 0, 6, 11);
+    assert!(a.run("edit.cut", json!({})), "cut runs live");
+    a.end_of(1);
+    assert!(a.run("edit.paste", json!({})), "paste runs live");
+    assert!(a.le.take_notices().is_empty(), "nothing refused");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Alpha gamma", "Secondbeta "], "the other editor sees the cut and the paste");
+    assert_same(&a, &b, "after cut and paste");
+    // Text of several lines makes paragraphs on every side.
+    a.end_of(0);
+    assert!(a.run("edit.pasteText", json!({"text": " one\ntwo"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Alpha gamma one", "two", "Secondbeta "]);
+    assert_same(&a, &b, "after a paste of two lines");
+}
+
+#[test]
+fn a_formatted_paste_keeps_its_runs_on_every_side_and_in_the_save() {
+    let relay = relay(None);
+    let bytes = file(&["Hello world"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    let mut saver = Ed::open(&relay, SERVICE_UID, Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b, &mut saver]);
+    select(&mut a, 0, 0, 5);
+    assert!(a.run("format.bold", json!({})));
+    assert!(a.run("edit.copy", json!({})));
+    a.end_of(0);
+    assert!(a.run("edit.paste", json!({})));
+    assert!(a.le.take_notices().is_empty(), "a paste of formatted text with the document's own styles is shared as it is");
+    settle(&relay, &mut [&mut a, &mut b, &mut saver]);
+    assert_same(&a, &b, "after the formatted paste");
+    assert_eq!(texts(&b.s.doc), ["Hello worldHello"]);
+    let end = para(&b, 0).text.len() - 1;
+    assert!(bold_at(&b, 0, end) && !bold_at(&b, 0, 6), "the pasted text is bold on the other side too");
+
+    // The document service saves it: the checkpoint's document, and the .docx it writes.
+    let state = saver.le.checkpoint().unwrap();
+    settle(&relay, &mut [&mut a, &mut b, &mut saver]);
+    let saved = document_from_state(&saver.s.doc, &state).unwrap();
+    assert!(saved.same_content(&a.s.doc), "the saved document holds the paste: {:?}", texts(&saved));
+    let reopened = wordcraft_engine::io::open_bytes("plan.docx", &save_bytes("plan.docx", &saved).unwrap()).unwrap();
+    let p = reopened.body[0].as_para().unwrap();
+    assert_eq!(p.text, "Hello worldHello");
+    let last = p.runs.last().unwrap();
+    assert_eq!(last.props.bold, Some(true), "the file keeps the pasted formatting");
+}
+
+#[test]
+fn concurrent_cut_and_paste_in_one_paragraph_converge() {
+    let relay = relay(None);
+    let bytes = file(&["The quick brown fox", "jumps"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    // Neither has seen the other's edits when they make their own.
+    select(&mut a, 0, 4, 10);
+    assert!(a.run("edit.cut", json!({})));
+    a.caret(0, 0);
+    assert!(a.run("edit.paste", json!({})));
+    select(&mut b, 0, 16, 19);
+    assert!(b.run("edit.cut", json!({})));
+    b.caret(0, 4);
+    assert!(b.run("edit.paste", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "concurrent cut and paste");
+    let all = texts(&a.s.doc).join("\n");
+    assert_eq!(all.matches("quick").count(), 1, "{all:?}");
+    assert_eq!(all.matches("fox").count(), 1, "{all:?}");
+    assert!(all.contains("jumps"), "{all:?}");
+    // A paste of several lines splits the paragraph while the other editor cuts from it: they
+    // converge (the split carries its tail as it was, as Enter does).
+    select(&mut a, 0, 0, 3);
+    assert!(a.run("edit.cut", json!({})));
+    b.caret(0, 1);
+    assert!(b.run("edit.pasteText", json!({"text": "A\nB"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "a cut against a split");
+}
+
+fn clipboard_command(rng: &mut Rng) -> (&'static str, Value) {
+    match rng.below(10) {
+        0 | 1 => ("edit.cut", json!({})),
+        2 => ("edit.copy", json!({})),
+        3 | 4 => ("edit.paste", json!({})),
+        5 => ("edit.pasteText", json!({"text": "p\nq"})),
+        6 => ("edit.pasteMerge", json!({})),
+        7 => ("text.insert", json!({"text": "ab"})),
+        8 => ("format.bold", json!({})),
+        _ => ("edit.undo", json!({})),
+    }
+}
+
+#[test]
+fn cut_copy_and_paste_converge_through_the_pump() {
+    for seed in 200..206 {
+        converge_with(2, seed, 120, clipboard_command);
+    }
+    for seed in 300..303 {
+        converge_with(3, seed, 120, clipboard_command);
+    }
+}
+
+#[test]
+fn undo_of_a_paste_takes_back_only_the_paste() {
+    let relay = relay(None);
+    let bytes = file(&["One"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    a.end_of(0);
+    assert!(a.run("edit.pasteText", json!({"text": " pasted\nmore"})));
+    b.caret(0, 0);
+    assert!(b.run("text.insert", json!({"text": "X"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&a.s.doc), ["XOne pasted", "more"]);
+    assert!(a.run("edit.undo", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["XOne"], "the paste is gone, the other editor's typing stays");
+    assert_same(&a, &b, "after undo");
+    // Bob's undo takes back his typing, not anything of Alice's.
+    assert!(b.run("edit.undo", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&a.s.doc), ["One"]);
+    assert_same(&a, &b, "after both undo");
+}
+
+/// A 1×1 PNG.
+const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+#[test]
+fn a_paste_with_a_picture_goes_in_as_text_on_every_side() {
+    let relay = relay(None);
+    let bytes = file(&["Start"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    let media = a.s.doc.media.len();
+    a.end_of(0);
+    let html = format!("<p>Hi <img src=\"data:image/png;base64,{PNG}\" width=\"10\" height=\"10\"> there</p>");
+    assert!(a.run("edit.paste", json!({"html": html, "text": " Hi there"})), "the paste goes in");
+    let said = a.le.take_notices();
+    assert!(said.iter().any(|n| n.contains("Pasted as text")), "the user is told: {said:?}");
+    assert!(!said.iter().any(|n| n.contains("link or bookmark")), "and not the refusal: {said:?}");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "the text-only paste");
+    assert_eq!(texts(&b.s.doc), ["Start Hi there"]);
+    assert_eq!(objects(&a.s.doc), 0, "no picture");
+    assert_eq!(a.s.doc.media.len(), media, "and no picture data");
+
+    // Without any text to fall back on, nothing changes and the user is told why.
+    let before = a.s.doc.clone();
+    let html = format!("<p><img src=\"data:image/png;base64,{PNG}\" width=\"10\" height=\"10\"></p>");
+    let _ = a.run("edit.paste", json!({"html": html}));
+    assert!(before.same_content(&a.s.doc), "nothing pasted");
+    let said = a.le.take_notices();
+    assert!(said.iter().any(|n| n.contains("paste")), "{said:?}");
+    // One undo step for the text paste: Undo takes it back whole.
+    assert!(a.run("edit.undo", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Start"]);
+}
+
+#[test]
+fn a_paste_bringing_a_new_list_definition_goes_in_as_text() {
+    // Another program's list brings its own list definition: the numbering is not shared.
+    let relay = relay(None);
+    let bytes = file(&["Start"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    let numbering = a.s.doc.numbering.clone();
+    a.end_of(0);
+    assert!(a.run("edit.paste", json!({"html": "<ul><li>one</li><li>two</li></ul>", "text": "one\ntwo"})));
+    let said = a.le.take_notices();
+    assert!(said.iter().any(|n| n.contains("Pasted as text")), "{said:?}");
+    assert!(a.s.doc.numbering == numbering, "no list definition was added");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "the text-only paste");
+    assert_eq!(texts(&b.s.doc), ["Startone", "two"]);
+}
+
+#[test]
+fn a_cut_of_a_picture_is_put_back() {
+    // A picture in the file, cut with its text: removing an inline object is not shared.
+    let mut doc = plain(&["Before", "After"]);
+    let html = format!("<p>x<img src=\"data:image/png;base64,{PNG}\" width=\"10\" height=\"10\">y</p>");
+    let mut s = Session::new(doc.clone());
+    s.sel = Selection { anchor: Pos::body(0, 6), focus: Pos::body(0, 6) };
+    s.run("edit.paste", &json!({"html": html})).unwrap();
+    assert!(objects(&s.doc) > 0, "the file has a picture");
+    doc = s.doc.clone();
+    let bytes = save_bytes("plan.docx", &doc).unwrap();
+    let relay = relay(None);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    let before = a.s.doc.clone();
+    let len = para(&a, 0).text.len();
+    select(&mut a, 0, 0, len);
+    let _ = a.run("edit.cut", json!({}));
+    assert!(before.same_content(&a.s.doc), "put back");
+    let said = a.le.take_notices();
+    assert!(said.iter().any(|n| n.contains("cut")), "{said:?}");
+    assert!(a.s.clipboard.is_some(), "the copy is still made");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "nothing was shared");
+}
+
+#[test]
+fn a_pasted_table_reaches_every_side() {
+    let relay = relay(None);
+    let bytes = file(&["Start", "End"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    a.end_of(0);
+    let html = "<table><tr><td>a1</td><td>b1</td></tr><tr><td>a2</td><td>b2</td></tr></table>";
+    assert!(a.run("edit.paste", json!({"html": html, "text": "a1\tb1\na2\tb2"})));
+    assert!(a.le.take_notices().is_empty(), "the table itself is shared");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "the pasted table");
+    assert_eq!(b.s.doc.body.iter().filter(|b| b.as_table().is_some()).count(), 1, "the other editor has the table");
+    assert!(b.s.doc.plain_text(wordcraft_doc::StoryRef::Body).contains("b2"));
 }

@@ -488,7 +488,8 @@ fn a_command_is_reported_once_and_put_back_whole() {
 #[test]
 fn objects_are_not_shared() {
     assert!(!is_shareable("insert.picture"), "pictures are not shared");
-    assert!(!is_shareable("edit.paste"), "paste may carry objects");
+    assert!(is_shareable("edit.paste") && is_shareable("edit.cut"), "paste and cut are shared (a paste that is not goes in as text)");
+    assert!(!is_shareable("edit.pasteSpecial"), "Paste Special pastes pictures and other formats");
     assert!(is_shareable("text.insert") && is_shareable("para.moveUp"));
     let commands = wordcraft_engine::cmd::registry();
     for id in wordcraft_live::SHAREABLE {

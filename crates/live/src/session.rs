@@ -52,7 +52,10 @@ use serde_json::{Value, json};
 use wordcraft_doc::Document;
 use wordcraft_engine::{CmdError, EditObserver, Registry, Session};
 
-use crate::{LiveMap, LocalEdit, MapError, Refusal, assign_seed_pids, is_shareable, seed_blocks, share_pids};
+use crate::{LiveMap, LocalEdit, MapError, PASTE_FALLS_BACK, Refusal, assign_seed_pids, is_shareable, seed_blocks, share_pids};
+
+/// What the user is told when a paste went in as its text only.
+pub const PASTED_AS_TEXT: &str = "Pasted as text; images and new styles are not shared in live editing yet.";
 
 /// Another editor in the document, its caret `(paragraph id, char offset)`.
 pub type Peer = craft_live::Peer<(u64, usize)>;
@@ -97,12 +100,29 @@ impl EditObserver for Observer {
     }
 }
 
+/// A batch of edits the mapping refused: the command it names, whether it brought content live
+/// editing does not share ([`brings_unshared`]), and what the user was told.
+struct Refused {
+    command: String,
+    brings_unshared: bool,
+    why: String,
+}
+
+/// Whether a refusal is for content an edit brought that live editing does not share (an object,
+/// a style, list or picture definition, a text box story), which a text-only paste leaves out.
+/// Other refusals (tracked changes, page setup, no space yet) would refuse the text too.
+fn brings_unshared(e: &MapError) -> bool {
+    matches!(e, MapError::NotShareable { reason: Refusal::InlineObject | Refusal::OutsideBody("styles" | "numbering" | "media" | "parts"), .. })
+}
+
 /// One call's view of WordCraft for craft-live: the engine session and the paragraph mapping.
 struct App<'a> {
     session: &'a mut Session,
     map: &'a mut LiveMap,
     /// The last batch's mapping, for its paragraph ids once its updates are sent.
     pending: &'a mut Option<LocalEdit>,
+    /// The last batch refused, for a paste to go in as text instead.
+    refused: &'a mut Option<Refused>,
 }
 
 impl LiveApp<Word> for App<'_> {
@@ -115,13 +135,24 @@ impl LiveApp<Word> for App<'_> {
                 *self.pending = Some(edit);
                 Ok(updates)
             }
-            Err(e) if e.refused().is_some() => Err(LocalError::Refused(refusal_text(&e).to_owned())),
+            Err(e) if e.refused().is_some() => {
+                let why = refusal_text(&e).to_owned();
+                *self.refused = Some(Refused { command, brings_unshared: brings_unshared(&e), why: why.clone() });
+                Err(LocalError::Refused(why))
+            }
             Err(e) => Err(LocalError::Failed(e.to_string())),
         }
     }
 
     fn landed(&mut self) -> Landed {
         let Some(edit) = self.pending.take() else { return Landed::Done };
+        // The replica holds runs merged; a paragraph the engine left with two equal runs side by
+        // side would differ from the other editors' copy of it only there.
+        if self.session.doc.body.iter().any(|b| b.as_para().is_some_and(split_runs))
+            && let Err(e) = self.session.apply_remote(merge_runs)
+        {
+            log::warn!("live: runs were not merged: {e}");
+        }
         if let Err(e) = share_pids(self.session, &edit) {
             log::warn!("live: new paragraph ids were not written back: {e}");
             Landed::Resync
@@ -195,6 +226,7 @@ pub struct LiveEditing<H: Hub> {
     core: craft_live::LiveEditing<H, Word>,
     map: LiveMap,
     pending: Option<LocalEdit>,
+    refused: Option<Refused>,
     registry: Arc<Registry>,
 }
 
@@ -217,32 +249,71 @@ impl<H: Hub> LiveEditing<H> {
         let map = LiveMap::new(&session.doc, 0);
         session.set_observer(Some(Box::new(Observer(core.queue()))));
         session.live_undo_hook(Some(core.queue().history_hook()));
-        Ok(LiveEditing { core, map, pending: None, registry: session.registry.clone() })
+        Ok(LiveEditing { core, map, pending: None, refused: None, registry: session.registry.clone() })
     }
 
     /// One frame: share the local edits, take in the other editors' edits, carets and saves,
     /// and say who else is here.
     pub fn pump(&mut self, session: &mut Session) -> Vec<Peer> {
-        self.core.pump(&mut App { session, map: &mut self.map, pending: &mut self.pending })
+        self.core.pump(&mut App { session, map: &mut self.map, pending: &mut self.pending, refused: &mut self.refused })
     }
 
     /// Run a command on the session, refused when live editing does not allow it now, and
     /// share its edit right away.
+    ///
+    /// A paste ([`PASTE_FALLS_BACK`]) whose edit is not shared (it brings a picture, another
+    /// object, or a style or list definition the document lacks) is put back and its text pasted
+    /// instead, with [`PASTED_AS_TEXT`] for the user. With no text to paste, it is refused.
     pub fn run(&mut self, session: &mut Session, id: &str, params: &Value) -> Result<Value, CmdError> {
         if !self.allows(id) {
             let why = self.refusal_for(id);
             self.core.push_notice(why.clone());
             return Err(CmdError::Disabled(why));
         }
+        let fallback = PASTE_FALLS_BACK.contains(&id).then(|| paste_text(session, id, params)).flatten();
+        let sel = session.sel.clone();
+        self.refused = None;
         let result = session.run(id, params);
         self.flush(session);
-        result
+        match (fallback, self.refused.take()) {
+            (Some(text), Some(r)) if r.brings_unshared && r.command == id => {
+                session.sel = sel;
+                self.paste_as_text(session, &text, &r.why)
+            }
+            _ => result,
+        }
+    }
+
+    /// Paste `text` with Keep Text Only, in place of a paste refused with `why`: the user is
+    /// told it went in as text, or, when that is refused too, why.
+    fn paste_as_text(&mut self, session: &mut Session, text: &str, why: &str) -> Result<Value, CmdError> {
+        let mut notices = self.core.take_notices();
+        if let Some(i) = notices.iter().rposition(|n| n == why) {
+            notices.remove(i);
+        }
+        for n in notices {
+            self.core.push_notice(n);
+        }
+        let result = session.run("edit.pasteText", &json!({"text": text}));
+        self.flush(session);
+        match (result, self.refused.take()) {
+            (Ok(v), None) => {
+                self.core.push_notice(PASTED_AS_TEXT.to_owned());
+                Ok(v)
+            }
+            // Its own reason is already a notice.
+            (Ok(_), Some(again)) => Err(CmdError::Disabled(again.why)),
+            (Err(e), _) => {
+                self.core.push_notice(why.to_owned());
+                Err(e)
+            }
+        }
     }
 
     /// Share the edits the session made since the last flush, and run the Undo and Redo it
     /// asked for. Refused edits are put back, with a notice.
     pub fn flush(&mut self, session: &mut Session) {
-        self.core.flush(&mut App { session, map: &mut self.map, pending: &mut self.pending });
+        self.core.flush(&mut App { session, map: &mut self.map, pending: &mut self.pending, refused: &mut self.refused });
     }
 
     /// Tell the room where this editor's caret is: paragraph `pid`, char `char_at`, and the
@@ -392,6 +463,12 @@ impl<H: Hub> LiveEditing<H> {
 fn refusal_text(e: &MapError) -> &'static str {
     match e {
         MapError::NoSpace { .. } => CONNECTING,
+        MapError::NotShareable { command, .. } if command.starts_with("edit.paste") && brings_unshared(e) => {
+            "This paste holds pictures, objects or new styles, which can't be shared while others are editing."
+        }
+        MapError::NotShareable { command, reason: Refusal::InlineObject } if command == "edit.cut" => {
+            "Pictures and other objects can't be cut while others are editing."
+        }
         MapError::NotShareable { command, reason: Refusal::InlineObject } => {
             if is_image(command) {
                 "Images can't be added while others are editing."
@@ -428,8 +505,8 @@ fn command_text(id: &str) -> &'static str {
         "Bullets and numbering are locked during live editing."
     } else if id.starts_with("review.") || has(&["comment"]) {
         "Comments and tracked changes are off during live editing."
-    } else if id == "edit.paste" || id == "edit.cut" || id.starts_with("edit.paste") {
-        "Paste and cut are off during live editing."
+    } else if id.starts_with("edit.paste") {
+        "This paste option is off during live editing. Paste and Keep Text Only work."
     } else {
         "This command isn't available while others are editing."
     }
@@ -437,6 +514,40 @@ fn command_text(id: &str) -> &'static str {
 
 fn is_image(id: &str) -> bool {
     ["picture", "image", "shape", "chart", "media"].iter().any(|w| id.contains(w))
+}
+
+/// The text paste command `id` with `params` would paste, without the object characters: the
+/// `text` it was given, else our own clipboard's (or the Clipboard pane item's) text.
+fn paste_text(session: &Session, id: &str, params: &Value) -> Option<String> {
+    let text = if id == "edit.pasteClipboardItem" {
+        let i = params.get("index").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok())?;
+        session.clip_history.items().get(i)?.text.clone()
+    } else {
+        match params.get("text").and_then(Value::as_str) {
+            Some(t) => t.to_owned(),
+            None if params.get("privateClipboard").and_then(Value::as_bool) != Some(false) => session.clipboard.as_ref()?.plain_text(),
+            None => return None,
+        }
+    };
+    let text: String = text.chars().filter(|c| *c != wordcraft_doc::para::OBJ).collect();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Whether paragraph `p` has two runs side by side with the same formatting.
+fn split_runs(p: &wordcraft_doc::Paragraph) -> bool {
+    p.runs.windows(2).any(|w| matches!(w, [x, y] if x.props == y.props))
+}
+
+/// Merge the equal neighbouring runs of the body's paragraphs, as the replica holds them.
+fn merge_runs(doc: &mut Document) {
+    for b in &mut doc.body {
+        if b.as_para().is_some_and(split_runs)
+            && let wordcraft_doc::Block::Para(p) = Arc::make_mut(b)
+        {
+            p.normalize();
+            p.touch();
+        }
+    }
 }
 
 /// The text of body paragraph `pid`.

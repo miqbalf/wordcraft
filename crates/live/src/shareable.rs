@@ -2,13 +2,18 @@
 
 /// The editing commands whose effect live editing shares: typing and deleting text, splitting
 /// and joining paragraphs, character formatting, paragraph styles and paragraph formatting,
-/// moving paragraphs, and Undo and Redo (which the live layer owns while live).
+/// moving paragraphs, cut and paste, and Undo and Redo (which the live layer owns while live).
+///
+/// A paste may bring what is not shared (a picture, a new style or list definition): its edit is
+/// refused like any other, and [`LiveEditing::run`](crate::LiveEditing::run) pastes its text
+/// instead ([`PASTE_FALLS_BACK`]). A cut that would remove an object is refused like Delete.
 ///
 /// Left out, because what they change is not shared in phase 1: inline objects (pictures,
 /// shapes, fields, equations, bookmarks, note and comment marks), media, numbering definitions
 /// (bullets and numbering), notes, comments, tracked changes, headers and footers, character
-/// styles (they may add a style definition), paste and cut (they may carry objects), and any
-/// table edit.
+/// styles (they may add a style definition), the other paste commands (Paste Special pastes
+/// pictures and other formats; Paste All and the Spike paste several pieces), and any table
+/// edit.
 pub const SHAREABLE: &[&str] = &[
     // Text.
     "text.insert",
@@ -94,6 +99,12 @@ pub const SHAREABLE: &[&str] = &[
     "para.outlineLevel",
     "para.moveUp",
     "para.moveDown",
+    // Cut and paste.
+    "edit.cut",
+    "edit.paste",
+    "edit.pasteText",
+    "edit.pasteMerge",
+    "edit.pasteClipboardItem",
     // History, owned by the live layer while live.
     "edit.undo",
     "edit.redo",
@@ -108,3 +119,6 @@ pub const SHAREABLE: &[&str] = &[
 pub fn is_shareable(command_id: &str) -> bool {
     SHAREABLE.contains(&command_id)
 }
+
+/// The paste commands that, when what they paste is not shared, paste its text instead.
+pub const PASTE_FALLS_BACK: &[&str] = &["edit.paste", "edit.pasteMerge", "edit.pasteClipboardItem"];

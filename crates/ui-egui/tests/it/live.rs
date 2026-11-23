@@ -190,7 +190,8 @@ fn non_shareable_command_is_disabled_while_live() {
     let app = h.state();
     assert!(wordcraft_ui_egui::widgets::enabled(app, "format.bold"), "a shared edit stays enabled");
     assert!(!wordcraft_ui_egui::widgets::enabled(app, "insert.bookmark"), "a bookmark can't be shared: greyed out");
-    assert!(!wordcraft_ui_egui::widgets::enabled(app, "edit.paste"), "nor can a paste");
+    assert!(wordcraft_ui_egui::widgets::enabled(app, "edit.paste"), "a paste is shared (as text when it can't be)");
+    assert!(!wordcraft_ui_egui::widgets::enabled(app, "edit.pasteSpecial"), "Paste Special is not");
     assert!(!wordcraft_ui_egui::widgets::enabled(app, "file.save"), "the document service saves, not this window");
     let bold = h.get_by_role_and_label(Role::Button, "Bold");
     assert!(!bold.accesskit_node().is_disabled(), "the ribbon's Bold button is enabled");
