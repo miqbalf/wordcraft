@@ -1204,6 +1204,36 @@ fn an_edit_in_the_tail_of_a_split_lands_in_the_new_paragraph() {
     assert_eq!(texts(&a.s.doc), ["Alpha", " ", "beta delta!", "En", "YdX of "]);
 }
 
+/// The browser e2e's steps: Enter mid-paragraph while the other editor types at its end, then
+/// Enter at the start of that tail while the other editor goes on typing there. The typing
+/// stays at the end of the tail.
+#[test]
+fn typing_at_the_end_follows_two_splits() {
+    let relay = relay(None);
+    let bytes = file(&["T7 test report", "This is a small test document for the share proof."]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+
+    a.caret(1, 10);
+    assert!(a.run("text.newParagraph", json!({})));
+    b.end_of(1);
+    assert!(b.run("text.insert", json!({"text": " TAILONE"})));
+    // Bob gets the split before Alice forwards his typing into the tail.
+    b.pump();
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["T7 test report", "This is a ", "small test document for the share proof. TAILONE"]);
+
+    a.caret(2, 0);
+    assert!(a.run("text.newParagraph", json!({})));
+    assert!(b.run("text.insert", json!({"text": " T"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(b.run("text.insert", json!({"text": "AILTWO"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "two splits and typing");
+    assert_eq!(texts(&a.s.doc), ["T7 test report", "This is a ", "", "small test document for the share proof. TAILONE TAILTWO"]);
+}
+
 /// Two separate edits racing a split, one in the head and one in the tail, reach the splitter
 /// together; each lands in its own part, and the split stays where it was made.
 #[test]

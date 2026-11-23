@@ -72,24 +72,36 @@ impl Anchor {
     /// The same character in the paragraphs from index `index` on whose texts, joined, start
     /// like the old paragraph's text up to it: the head and the tail of the paragraph split
     /// under it. `None` when they do not.
-    fn in_split(&self, doc: &Document, paths: &[super::Path], index: usize) -> Option<Pos> {
+    ///
+    /// When those paragraphs end before the character (this window typed there after the peer
+    /// split the paragraph, and the peer has not passed that text on yet), the end of the last
+    /// of them, with that text and the id of that paragraph: the caret waits there for it.
+    fn in_split(&self, doc: &Document, paths: &[super::Path], index: usize) -> Option<(Pos, Option<(u64, String)>)> {
         let mut old = self.text.chars();
         let mut before = 0;
+        let mut last: Option<(&super::Path, usize, u64)> = None;
         for path in paths.get(index..)? {
-            let text = doc.para(self.story, path).map_or("", |p| p.text.as_str());
+            let para = doc.para(self.story, path);
+            let text = para.map_or("", |p| p.text.as_str());
             let n = text.chars().count();
             // The paragraph's text first: when it runs out, no char of the old text is used up.
             let same = text.chars().zip(old.by_ref()).take_while(|(a, b)| a == b).count();
             if self.chars <= before + same {
                 let off = text.char_indices().nth(self.chars - before).map_or(text.len(), |(i, _)| i);
-                return Some(Pos::new(self.story, path.clone(), off));
+                return Some((Pos::new(self.story, path.clone(), off), None));
             }
             if same < n {
-                return None;
+                if same > 0 {
+                    return None;
+                }
+                break;
             }
             before += n;
+            last = Some((path, text.len(), para.map_or(0, |p| p.pid)));
         }
-        None
+        let (path, end, pid) = last.filter(|_| before > 0)?;
+        let awaited: String = self.text.chars().skip(before).take(self.chars - before).collect();
+        Some((Pos::new(self.story, path.clone(), end), Some((pid, awaited))))
     }
 
     /// The same place in `doc`: the same character of the paragraph with the same shared id
@@ -99,9 +111,9 @@ impl Anchor {
     /// old text up to it (the head and tail of a split), otherwise the start of the paragraph now
     /// at its index. An unshared paragraph (id 0) keeps its path. The
     /// result is clamped to the document.
-    fn find(&self, doc: &Document) -> Pos {
+    fn find(&self, doc: &Document) -> (Pos, Option<(u64, String)>) {
         if self.pid == 0 {
-            return doc.clamp(&self.pos);
+            return (doc.clamp(&self.pos), None);
         }
         let paths = doc.para_paths(self.story);
         let found = paths
@@ -109,6 +121,7 @@ impl Anchor {
             .filter_map(|path| doc.para(self.story, path).filter(|p| p.pid == self.pid).map(|p| (path, p)))
             .rev()
             .max_by_key(|(_, p)| likeness(&p.text, &self.text));
+        let mut awaits = None;
         let pos = match found {
             Some((path, p)) => {
                 let chars = follow(&self.text, &p.text, self.chars);
@@ -118,12 +131,18 @@ impl Anchor {
             None => {
                 let index = self.index.min(paths.len().saturating_sub(1));
                 match paths.get(index) {
-                    Some(path) => self.in_split(doc, &paths, index).unwrap_or_else(|| Pos::new(self.story, path.clone(), 0)),
+                    Some(path) => match self.in_split(doc, &paths, index) {
+                        Some((pos, waits)) => {
+                            awaits = waits;
+                            pos
+                        }
+                        None => Pos::new(self.story, path.clone(), 0),
+                    },
                     None => doc.start_of(StoryRef::Body),
                 }
             }
         };
-        doc.clamp(&pos)
+        (doc.clamp(&pos), awaits)
     }
 }
 
@@ -219,7 +238,27 @@ impl Session {
         self.doc.touch_changed_since(&before);
         drop(before);
         self.doc.ensure_nonempty();
-        self.sel = Selection { anchor: anchor.find(&self.doc), focus: focus.find(&self.doc) };
+        let ((a, _), (f, awaits)) = (anchor.find(&self.doc), focus.find(&self.doc));
+        let mut sel = Selection { anchor: a, focus: f };
+        // A caret left waiting at the end of a split paragraph's part (see `Anchor::in_split`)
+        // for this window's own text: when that text has come right after it, it goes past it,
+        // where this window typed it.
+        // It keeps waiting through other edits while it stays in that paragraph.
+        let mut still = None;
+        if let Some((pid, text)) = self.live_awaits.take().filter(|_| sel.anchor == sel.focus) {
+            let here = self.doc.para_at(&sel.focus).filter(|p| p.pid == pid).map(|p| p.text.get(sel.focus.off..).unwrap_or(""));
+            let was = focus.text.get(focus.pos.off..).unwrap_or("");
+            if here.is_some_and(|t| t.starts_with(&text)) && !was.starts_with(&text) {
+                sel.focus.off += text.len();
+                sel.anchor = sel.focus.clone();
+            } else if here.is_some() {
+                still = Some((pid, text));
+            }
+        }
+        if sel.anchor == sel.focus {
+            self.live_awaits = awaits.or(still);
+        }
+        self.sel = sel;
         // Selections that name places the peer's edit may have moved are dropped.
         self.column = None;
         self.widened = None;
