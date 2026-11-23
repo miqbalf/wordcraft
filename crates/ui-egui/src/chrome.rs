@@ -808,6 +808,7 @@ pub fn ribbon_autohide_strip(app: &mut WordApp, ui: &mut Ui) {
         ui,
         |ui| {
             let full = ui.max_rect();
+            ui.data_mut(|d| d.insert_temp(autohide_keep_id(), Some(full)));
             let resp = ui.interact(full, ui.scope_id().with("ribbon_autohide_click"), Sense::click());
             let shade = if resp.hovered() || app.ui.ribbon_peek { t.text } else { t.text_dim };
             icons::paint(ui.painter(), Rect::from_center_size(full.center(), vec2(12.0, 12.0)), "chevronDown", shade, t.accent);
@@ -831,16 +832,32 @@ pub fn ribbon_peek(app: &mut WordApp, ctx: &egui::Context) {
     });
 }
 
-/// A click on the page puts away the ribbon shown over it (tabs only, Full-screen mode).
+/// Where the ribbon shown over the page keeps its own clicks outside its layer: the tab buttons
+/// (a tab click toggles it) and the top strip (a click there toggles Full-screen mode's peek).
+pub(crate) fn ribbon_keep_id() -> egui::Id {
+    egui::Id::unique("ribbon_keep_tabs")
+}
+
+pub(crate) fn autohide_keep_id() -> egui::Id {
+    egui::Id::unique("ribbon_keep_strip")
+}
+
+/// Esc, or a click anywhere else (the page, the status bar, a pane, the empty strip), puts away
+/// the ribbon shown over the page (tabs only, Full-screen mode). Menus and popups (above the
+/// window) and the ribbon's own layer keep their clicks.
 pub fn close_ribbon_on_page_click(app: &mut WordApp, ctx: &egui::Context) {
     if !(app.ui.ribbon_overlay || app.ui.ribbon_peek) {
         return;
     }
+    let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
     let click = ctx.input(|i| if i.pointer.any_click() { i.pointer.interact_pos() } else { None });
-    if let Some(pos) = click
-        && app.canvas.viewport.is_some_and(|v| v.contains(pos))
-        && ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background)
-    {
+    let elsewhere = click.is_some_and(|pos| {
+        let kept = [ribbon_keep_id(), autohide_keep_id()]
+            .into_iter()
+            .any(|id| ctx.data(|d| d.get_temp::<Option<Rect>>(id)).flatten().is_some_and(|r| r.contains(pos)));
+        !kept && ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background)
+    });
+    if esc || elsewhere {
         app.ui.ribbon_overlay = false;
         app.ui.ribbon_peek = false;
     }

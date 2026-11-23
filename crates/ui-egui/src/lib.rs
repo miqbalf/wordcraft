@@ -311,10 +311,9 @@ impl UiState {
 
     /// Show the ribbon in `mode`; any ribbon shown over the page is put away.
     pub fn set_ribbon_display(&mut self, mode: RibbonDisplay) {
+        // One source of truth: the two flags are never both set.
         self.ribbon_fullscreen = mode == RibbonDisplay::FullScreen;
-        if mode != RibbonDisplay::FullScreen {
-            self.ribbon_collapsed = mode == RibbonDisplay::TabsOnly;
-        }
+        self.ribbon_collapsed = mode == RibbonDisplay::TabsOnly;
         self.ribbon_overlay = false;
         self.ribbon_peek = false;
     }

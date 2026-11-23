@@ -322,6 +322,7 @@ fn ribbon_display_options_set_the_three_modes() {
     assert!(a.ui.ribbon_collapsed && !a.ui.ribbon_fullscreen);
     a.run("ui.ribbonDisplay", json!({"mode": "fullscreen"})).unwrap();
     assert_eq!(a.ui.ribbon_display(), RibbonDisplay::FullScreen);
+    assert!(!a.ui.ribbon_collapsed, "one choice: the two flags are never both set");
     a.run("ui.ribbonDisplay", json!({"mode": "full"})).unwrap();
     assert_eq!(a.ui.ribbon_display(), RibbonDisplay::Full);
     assert!(!a.ui.ribbon_collapsed && !a.ui.ribbon_fullscreen);
@@ -357,6 +358,11 @@ fn the_ribbon_display_choice_is_saved_and_restored() {
     let mut a = app();
     a.run("ui.ribbonDisplay", json!({"mode": "fullscreen"})).unwrap();
     assert_eq!(serde_json::to_value(a.prefs()).unwrap()["ribbonFullscreen"], json!(true));
+    // Prefs from before the two were one choice (both set): Full-screen wins, nothing collapsed.
+    let mut b = app();
+    b.apply_prefs(UiState::from_json(br#"{"ribbonCollapsed": true, "ribbonFullscreen": true}"#).unwrap());
+    assert_eq!(b.ui.ribbon_display(), RibbonDisplay::FullScreen);
+    assert!(!b.ui.ribbon_collapsed);
 }
 
 /// Tabs only: a tab click shows that tab's ribbon over the page, not the permanent ribbon; it
@@ -430,6 +436,115 @@ fn full_screen_ribbon_mode_autohides_and_a_top_click_shows_it() {
     assert!(!h.state().ui.ribbon_peek);
     assert!(h.query_by_label("Insert").is_none(), "hidden again");
     assert_eq!(h.state().ui.ribbon_display(), RibbonDisplay::FullScreen, "the mode stays");
+}
+
+/// A pointer click at `pos`, in a harness.
+fn click_at(h: &mut egui_kittest::Harness<'static, WordApp>, pos: egui::Pos2) {
+    let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+    h.event(egui::Event::PointerMoved(pos));
+    h.event(button(true));
+    h.run_steps(1);
+    h.event(button(false));
+    h.run_steps(3);
+}
+
+fn sized_harness(a: WordApp, size: egui::Vec2) -> egui_kittest::Harness<'static, WordApp> {
+    let mut h = egui_kittest::Harness::builder().with_size(size).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        a,
+    );
+    h.run_steps(5);
+    h
+}
+
+fn ribbon_probe(h: &egui_kittest::Harness<'static, WordApp>) -> (egui::Rect, f32, f32, egui::Rect) {
+    let (content, offset, overflow) =
+        h.ctx.data(|d| d.get_temp::<(egui::Rect, f32, f32)>(egui::Id::unique("ribbon_probe_content"))).expect("the ribbon was drawn");
+    let button = h.ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::unique("ribbon_probe_button"))).expect("the chevron was drawn");
+    (content, offset, overflow, button)
+}
+
+/// The chevron has its own column: the ribbon's content (the last group, its label and
+/// launcher, and the scroll cue) is laid out beside it, so at a narrow width a click on either
+/// still reaches them and never collapses the ribbon.
+#[test]
+fn the_ribbon_chevron_does_not_cover_the_content_or_the_scroll_cue() {
+    let mut overflowed = false;
+    for width in [360.0_f32, 520.0, 700.0, 900.0, 1440.0] {
+        let mut a = app();
+        a.run("text.insert", json!({"text": "Hello"})).unwrap();
+        let mut h = sized_harness(a, egui::vec2(width, 700.0));
+        let (content, _, overflow, button) = ribbon_probe(&h);
+        assert!(content.right() <= button.left(), "{width}: the content ends before the chevron ({content:?} vs {button:?})");
+        let mut scrolled = false;
+        if overflow > 1.0 {
+            overflowed = true;
+            // The cue's lowest corner, where the chevron used to sit: scrolls the ribbon.
+            for _ in 0..60 {
+                let (content, offset, _, _) = ribbon_probe(&h);
+                click_at(&mut h, egui::pos2(content.right() - 6.0, content.bottom() - 4.0));
+                assert_eq!(h.state().ui.ribbon_display(), RibbonDisplay::Full, "{width}: no click reached the chevron");
+                let (_, now, _, _) = ribbon_probe(&h);
+                scrolled |= now > offset + 1.0;
+                if now <= offset + 0.5 {
+                    break;
+                }
+            }
+            assert!(scrolled, "{width}: the cue scrolled the ribbon");
+        }
+        // At the end (or with room to spare) the same corner is the last group's label row.
+        let (content, _, _, button) = ribbon_probe(&h);
+        click_at(&mut h, egui::pos2(content.right() - 6.0, content.bottom() - 6.0));
+        assert_eq!(h.state().ui.ribbon_display(), RibbonDisplay::Full, "{width}: the last group's corner is not the chevron's");
+        // The chevron itself still works.
+        click_at(&mut h, egui::pos2(button.center().x, button.top() + 5.0));
+        assert_eq!(h.state().ui.ribbon_display(), RibbonDisplay::TabsOnly, "{width}");
+    }
+    assert!(overflowed, "some width overflowed, so the cue was exercised");
+}
+
+/// Esc, or a click on the status bar, a pane or the empty strip, puts away the ribbon shown over
+/// the page, in tabs only and in Full-screen mode; a click on the ribbon itself does not.
+#[test]
+fn esc_or_a_click_elsewhere_closes_the_overlay_and_the_peek() {
+    let mut a = app();
+    a.run("text.insert", json!({"text": "Hello"})).unwrap();
+    let mut h = sized_harness(a, egui::vec2(1440.0, 900.0));
+    let status = egui::pos2(300.0, 900.0 - 12.0);
+    let open = |h: &mut egui_kittest::Harness<'static, WordApp>, peek: bool| {
+        if peek {
+            h.state_mut().run("ui.ribbonDisplay", json!({"mode": "fullscreen"})).unwrap();
+            h.state_mut().ui.ribbon_peek = true;
+        } else {
+            h.state_mut().run("ui.ribbonDisplay", json!({"mode": "tabs"})).unwrap();
+            h.state_mut().run("ui.tab", json!({"tab": "Home"})).unwrap();
+        }
+        h.run_steps(3);
+        assert!(h.state().ui.ribbon_overlay || h.state().ui.ribbon_peek, "open");
+    };
+    for peek in [false, true] {
+        open(&mut h, peek);
+        h.key_press(egui::Key::Escape);
+        h.run_steps(3);
+        assert!(!h.state().ui.ribbon_overlay && !h.state().ui.ribbon_peek, "peek {peek}: Esc closes it");
+        open(&mut h, peek);
+        click_at(&mut h, status);
+        assert!(!h.state().ui.ribbon_overlay && !h.state().ui.ribbon_peek, "peek {peek}: the status bar closes it");
+    }
+    // The empty part of the tab strip (past the last tab) closes the overlay.
+    open(&mut h, false);
+    let span = h.ctx.data(|d| d.get_temp::<Option<egui::Rect>>(crate::chrome::ribbon_keep_id())).flatten().expect("the tabs were drawn");
+    click_at(&mut h, egui::pos2(span.right() + 12.0, span.center().y));
+    assert!(!h.state().ui.ribbon_overlay, "the empty strip closes it");
+    // A click on the ribbon itself (its own layer) keeps it.
+    open(&mut h, false);
+    let (content, _, _, _) = ribbon_probe(&h);
+    click_at(&mut h, egui::pos2(content.left() + 4.0, content.bottom() - 3.0));
+    assert!(h.state().ui.ribbon_overlay, "a click inside the overlay keeps it");
 }
 
 /// #1678: a Ctrl+F1 the user binds in Customize Keyboard runs their command through the app,

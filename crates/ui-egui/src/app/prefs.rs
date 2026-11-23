@@ -32,6 +32,10 @@ impl WordApp {
     pub fn apply_prefs(&mut self, ui: UiState) {
         self.ui = ui;
         self.ui.backstage = false;
+        // Full-screen mode and a collapsed ribbon are one choice: Full-screen wins.
+        if self.ui.ribbon_fullscreen {
+            self.ui.ribbon_collapsed = false;
+        }
         // Word opens on Home every launch, so the tab `ui.json` holds is not restored. Going File
         // and back to the editor within the run still returns to the tab that was showing.
         self.ui.tab = DEFAULT_TAB.into();

@@ -98,6 +98,11 @@ impl WordApp {
                 // Ribbon Display Options: Full-screen mode auto-hides the title bar, tabs and
                 // ribbon behind a thin strip; shown over the page after a click on it.
                 let auto = self.ui.ribbon_fullscreen;
+                // Rebuilt by the strip and the tabs below, each frame they are drawn.
+                ctx.data_mut(|d| {
+                    d.insert_temp(chrome::ribbon_keep_id(), None::<egui::Rect>);
+                    d.insert_temp(chrome::autohide_keep_id(), None::<egui::Rect>);
+                });
                 if !auto {
                     self.ui.ribbon_peek = false;
                 }

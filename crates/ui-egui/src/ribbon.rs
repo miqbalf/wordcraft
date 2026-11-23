@@ -155,7 +155,9 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     for (name, at, _) in &ghosts {
         tabs.insert((*at).min(tabs.len()), (name.clone(), false));
     }
-    // Tab strip.
+    // Tab strip. `span`: where the tab buttons are, for the ribbon shown over the page: a click
+    // there is the tab's own, a click elsewhere puts the ribbon away.
+    let mut span = Rect::NOTHING;
     egui::Panel::top("tabs")
         .exact_size(30.0)
         .frame(egui::Frame::NONE.fill(t.tab_strip).inner_margin(egui::Margin { left: 8, right: 10, top: 0, bottom: 0 }))
@@ -285,6 +287,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                                 let cut = specs.get(i).is_some_and(|sp| sp.text_w + plan.pad > w + 0.5);
                                 let ghost = ghosts.iter().find(|(n, ..)| n == tab);
                                 let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), if ghost.is_some() { Sense::hover() } else { Sense::click() });
+                                span = span.union(r);
                                 if app.ui.keytips == crate::keytips::Phase::Tabs && ghost.is_none() {
                                     crate::keytips::record_tab(r, tab, &app.ui.keytip_prefix, &mut app.keytip_rects);
                                 } else if app.ui.keytips == crate::keytips::Phase::Legacy && ghost.is_none() {
@@ -393,6 +396,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 });
             })
         });
+    ui.data_mut(|d| d.insert_temp(crate::chrome::ribbon_keep_id(), span.is_finite().then_some(span)));
     // Collapsed: the tab strip alone, unless a tab was clicked (its ribbon shows over the page) or
     // Full-screen mode's top strip was (the ribbon and tabs show over the page).
     let peek = app.ui.ribbon_peek;
@@ -414,7 +418,16 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 let index = tabs.iter().position(|(name, _)| name == &app.ui.tab).unwrap_or(0);
                 let (settled, direction) = tab_content_entry(ui.ctx(), &app.ui.tab, index, now, animate);
                 let shift = vec2(direction * (1.0 - settled) * CONTENT_SWITCH_SLIDE, 0.0);
-                let mut shifted = ui.new_child(egui::UiBuilder::new().max_rect(ui.max_rect().translate(shift)).layout(*ui.layout()));
+                // The display button keeps its own column at the corner: the content (the last
+                // group, its launcher and label, the scroll cue) is laid out beside it, not under it.
+                let full = ui.max_rect();
+                let mut content = full.translate(shift);
+                if crate::rtl::on() {
+                    content.min.x += CORNER_W + 4.0;
+                } else {
+                    content.max.x -= CORNER_W + 4.0;
+                }
+                let mut shifted = ui.new_child(egui::UiBuilder::new().max_rect(content).layout(*ui.layout()));
                 shifted.set_opacity(0.2 + 0.8 * settled);
                 let ui = &mut shifted;
                 // Right-click on the ribbon (outside a button): Customize Ribbon. Registered first, so
@@ -509,6 +522,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 // where more is and scroll it on click. Every command also stays reachable through Search Commands.
                 let r = scroll.inner_rect;
                 let overflow = scroll.content_size.x - r.width();
+                ui.data_mut(|d| d.insert_temp(egui::Id::unique("ribbon_probe_content"), (r, scroll.state.clamped_offset().x, overflow)));
                 let offset = scroll.state.clamped_offset().x;
                 let step = 160.0;
                 let mut next = None;
@@ -533,10 +547,11 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     ui.ctx().request_repaint();
                 }
                 // The chevron at the bottom corner: collapse the ribbon, and Ribbon Display Options.
-                let m = ui.max_rect();
-                let (w, h) = (DISPLAY_BUTTON_W, 18.0);
-                let x = if rtl { m.left() + 2.0 } else { m.right() - w - 2.0 };
-                display_button(app, ui, Rect::from_min_size(pos2(x, m.bottom() - h - 1.0), vec2(w, h)), &t, true);
+                let (w, h) = (CORNER_W, 38.0);
+                let x = if rtl { full.left() + 1.0 } else { full.right() - w - 1.0 };
+                let button = Rect::from_min_size(pos2(x, full.bottom() - h - 1.0), vec2(w, h));
+                ui.data_mut(|d| d.insert_temp(egui::Id::unique("ribbon_probe_button"), button));
+                display_button(app, ui, button, &t, true);
             });
     };
     if overlay {
@@ -554,6 +569,9 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
 
 /// Width of the ribbon display button: the chevron and the options arrow.
 const DISPLAY_BUTTON_W: f32 = 38.0;
+
+/// Width of the corner column that holds the stacked chevron and options arrow in the ribbon.
+const CORNER_W: f32 = 22.0;
 
 /// The three Ribbon Display Options, as `(label, command mode, mode)`.
 fn display_choices() -> [(&'static str, &'static str, crate::RibbonDisplay); 3] {
@@ -588,8 +606,15 @@ fn display_menu(ui: &mut Ui, app: &mut WordApp) {
 /// with the arrow beside it that opens "Ribbon display options"; right-clicking the chevron opens
 /// the same menu.
 pub(crate) fn display_button(app: &mut WordApp, ui: &mut Ui, rect: Rect, t: &Tokens, up: bool) {
-    let chevron = Rect::from_min_size(rect.min, vec2(rect.width() - 14.0, rect.height()));
-    let arrow = Rect::from_min_max(pos2(chevron.right(), rect.top()), rect.right_bottom());
+    // In the ribbon's corner column the two stack (chevron over arrow); in the tab strip they sit
+    // side by side.
+    let (chevron, arrow) = if up {
+        let half = rect.height() / 2.0;
+        (Rect::from_min_size(rect.min, vec2(rect.width(), half)), Rect::from_min_max(pos2(rect.left(), rect.top() + half), rect.right_bottom()))
+    } else {
+        let chevron = Rect::from_min_size(rect.min, vec2(rect.width() - 14.0, rect.height()));
+        (chevron, Rect::from_min_max(pos2(chevron.right(), rect.top()), rect.right_bottom()))
+    };
     let id = ui.scope_id().with(("ribbon_display_button", up));
     let resp = ui.interact(chevron, id, Sense::click());
     let more = ui.interact(arrow, id.with("options"), Sense::click());
