@@ -464,6 +464,43 @@ fn save_as_after_the_link_broke_downloads_a_copy_and_stays_unsaved() {
     assert_eq!(guard.borrow().last(), Some(&true), "and the leave guard stays on");
 }
 
+/// The window's link has ended; a control client asks for a copy of another open document.
+/// That copy keeps its own document's name, not the window's "(my copy …)" one.
+#[test]
+fn a_background_documents_copy_keeps_its_own_name_after_the_link_broke() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (mut services, _, _guard) = recorded();
+    let copies = Rc::new(RefCell::new(Vec::<String>::new()));
+    let c = Rc::clone(&copies);
+    services.download_copy = Some(Box::new(move |name: &str, _mime: &str, _bytes: &[u8]| {
+        c.borrow_mut().push(name.to_owned());
+        Ok(())
+    }));
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, false, services);
+    settle(&relay, &mut h, &mut bob);
+    type_text(&mut h, "X");
+    settle(&relay, &mut h, &mut bob);
+    assert!(matches!(status(&h), LiveStatus::Broken(_)));
+    let live = h.state().session.document_id();
+    let other = h.state_mut().session.add_document(wordcraft_doc::Document::from_text("Other"));
+    h.state_mut().session.switch_document(live).unwrap();
+    let ctx = egui::Context::default();
+    let (req, _reply) = wordcraft_ui_egui::ControlRequest::new("engine.execute", json!({"command": "file.saveAs", "params": {}, "doc": other}));
+    match wordcraft_ui_egui::control::handle(h.state_mut(), &ctx, &req) {
+        wordcraft_ui_egui::control::Outcome::Done(v) => assert_eq!(v["ok"], true, "{v}"),
+        wordcraft_ui_egui::control::Outcome::Screenshot { .. } => panic!("not a reply"),
+    }
+    let name = copies.borrow().last().cloned().unwrap();
+    assert!(!name.contains("my copy") && name.ends_with(".docx"), "{name}");
+    assert_ne!(h.state().status_msg.as_ref().map(|(m, _)| m.as_str()), Some(COPY_DOWNLOADED));
+    assert_eq!(h.state().session.document_id(), live, "the window keeps its document");
+    // The window's own document still gets its "my copy".
+    h.state_mut().save_as_copy("docx").unwrap();
+    let name = copies.borrow().last().cloned().unwrap();
+    assert!(name.starts_with("plan (my copy "), "{name}");
+}
+
 /// The document service in the room sends the editors `kind` with `payload`.
 fn service_says(service: &mut Bob, kind: &str, payload: Value) {
     service.le.hub_mut().send(ClientMsg::Ephemeral { doc: ROOM.into(), kind: kind.into(), payload }).unwrap();

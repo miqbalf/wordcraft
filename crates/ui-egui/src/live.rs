@@ -250,9 +250,12 @@ impl WordApp {
     /// or read-only): `<stem> (my copy <date> <time>)`, so it is never taken for the shared file.
     /// The copy goes through the Save As list like anywhere else ([`crate::save_as`]); the
     /// browser can't say whether the user kept it, so the document stays unsaved and the leave
-    /// guard stays on. `None` while the service still saves, or with no link.
+    /// guard stays on. `None` while the service still saves, with no link, or for a document
+    /// other than the linked one.
     pub(crate) fn live_copy_title(&self) -> Option<String> {
-        if self.live_link().is_none() || self.live_saves() {
+        // Only the linked document's copy: a background document copied for the control
+        // channel ([`WordApp::save_as_copy_of`]) keeps its own name.
+        if self.live_link().is_none_or(|link| link.document != self.session.document_id()) || self.live_saves() {
             return None;
         }
         let title = self.title_stem();
