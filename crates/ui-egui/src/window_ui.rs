@@ -277,6 +277,9 @@ impl WordApp {
             // App-wide: preferences, recent lists, and the settings the session owns while
             // running.
             ribbon_collapsed: _,
+            ribbon_fullscreen: _,
+            ribbon_overlay: _,
+            ribbon_peek: _,
             quick_access_toolbar: _,
             recent: _,
             recent_symbols: _,

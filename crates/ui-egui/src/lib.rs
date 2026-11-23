@@ -288,6 +288,38 @@ pub fn count_in_unit(s: &str, unit: StatusCount) -> usize {
     }
 }
 
+/// How much of the ribbon shows (Ribbon Display Options): the tabs and commands, the tabs alone
+/// (a tab click shows its commands for a moment), or neither until the top strip is clicked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RibbonDisplay {
+    Full,
+    TabsOnly,
+    FullScreen,
+}
+
+impl UiState {
+    /// The ribbon display mode the two saved flags make.
+    pub fn ribbon_display(&self) -> RibbonDisplay {
+        if self.ribbon_fullscreen {
+            RibbonDisplay::FullScreen
+        } else if self.ribbon_collapsed {
+            RibbonDisplay::TabsOnly
+        } else {
+            RibbonDisplay::Full
+        }
+    }
+
+    /// Show the ribbon in `mode`; any ribbon shown over the page is put away.
+    pub fn set_ribbon_display(&mut self, mode: RibbonDisplay) {
+        self.ribbon_fullscreen = mode == RibbonDisplay::FullScreen;
+        if mode != RibbonDisplay::FullScreen {
+            self.ribbon_collapsed = mode == RibbonDisplay::TabsOnly;
+        }
+        self.ribbon_overlay = false;
+        self.ribbon_peek = false;
+    }
+}
+
 /// UI state that persists between runs (and that agents can read and set).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -301,6 +333,18 @@ pub struct UiState {
     #[serde(skip)]
     pub print: print_page::PrintSettings,
     pub ribbon_collapsed: bool,
+    /// Full-screen mode: the ribbon, its tabs and the title bar auto-hide, and a click on the
+    /// strip at the top brings them back for a moment. The user's own choice, kept between runs
+    /// (hosted pages included), with [`Self::ribbon_collapsed`] ([`RibbonDisplay`]).
+    pub ribbon_fullscreen: bool,
+    /// Tabs only: the tab clicked while the ribbon is collapsed shows its ribbon over the page,
+    /// until a command runs or the page is clicked. Not saved.
+    #[serde(skip)]
+    pub ribbon_overlay: bool,
+    /// Full-screen mode: the ribbon and tabs are shown over the page after a click on the top
+    /// strip, until a command runs or the page is clicked. Not saved.
+    #[serde(skip)]
+    pub ribbon_peek: bool,
     /// The Quick Access Toolbar shows in the title bar (#1945). Its menu's Hide Quick Access
     /// Toolbar takes it away; Show Quick Access Toolbar (the ribbon's right-click menu, Customize
     /// Ribbon › Quick Access Toolbar) brings it back. Kept between runs.
@@ -500,6 +544,9 @@ impl Default for UiState {
             backstage_page: "home".into(),
             print: print_page::PrintSettings::default(),
             ribbon_collapsed: false,
+            ribbon_fullscreen: false,
+            ribbon_overlay: false,
+            ribbon_peek: false,
             quick_access_toolbar: true,
             recent: Vec::new(),
             recent_symbols: Vec::new(),

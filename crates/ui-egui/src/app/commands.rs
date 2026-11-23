@@ -455,6 +455,11 @@ impl WordApp {
             self.keep_web_font(id, &params, v);
         }
         self.after_command(id);
+        // A command ends the ribbon shown over the page (tabs only, Full-screen mode).
+        if r.is_ok() && !(id == "ui.tab" || id.starts_with("ui.ribbon") || id == "ui.collapseRibbon" || id.starts_with("ui.keytips")) {
+            self.ui.ribbon_overlay = false;
+            self.ui.ribbon_peek = false;
+        }
         if let Err(e) = &r {
             self.status(e.clone());
         }
@@ -786,6 +791,10 @@ impl WordApp {
                 if tab == "File" {
                     self.ui.backstage = true;
                 } else {
+                    // Tabs only: a tab shows its ribbon over the page; the same tab again puts it away.
+                    if self.ui.ribbon_collapsed && !self.ui.ribbon_peek && !self.ui.ribbon_fullscreen {
+                        self.ui.ribbon_overlay = !(self.ui.ribbon_overlay && self.ui.tab == tab);
+                    }
                     self.ui.tab = tab;
                     self.ui.backstage = false;
                 }
@@ -844,8 +853,23 @@ impl WordApp {
             }
             "ui.paneDock" => return Some(panes::dock_command(self, p)),
             "ui.collapseRibbon" => {
-                self.ui.ribbon_collapsed = !self.ui.ribbon_collapsed;
+                // The chevron, Ctrl+F1 and double-clicking a tab: tabs and commands <-> tabs only;
+                // from Full-screen mode, back to tabs and commands.
+                let mode =
+                    if self.ui.ribbon_display() == crate::RibbonDisplay::Full { crate::RibbonDisplay::TabsOnly } else { crate::RibbonDisplay::Full };
+                self.ui.set_ribbon_display(mode);
                 json!({"collapsed": self.ui.ribbon_collapsed})
+            }
+            "ui.ribbonDisplay" => {
+                // Ribbon Display Options: `mode` is "full", "tabs" or "fullscreen".
+                let mode = match s("mode") {
+                    Some("full") => crate::RibbonDisplay::Full,
+                    Some("tabs") => crate::RibbonDisplay::TabsOnly,
+                    Some("fullscreen") => crate::RibbonDisplay::FullScreen,
+                    _ => return Some(Err("`mode` must be \"full\", \"tabs\" or \"fullscreen\"".into())),
+                };
+                self.ui.set_ribbon_display(mode);
+                json!({"collapsed": self.ui.ribbon_collapsed, "fullscreen": self.ui.ribbon_fullscreen})
             }
             "ui.focusRibbon" => {
                 // Focus's "⋯" (#1678): `value` true drops the ribbon down over the page, false
@@ -1421,6 +1445,7 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "ui.dialog"
             | "ui.closeDialog"
             | "ui.collapseRibbon"
+            | "ui.ribbonDisplay"
             | "ui.quickAccessToolbar"
             | "ui.keytips"
             | "ui.dark"

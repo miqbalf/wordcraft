@@ -121,6 +121,22 @@ fn cmd_option_r_collapses_the_ribbon_on_macos() {
     assert_eq!(ui_shortcut(Key::R, m(true, true, true)), None, "Mod+Alt+Shift+R");
 }
 
+/// The ribbon toggle's shortcut on each platform: Cmd+Option+R on macOS (already bound, as in
+/// Word for Mac), Ctrl+F1 elsewhere; neither fires on the other platform.
+#[test]
+fn the_ribbon_toggle_shortcut_exists_on_each_platform() {
+    let cmd_opt = egui::Modifiers { mac_cmd: true, command: true, alt: true, ..Default::default() };
+    let ctrl = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
+    let toggle = Some(("ui.collapseRibbon", json!({})));
+    if cfg!(target_os = "macos") {
+        assert_eq!(ui_shortcut(Key::R, cmd_opt), toggle, "Cmd+Option+R on macOS");
+        assert_eq!(ui_shortcut(Key::F1, ctrl), None, "Ctrl+F1 is the system's on macOS");
+    } else {
+        assert_eq!(ui_shortcut(Key::F1, ctrl), toggle, "Ctrl+F1 on Windows and Linux");
+        assert_eq!(ui_shortcut(Key::R, cmd_opt), None);
+    }
+}
+
 #[test]
 fn only_plain_paste_releases_paste_a_clipboard_picture() {
     let m = |command, shift, alt| egui::Modifiers { command, shift, alt, ..Default::default() };

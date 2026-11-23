@@ -797,6 +797,55 @@ pub fn focus_ribbon(app: &mut WordApp, ctx: &egui::Context) {
     }
 }
 
+/// Height of the strip Full-screen mode leaves at the top in place of the title bar, tabs and
+/// ribbon.
+pub const AUTOHIDE_STRIP: f32 = 14.0;
+
+/// Full-screen mode: the thin strip that brings the ribbon and tabs back with a click.
+pub fn ribbon_autohide_strip(app: &mut WordApp, ui: &mut Ui) {
+    let t = Tokens::get(ui.ctx());
+    egui::Panel::top("ribbon_autohide").exact_size(AUTOHIDE_STRIP).show_separator_line(false).frame(egui::Frame::NONE.fill(t.tab_strip)).show(
+        ui,
+        |ui| {
+            let full = ui.max_rect();
+            let resp = ui.interact(full, ui.scope_id().with("ribbon_autohide_click"), Sense::click());
+            let shade = if resp.hovered() || app.ui.ribbon_peek { t.text } else { t.text_dim };
+            icons::paint(ui.painter(), Rect::from_center_size(full.center(), vec2(12.0, 12.0)), "chevronDown", shade, t.accent);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tl!("Show the ribbon")));
+            if resp.on_hover_text(tl!("Show the ribbon")).clicked() {
+                app.ui.ribbon_peek = !app.ui.ribbon_peek;
+            }
+        },
+    );
+}
+
+/// Full-screen mode, after the top strip was clicked: the title bar, tabs and ribbon drawn over
+/// the page, so the page doesn't move.
+pub fn ribbon_peek(app: &mut WordApp, ctx: &egui::Context) {
+    let width = ctx.content_rect().width();
+    egui::Area::new(egui::Id::unique("ribbon_peek")).fixed_pos(pos2(0.0, AUTOHIDE_STRIP)).order(egui::Order::Middle).show(ctx, |ui| {
+        ui.set_width(width);
+        ui.set_max_width(width);
+        title_bar(app, ui);
+        crate::ribbon::show(app, ui);
+    });
+}
+
+/// A click on the page puts away the ribbon shown over it (tabs only, Full-screen mode).
+pub fn close_ribbon_on_page_click(app: &mut WordApp, ctx: &egui::Context) {
+    if !(app.ui.ribbon_overlay || app.ui.ribbon_peek) {
+        return;
+    }
+    let click = ctx.input(|i| if i.pointer.any_click() { i.pointer.interact_pos() } else { None });
+    if let Some(pos) = click
+        && app.canvas.viewport.is_some_and(|v| v.contains(pos))
+        && ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background)
+    {
+        app.ui.ribbon_overlay = false;
+        app.ui.ribbon_peek = false;
+    }
+}
+
 /// Draws the status bar's page, word count, zoom and status controls, fitting a status message
 /// with a tooltip; without a document the bar is empty.
 pub fn status_bar(app: &mut WordApp, ui: &mut Ui) {

@@ -312,6 +312,126 @@ fn ctrl_f1_through_the_app_collapses_the_ribbon() {
     assert!(!h.state().ui.ribbon_collapsed, "and brings it back");
 }
 
+/// Ribbon Display Options: the three modes, set by command, with the saved flags they make.
+#[test]
+fn ribbon_display_options_set_the_three_modes() {
+    let mut a = app();
+    assert_eq!(a.ui.ribbon_display(), RibbonDisplay::Full);
+    a.run("ui.ribbonDisplay", json!({"mode": "tabs"})).unwrap();
+    assert_eq!(a.ui.ribbon_display(), RibbonDisplay::TabsOnly);
+    assert!(a.ui.ribbon_collapsed && !a.ui.ribbon_fullscreen);
+    a.run("ui.ribbonDisplay", json!({"mode": "fullscreen"})).unwrap();
+    assert_eq!(a.ui.ribbon_display(), RibbonDisplay::FullScreen);
+    a.run("ui.ribbonDisplay", json!({"mode": "full"})).unwrap();
+    assert_eq!(a.ui.ribbon_display(), RibbonDisplay::Full);
+    assert!(!a.ui.ribbon_collapsed && !a.ui.ribbon_fullscreen);
+    assert!(a.run("ui.ribbonDisplay", json!({"mode": "nope"})).is_err());
+    // The chevron's command: tabs and commands <-> tabs only; Full-screen goes back to Full.
+    a.run("ui.collapseRibbon", json!({})).unwrap();
+    assert_eq!(a.ui.ribbon_display(), RibbonDisplay::TabsOnly);
+    a.run("ui.collapseRibbon", json!({})).unwrap();
+    assert_eq!(a.ui.ribbon_display(), RibbonDisplay::Full);
+    a.run("ui.ribbonDisplay", json!({"mode": "fullscreen"})).unwrap();
+    a.run("ui.collapseRibbon", json!({})).unwrap();
+    assert_eq!(a.ui.ribbon_display(), RibbonDisplay::Full);
+}
+
+/// The choice is the user's own: it is saved with the preferences and restored, hosted or not;
+/// the ribbon shown over the page is not.
+#[test]
+fn the_ribbon_display_choice_is_saved_and_restored() {
+    for hosted in [false, true] {
+        for (mode, name) in [("tabs", "TabsOnly"), ("fullscreen", "FullScreen"), ("full", "Full")] {
+            let services = Services { hosted, ..Default::default() };
+            let mut a = WordApp::new(Session::new(wordcraft_doc::Document::new()), services);
+            a.run("ui.ribbonDisplay", json!({"mode": mode})).unwrap();
+            a.ui.ribbon_overlay = true;
+            a.ui.ribbon_peek = true;
+            let stored = serde_json::to_string(&a.prefs()).unwrap();
+            let mut next = WordApp::new(Session::new(wordcraft_doc::Document::new()), Services { hosted, ..Default::default() });
+            next.apply_prefs(UiState::from_json(stored.as_bytes()).unwrap());
+            assert_eq!(format!("{:?}", next.ui.ribbon_display()), name, "hosted {hosted}, {mode}");
+            assert!(!next.ui.ribbon_overlay && !next.ui.ribbon_peek, "shown-over-the-page state is not saved");
+        }
+    }
+    let mut a = app();
+    a.run("ui.ribbonDisplay", json!({"mode": "fullscreen"})).unwrap();
+    assert_eq!(serde_json::to_value(a.prefs()).unwrap()["ribbonFullscreen"], json!(true));
+}
+
+/// Tabs only: a tab click shows that tab's ribbon over the page, not the permanent ribbon; it
+/// closes on the same tab again, after a command, or after a click on the page.
+#[test]
+fn a_tab_click_while_collapsed_opens_an_overlay_not_the_permanent_ribbon() {
+    let mut h = canvas_harness();
+    h.state_mut().run("ui.ribbonDisplay", json!({"mode": "tabs"})).unwrap();
+    h.run_steps(3);
+    assert!(!h.state().ui.ribbon_overlay, "collapsed: tabs alone");
+    h.get_by_label("Insert").click();
+    h.run_steps(3);
+    let ui = &h.state().ui;
+    assert!(ui.ribbon_overlay, "the tab's ribbon shows over the page");
+    assert!(ui.ribbon_collapsed, "the ribbon itself stays collapsed");
+    assert_eq!(ui.tab, "Insert");
+    // The same tab again puts it away.
+    h.get_by_label("Insert").click();
+    h.run_steps(3);
+    assert!(!h.state().ui.ribbon_overlay && h.state().ui.ribbon_collapsed);
+    // A command that runs closes it.
+    h.state_mut().run("ui.tab", json!({"tab": "Home"})).unwrap();
+    assert!(h.state().ui.ribbon_overlay);
+    h.state_mut().run("format.bold", json!({})).unwrap();
+    assert!(!h.state().ui.ribbon_overlay, "a command closed it");
+    assert!(h.state().ui.ribbon_collapsed);
+    // Expanded: a tab click never opens an overlay.
+    h.state_mut().run("ui.ribbonDisplay", json!({"mode": "full"})).unwrap();
+    h.state_mut().run("ui.tab", json!({"tab": "Insert"})).unwrap();
+    assert!(!h.state().ui.ribbon_overlay);
+}
+
+/// The visible chevron: it collapses the ribbon, the tab strip then carries one that expands it,
+/// and the options arrow opens the menu with the three choices.
+#[test]
+fn the_ribbon_chevron_collapses_and_expands_and_has_display_options() {
+    let mut h = canvas_harness();
+    assert_eq!(h.state().ui.ribbon_display(), RibbonDisplay::Full);
+    h.get_by_label("Collapse the ribbon").click();
+    h.run_steps(3);
+    assert_eq!(h.state().ui.ribbon_display(), RibbonDisplay::TabsOnly);
+    h.get_by_label("Expand the ribbon").click();
+    h.run_steps(3);
+    assert_eq!(h.state().ui.ribbon_display(), RibbonDisplay::Full);
+    h.get_by_label("Ribbon display options").click();
+    h.run_steps(3);
+    for label in ["Show tabs and commands", "Show tabs only", "Full-screen mode"] {
+        assert!(h.query_by_label(label).is_some(), "{label} is in the menu");
+    }
+    h.get_by_label("Full-screen mode").click();
+    h.run_steps(3);
+    assert_eq!(h.state().ui.ribbon_display(), RibbonDisplay::FullScreen);
+}
+
+/// Full-screen mode: no title bar, tabs or ribbon, only the top strip; a click on it shows them
+/// over the page, and a command puts them away again.
+#[test]
+fn full_screen_ribbon_mode_autohides_and_a_top_click_shows_it() {
+    let mut h = canvas_harness();
+    assert!(h.query_by_label("Insert").is_some());
+    h.state_mut().run("ui.ribbonDisplay", json!({"mode": "fullscreen"})).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label("Insert").is_none(), "tabs are hidden");
+    assert!(h.query_by_label("AutoSave").is_none(), "and the title bar");
+    h.get_by_label("Show the ribbon").click();
+    h.run_steps(3);
+    assert!(h.state().ui.ribbon_peek);
+    assert!(h.query_by_label("Insert").is_some(), "tabs shown over the page");
+    h.state_mut().run("format.bold", json!({})).unwrap();
+    h.run_steps(3);
+    assert!(!h.state().ui.ribbon_peek);
+    assert!(h.query_by_label("Insert").is_none(), "hidden again");
+    assert_eq!(h.state().ui.ribbon_display(), RibbonDisplay::FullScreen, "the mode stays");
+}
+
 /// #1678: a Ctrl+F1 the user binds in Customize Keyboard runs their command through the app,
 /// and the ribbon stays as it was.
 #[cfg(not(target_os = "macos"))]

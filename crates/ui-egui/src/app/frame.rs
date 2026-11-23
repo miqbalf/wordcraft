@@ -95,13 +95,26 @@ impl WordApp {
             if screen != chrome::Screen::Normal {
                 chrome::screen_bar(self, ui, screen);
             } else {
-                chrome::title_bar(self, ui);
-                if moved(self) {
-                    return;
+                // Ribbon Display Options: Full-screen mode auto-hides the title bar, tabs and
+                // ribbon behind a thin strip; shown over the page after a click on it.
+                let auto = self.ui.ribbon_fullscreen;
+                if !auto {
+                    self.ui.ribbon_peek = false;
                 }
-                ribbon::show(self, ui);
-                if moved(self) {
-                    return;
+                if !self.ui.ribbon_collapsed || auto {
+                    self.ui.ribbon_overlay = false;
+                }
+                if auto {
+                    chrome::ribbon_autohide_strip(self, ui);
+                } else {
+                    chrome::title_bar(self, ui);
+                    if moved(self) {
+                        return;
+                    }
+                    ribbon::show(self, ui);
+                    if moved(self) {
+                        return;
+                    }
                 }
                 crate::language_packs::bar(self, ui);
                 chrome::status_bar(self, ui);
@@ -120,6 +133,12 @@ impl WordApp {
             });
             if self.focus_ribbon && !moved(self) {
                 chrome::focus_ribbon(self, ctx);
+            }
+            if screen == chrome::Screen::Normal && !moved(self) {
+                if self.ui.ribbon_peek {
+                    chrome::ribbon_peek(self, ctx);
+                }
+                chrome::close_ribbon_on_page_click(self, ctx);
             }
         }
     }
