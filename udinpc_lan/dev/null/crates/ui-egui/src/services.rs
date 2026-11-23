@@ -1,0 +1,162 @@
+use super::state::DefaultApp;
+use super::{FileDialogAnswer, FileDialogRequest, WordApp, async_saves, paste_picture, printing, system_clipboard};
+
+/// Platform services injected by the host (file dialogs, file I/O).
+#[derive(Default)]
+pub struct Services {
+    /// Desktop: discover configured printers on a worker.
+    pub printers: Option<printing::Discover>,
+    /// Desktop: submit the PDF with the chosen settings on a worker.
+    pub print_native: Option<printing::Submit>,
+    /// Desktop: stop the print job still waiting to be sent (on a sleeping printer's driver,
+    /// say). `true`: it will never be sent; `false`: it was already being sent.
+    pub cancel_print: Option<Box<dyn Fn() -> bool>>,
+    /// Pick a file to open; the argument says what for (`document`, `picture`).
+    pub pick_open: Option<Box<dyn Fn(&str) -> Option<String>>>,
+    /// Pick a path to save to, given a suggested name.
+    pub pick_save: Option<Box<dyn Fn(&str) -> Option<String>>>,
+    /// Desktop: show a native file dialog without blocking the UI thread (#94); used instead of
+    /// `pick_open` / `pick_save` when set. The host sends the picked path (`Ok(None)` when
+    /// cancelled) through the returned channel once the user answers, and wakes the UI; a dropped
+    /// sender counts as cancelled. An `Err` says no system dialog could be shown, and the app shows
+    /// its built-in file browser instead (#576). The app shows one dialog at a time ([`file_dialogs`]).
+    pub file_dialog: Option<Box<dyn Fn(FileDialogRequest) -> std::sync::mpsc::Receiver<FileDialogAnswer>>>,
+    /// Desktop: stop waiting for the system file dialog the host is showing, if it can (a portal
+    /// that never answers). The app calls it when it gives the dialog up (File › Open › Browse in
+    /// WordCraft…), so the host closes the request and answers as cancelled.
+    pub cancel_file_dialog: Option<Box<dyn Fn()>>,
+    /// Web: open a file picker; the file arrives later through `inbox`.
+    pub open_async: Option<Box<dyn Fn(&str)>>,
+    /// Web: files (name, bytes) delivered asynchronously (picker, drag and drop).
+    pub inbox: Option<Inbox>,
+    /// Web: pictures pasted from the browser's clipboard (the bytes; the name is ignored). Kept
+    /// apart from `inbox` because a paste only lands in the document when the page is the edit
+    /// target (#1349), where a dropped or opened file always lands.
+    pub pasted: Option<Inbox>,
+    /// Web: hand bytes to the browser as a download. An error means no download started (the
+    /// browser can't tell the page whether the user then kept the file).
+    pub download: Option<Box<dyn Fn(&str, &[u8]) -> Result<(), String>>>,
+    /// Web: hand bytes to the browser as a plain download (`craft_web_host::web::download`: an
+    /// `<a download>` click, no network), whatever page frames the app, as `(name, MIME type,
+    /// bytes)`. Every Save As and Export copy goes this way ([`crate::save_as`]), and a live
+    /// session that ended keeps the user's edits this way: the host page never gets a copy.
+    pub download_copy: Option<Box<dyn Fn(&str, &str, &[u8]) -> Result<(), String>>>,
+    /// Web: saves that `download` started and that finish later (the browser's save picker,
+    /// #1315). The hook starts a ticket for such a save and reports how it ended; until then the
+    /// document's save isn't confirmed, and a New/Open held back by the Save Changes prompt waits.
+    pub async_saves: Option<async_saves::AsyncSaves>,
+    /// Web, framed by a page that keeps the files (`?host=parent`): set alongside `download`,
+    /// Save, Save As and Export hand the bytes to that page instead, with whether it was Save As
+    /// ([`HostSaveFn`]: true for a `file.saveAs` in a format that keeps everything, which File ›
+    /// Export to such a format runs too, and for a Save under a name the page never sent; false
+    /// for Save and for copies: the PDF and PNG exports and Save As in a format that doesn't keep
+    /// everything). Save then writes the opened file
+    /// under its own name and format, as on the desktop, and a Save or Save As that keeps
+    /// everything makes that name the document's file, so the next Save goes to it.
+    pub host_save: Option<HostSaveFn>,
+    /// Web, framed by a page that keeps the user's files (`?host=parent`, such as Nextcloud). Only
+    /// a plain Save of the opened document goes to that page ([`Self::host_save`]); Save As,
+    /// Export, Save these pages as PDF, a template and a Save of a document the page never sent
+    /// are copies that download to the user's computer through [`Self::download_copy`], with no
+    /// network, and never change which file the document is. The page opens and creates files
+    /// itself, so New, Open and Close are hidden and refused, a dropped document is refused, and
+    /// the Recent list is neither shown nor recorded.
+    pub hosted: bool,
+    /// Web, hosted (`?host=parent`): the document the page sends, kept apart from [`Self::inbox`]
+    /// (the picker and drops), which may not open documents while hosted.
+    pub host_open: Option<Inbox>,
+    /// Web, framed by a page that does not store saves (`?host=parent`): Save, Save As and the
+    /// exports download a copy through `download_copy` instead, and never mark the document
+    /// saved (the browser can't say whether the user kept the download).
+    pub saves_are_copies: bool,
+    /// Web, framed by a page that stores saves and answers each one (`?host=parent`, the host's
+    /// `saves`): `host_save` finishes later, through a ticket of `async_saves`. The document is
+    /// marked saved, and takes the name the host kept it under ([`async_saves::SaveOutcome::SavedAs`]),
+    /// only when the host says `Saved`; on a failure it stays unsaved and the status bar says
+    /// "Couldn't save to Nextcloud: {error}". Without it, `host_save` returns at once and the
+    /// document is marked saved when it returns.
+    pub host_confirms_saves: bool,
+    /// Web, framed by a page that shares files itself (`?host=parent` whose `host` says `share`,
+    /// such as Nextcloud): Share asks that page to open its sharing for the document it sent
+    /// ([`WordApp::host_document`]). An error means the page didn't get the request.
+    pub host_share: Option<Box<dyn Fn() -> Result<(), String>>>,
+    /// Desktop: where Share goes for a document saved at this path (`craft_share::desktop_route`:
+    /// the Nextcloud account whose synced folder holds it, else no Nextcloud). Without it, and
+    /// without [`Self::host_share`], Share says "No Nextcloud connected".
+    pub share_route: Option<Box<dyn Fn(&std::path::Path) -> craft_share::ShareRoute>>,
+    /// Web: told whether the document has unsaved changes after each pass, for the browser's
+    /// leave-page guard (`beforeunload` runs between frames and can't ask the app).
+    pub on_dirty: Option<Box<dyn Fn(bool)>>,
+    /// Web: told the live session's state on every change and at most once a second otherwise
+    /// (`live-state` to the host page).
+    pub live_state: Option<Box<dyn Fn(&crate::live::LiveReport)>>,
+    /// Web: hand PDF bytes to the browser's print dialog (no download or intermediate file).
+    /// Desktop uses `print_native` instead. An error means nothing was opened.
+    pub print: Option<Box<dyn Fn(&[u8]) -> Result<(), String>>>,
+    /// Desktop: the picture on the system clipboard, if any — egui's paste only carries text
+    /// (#45). Read when Paste finds no text; see [`paste_picture`].
+    pub clipboard_picture: Option<Box<dyn Fn() -> Option<paste_picture::ClipboardPicture>>>,
+    /// Whether the system has animation effects on (Windows: Animation effects; macOS: Reduce
+    /// motion; Linux and the BSDs: the desktop's setting; browsers: `prefers-reduced-motion`), or
+    /// `None` when it doesn't say. What "Use system setting" follows ([`theme::Animations`]).
+    /// Asked every frame, so a change in the system's settings shows at once: the host answers
+    /// from memory and does any slow asking elsewhere. Without the hook, animation effects stay on.
+    pub animations_enabled: Option<Box<dyn Fn() -> Option<bool>>>,
+    /// Desktop: the text on the system clipboard, if any. Ctrl+V gets it from egui's paste event;
+    /// the ribbon and context-menu Paste read it here (#584).
+    pub clipboard_text: Option<Box<dyn Fn() -> Option<String>>>,
+    /// Web: the browser's clipboard, read for the ribbon and context-menu Paste (WA F7), which
+    /// answers later ([`system_clipboard::BrowserClipboard`]). Unused where `clipboard_text` is set.
+    pub browser_clipboard: Option<system_clipboard::BrowserClipboard>,
+    /// Desktop: the HTML on the system clipboard — another program's formatted copy (a Word
+    /// document, a web page) — if any. Paste keeps its formatting (#687); see [`system_clipboard`].
+    pub clipboard_html: Option<Box<dyn Fn() -> Option<String>>>,
+    /// Desktop: put a copy on the system clipboard as (text, html, rtf, mathml): its text, with
+    /// its HTML (equations as MathML, #816) and RTF beside it where the platform takes them, so
+    /// other programs keep the formatting (#1523); an empty one isn't offered. `mathml` is a copy
+    /// of one equation alone (else empty), for the platform's MathML formats, which Word reads a
+    /// pasted equation from (#1297). `true` when the text and HTML are there; otherwise the copy's
+    /// text goes through egui as usual.
+    pub set_clipboard_rich: Option<Box<dyn Fn(&str, &str, &str, &str) -> bool>>,
+    /// Desktop: publish one picture's pixels, HTML and text together without clearing formats.
+    pub set_clipboard_image: Option<Box<dyn Fn(&system_clipboard::CopyImage, &str, &str) -> bool>>,
+    /// Whether the clipboard still contains this process's last copy.
+    pub clipboard_is_own: Option<Box<dyn Fn() -> bool>>,
+    /// Desktop: the RTF on the system clipboard, where the platform offers it (#687).
+    pub clipboard_rtf: Option<Box<dyn Fn() -> Option<String>>>,
+    /// Desktop: the names of the formats on the system clipboard (MIME types, Windows format
+    /// names), where the platform lists them, so a paste that finds nothing it can use says what
+    /// is there instead of "empty" (#833).
+    pub clipboard_formats: Option<Box<dyn Fn() -> Vec<String>>>,
+    /// Web: keep a font the user added (stored file name, original bytes) for the next visit
+    /// (#582). Desktop fonts are stored by the font database itself, in the app's font folder.
+    pub store_font: Option<Box<dyn Fn(&str, &[u8])>>,
+    /// Web: forget a stored font (its stored file name) once the user removes it.
+    pub forget_font: Option<Box<dyn Fn(&str)>>,
+    /// Web: request browser to query and load local installed fonts (`window.queryLocalFonts()`).
+    pub load_system_fonts: Option<Box<dyn Fn()>>,
+    /// Desktop: File › Options › General › Make WordCraft the default for Word documents (#295),
+    /// only from that button (never a programmatic command). Windows opens the Settings app's
+    /// Default apps page (apps can't set defaults themselves); Linux and BSD set it with
+    /// `xdg-mime`. `None` (web, macOS) hides the button; macOS shows how to do it in Finder
+    /// instead. An error means nothing changed.
+    pub make_default_app: Option<Box<dyn Fn() -> Result<DefaultApp, String>>>,
+    /// Desktop: write the app's current preferences out now, not only at exit (#2716): a
+    /// document taken off the recent list should survive the app being killed before a normal
+    /// close. `Ok(true)`: written; `Ok(false)`: nothing written because the host keeps no
+    /// preferences (switched off, no settings folder); an error is the reason the write failed.
+    /// The recent commands report these as `saved` true / null / false. `None` (web, tests) keeps
+    /// the change to this run and reports `saved: null`.
+    pub save_prefs: Option<Box<dyn Fn(&WordApp) -> Result<bool, String>>>,
+    /// Desktop: the app's own user templates folder (`Templates` in the settings folder, #2852),
+    /// used while File › Options names none. File › New lists personal templates from it and Save
+    /// as Word Template starts in it. `None` (web) hides personal templates.
+    pub templates_dir: Option<std::path::PathBuf>,
+}
+
+/// Files delivered asynchronously.
+pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// [`Services::host_save`]: `(file name, bytes, save_as)`. An error means the page didn't get
+/// the file, and the save failed.
+pub type HostSaveFn = Box<dyn Fn(&str, &[u8], bool) -> Result<(), String>>;

@@ -547,6 +547,81 @@ fn esc_or_a_click_elsewhere_closes_the_overlay_and_the_peek() {
     assert!(h.state().ui.ribbon_overlay, "a click inside the overlay keeps it");
 }
 
+/// The glyphs say different things: a single chevron to collapse (up) or expand (down), a pin
+/// where the ribbon is shown over the page (it keeps it shown), and the display options' own
+/// icon; and every one of those hit targets is at least 24 x 24.
+#[test]
+fn the_ribbon_buttons_have_distinct_glyphs_and_roomy_targets() {
+    let mut h = canvas_harness();
+    let size = |h: &egui_kittest::Harness<'static, WordApp>, label: &str| {
+        let r = h.get_by_label(label).rect();
+        (r.width(), r.height())
+    };
+    // Shown: collapse (a chevron up) + options.
+    for label in ["Collapse the ribbon", "Ribbon display options"] {
+        let (w, hgt) = size(&h, label);
+        assert!(w >= 24.0 && hgt >= 24.0, "{label}: {w} x {hgt}");
+    }
+    assert!(h.query_by_label("Keep the ribbon shown").is_none(), "no pin while the ribbon is simply shown");
+    // Tabs only: expand (a chevron down) + options in the tab strip.
+    h.state_mut().run("ui.ribbonDisplay", json!({"mode": "tabs"})).unwrap();
+    h.run_steps(3);
+    for label in ["Expand the ribbon", "Ribbon display options"] {
+        let (w, hgt) = size(&h, label);
+        assert!(w >= 24.0 && hgt >= 24.0, "{label}: {w} x {hgt}");
+    }
+    assert!(h.query_by_label("Collapse the ribbon").is_none());
+    // The overlay: a pin in the ribbon's corner, not a chevron up; it keeps the ribbon shown.
+    h.state_mut().run("ui.tab", json!({"tab": "Insert"})).unwrap();
+    h.run_steps(3);
+    assert!(h.state().ui.ribbon_overlay);
+    assert!(h.query_by_label("Collapse the ribbon").is_none(), "the overlay has no up chevron");
+    let (w, hgt) = size(&h, "Keep the ribbon shown");
+    assert!(w >= 24.0 && hgt >= 24.0, "pin: {w} x {hgt}");
+    h.get_by_label("Keep the ribbon shown").click();
+    h.run_steps(3);
+    assert_eq!(h.state().ui.ribbon_display(), RibbonDisplay::Full, "the pin keeps the ribbon shown");
+    // The full-screen peek has the pin too.
+    h.state_mut().run("ui.ribbonDisplay", json!({"mode": "fullscreen"})).unwrap();
+    h.state_mut().ui.ribbon_peek = true;
+    h.run_steps(3);
+    assert!(h.query_by_label("Keep the ribbon shown").is_some() && h.query_by_label("Collapse the ribbon").is_none());
+}
+
+fn luminance(c: egui::Color32) -> f32 {
+    let f = |v: u8| {
+        let v = f32::from(v) / 255.0;
+        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+}
+
+/// Full-screen's only way back: a chevron at least 16 px, in the full-strength text colour with
+/// at least 4.5:1 against the strip in both themes, a tooltip with the platform's shortcut, and a
+/// target at least 24 px high.
+#[test]
+fn the_full_screen_strip_is_easy_to_see_and_say_what_it_does() {
+    const { assert!(chrome::AUTOHIDE_ICON >= 16.0) };
+    const { assert!(chrome::AUTOHIDE_STRIP >= 24.0) };
+    assert_eq!(chrome::show_ribbon_hint(false), "Show ribbon (Ctrl+F1)");
+    assert_eq!(chrome::show_ribbon_hint(true), "Show ribbon (⌘⌥R)");
+    for appearance in [theme::Appearance::Light, theme::Appearance::Dark] {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, appearance);
+        ctx.run_ui(egui::RawInput::default(), |_| {}).drop_without_applying_deltas();
+        let t = theme::Tokens::get(&ctx);
+        let (a, b) = (luminance(t.text), luminance(t.tab_strip));
+        let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+        assert!(ratio >= 4.5, "{appearance:?}: contrast {ratio:.2}");
+    }
+    let mut h = canvas_harness();
+    h.state_mut().run("ui.ribbonDisplay", json!({"mode": "fullscreen"})).unwrap();
+    h.run_steps(3);
+    let r = h.get_by_label("Show the ribbon").rect();
+    assert!(r.height() >= 24.0, "{r:?}");
+}
+
 /// #1678: a Ctrl+F1 the user binds in Customize Keyboard runs their command through the app,
 /// and the ribbon stays as it was.
 #[cfg(not(target_os = "macos"))]

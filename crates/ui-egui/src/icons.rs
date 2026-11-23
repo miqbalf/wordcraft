@@ -1335,6 +1335,12 @@ fn paint_view_and_tables(pen: &Pen, name: &str) -> bool {
         "chevronRight" => pen.line(&[(7.0, 4.0), (13.0, 10.0), (7.0, 16.0)]),
         "chevronUp" => pen.line(&[(4.0, 13.0), (10.0, 7.0), (16.0, 13.0)]),
         "chevronDown" => pen.line(&[(4.0, 7.0), (10.0, 13.0), (16.0, 7.0)]),
+        // Ribbon display options: a window with its ribbon band, and a small caret under it.
+        "ribbonOptions" => {
+            pen.rect(3.0, 3.0, 17.0, 12.0, c);
+            pen.line(&[(3.0, 7.0), (17.0, 7.0)]);
+            pen.fill(&[(7.5, 14.5), (12.5, 14.5), (10.0, 17.5)], c);
+        }
         // Read Aloud player
         "mediaPlay" => pen.fill(&[(6.0, 4.0), (16.0, 10.0), (6.0, 16.0)], c),
         "mediaPause" => {

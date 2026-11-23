@@ -202,7 +202,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                         // tabs took clicks that did nothing, so the empty window had no way back to
                         // the Start screen (#3045).
                         if app.ui.ribbon_collapsed && !app.ui.ribbon_fullscreen {
-                            let (r, _) = ui.allocate_exact_size(vec2(DISPLAY_BUTTON_W, 22.0), Sense::hover());
+                            let (r, _) = ui.allocate_exact_size(vec2(DISPLAY_BUTTON_W, TARGET), Sense::hover());
                             display_button(app, ui, r, &t, false);
                             ui.add_space(8.0);
                         }
@@ -423,9 +423,9 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 let full = ui.max_rect();
                 let mut content = full.translate(shift);
                 if crate::rtl::on() {
-                    content.min.x += CORNER_W + 4.0;
+                    content.min.x += CORNER_W;
                 } else {
-                    content.max.x -= CORNER_W + 4.0;
+                    content.max.x -= CORNER_W;
                 }
                 let mut shifted = ui.new_child(egui::UiBuilder::new().max_rect(content).layout(*ui.layout()));
                 shifted.set_opacity(0.2 + 0.8 * settled);
@@ -522,6 +522,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 // where more is and scroll it on click. Every command also stays reachable through Search Commands.
                 let r = scroll.inner_rect;
                 let overflow = scroll.content_size.x - r.width();
+                // Test-only: where the content ended and how far it was scrolled.
+                #[cfg(test)]
                 ui.data_mut(|d| d.insert_temp(egui::Id::unique("ribbon_probe_content"), (r, scroll.state.clamped_offset().x, overflow)));
                 let offset = scroll.state.clamped_offset().x;
                 let step = 160.0;
@@ -547,9 +549,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     ui.ctx().request_repaint();
                 }
                 // The chevron at the bottom corner: collapse the ribbon, and Ribbon Display Options.
-                let (w, h) = (CORNER_W, 38.0);
-                let x = if rtl { full.left() + 1.0 } else { full.right() - w - 1.0 };
+                let (w, h) = (CORNER_W, 2.0 * TARGET);
+                let x = if rtl { full.left() } else { full.right() - w };
                 let button = Rect::from_min_size(pos2(x, full.bottom() - h - 1.0), vec2(w, h));
+                #[cfg(test)]
                 ui.data_mut(|d| d.insert_temp(egui::Id::unique("ribbon_probe_button"), button));
                 display_button(app, ui, button, &t, true);
             });
@@ -568,10 +571,13 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
 }
 
 /// Width of the ribbon display button: the chevron and the options arrow.
-const DISPLAY_BUTTON_W: f32 = 38.0;
+const DISPLAY_BUTTON_W: f32 = 2.0 * TARGET;
+
+/// The smallest side of the chevron and options buttons' hit targets.
+pub(crate) const TARGET: f32 = 24.0;
 
 /// Width of the corner column that holds the stacked chevron and options arrow in the ribbon.
-const CORNER_W: f32 = 22.0;
+const CORNER_W: f32 = TARGET + 2.0;
 
 /// The three Ribbon Display Options, as `(label, command mode, mode)`.
 fn display_choices() -> [(&'static str, &'static str, crate::RibbonDisplay); 3] {
@@ -602,39 +608,47 @@ fn display_menu(ui: &mut Ui, app: &mut WordApp) {
     }
 }
 
-/// The button that collapses and expands the ribbon (`up`: the ribbon is shown, so it points up)
-/// with the arrow beside it that opens "Ribbon display options"; right-clicking the chevron opens
-/// the same menu.
+/// The buttons at the ribbon's corner (stacked) or in the tab strip (side by side). The first is
+/// a chevron up that collapses the ribbon while it is shown (`up`), a pin that keeps it shown
+/// (back to "Show tabs and commands") while it is shown over the page (tabs-only overlay,
+/// Full-screen peek), or a chevron down that expands the tab strip alone. Beside or under it is
+/// the Ribbon display options button with its own glyph; right-clicking the first opens the same
+/// menu. Every target is at least `TARGET` square.
 pub(crate) fn display_button(app: &mut WordApp, ui: &mut Ui, rect: Rect, t: &Tokens, up: bool) {
-    // In the ribbon's corner column the two stack (chevron over arrow); in the tab strip they sit
-    // side by side.
-    let (chevron, arrow) = if up {
+    let over = up && (app.ui.ribbon_overlay || app.ui.ribbon_peek);
+    let (first, options) = if up {
         let half = rect.height() / 2.0;
         (Rect::from_min_size(rect.min, vec2(rect.width(), half)), Rect::from_min_max(pos2(rect.left(), rect.top() + half), rect.right_bottom()))
     } else {
-        let chevron = Rect::from_min_size(rect.min, vec2(rect.width() - 14.0, rect.height()));
-        (chevron, Rect::from_min_max(pos2(chevron.right(), rect.top()), rect.right_bottom()))
+        let first = Rect::from_min_size(rect.min, vec2(rect.width() / 2.0, rect.height()));
+        (first, Rect::from_min_max(pos2(first.right(), rect.top()), rect.right_bottom()))
     };
     let id = ui.scope_id().with(("ribbon_display_button", up));
-    let resp = ui.interact(chevron, id, Sense::click());
-    let more = ui.interact(arrow, id.with("options"), Sense::click());
-    for (r, hovered) in [(chevron, resp.hovered()), (arrow, more.hovered())] {
+    let resp = ui.interact(first, id, Sense::click());
+    let more = ui.interact(options, id.with("options"), Sense::click());
+    for (r, hovered) in [(first, resp.hovered()), (options, more.hovered())] {
         if hovered {
-            ui.painter().rect_filled(r.shrink2(vec2(0.0, 1.0)), 4.0, t.hover);
+            ui.painter().rect_filled(r.shrink(1.0), 4.0, t.hover);
         }
     }
     let icon =
-        |ui: &Ui, r: Rect, name: &str| icons::paint(ui.painter(), Rect::from_center_size(r.center(), vec2(12.0, 12.0)), name, t.text, t.accent);
-    icon(ui, chevron, if up { "chevronUp" } else { "chevronDown" });
-    icon(ui, arrow, "chevronDown");
-    let label = if up { tl!("Collapse the ribbon") } else { tl!("Expand the ribbon") };
+        |ui: &Ui, r: Rect, name: &str| icons::paint(ui.painter(), Rect::from_center_size(r.center(), vec2(14.0, 14.0)), name, t.text, t.accent);
+    let (glyph, label) = if over {
+        ("pin", tl!("Keep the ribbon shown"))
+    } else if up {
+        ("chevronUp", tl!("Collapse the ribbon"))
+    } else {
+        ("chevronDown", tl!("Expand the ribbon"))
+    };
+    icon(ui, first, glyph);
+    icon(ui, options, "ribbonOptions");
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
-    let options = tl!("Ribbon display options");
-    more.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, options));
+    let name = tl!("Ribbon display options");
+    more.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
     let resp = resp.on_hover_text(label);
-    let more = more.on_hover_text(options);
+    let more = more.on_hover_text(name);
     if resp.clicked() {
-        let _ = app.run("ui.collapseRibbon", json!({}));
+        let _ = if over { app.run("ui.ribbonDisplay", json!({"mode": "full"})) } else { app.run("ui.collapseRibbon", json!({})) };
     }
     crate::rtl::context_menu(&resp, |ui| display_menu(ui, app));
     crate::rtl::menu(&more).show(|ui| display_menu(ui, app));

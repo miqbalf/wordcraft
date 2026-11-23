@@ -799,7 +799,15 @@ pub fn focus_ribbon(app: &mut WordApp, ctx: &egui::Context) {
 
 /// Height of the strip Full-screen mode leaves at the top in place of the title bar, tabs and
 /// ribbon.
-pub const AUTOHIDE_STRIP: f32 = 14.0;
+pub const AUTOHIDE_STRIP: f32 = 24.0;
+
+/// The size of the chevron on the Full-screen strip.
+pub const AUTOHIDE_ICON: f32 = 16.0;
+
+/// The strip's tooltip: how to show the ribbon, with the shortcut of the platform.
+pub fn show_ribbon_hint(mac: bool) -> &'static str {
+    if mac { tl!("Show ribbon (⌘⌥R)") } else { tl!("Show ribbon (Ctrl+F1)") }
+}
 
 /// Full-screen mode: the thin strip that brings the ribbon and tabs back with a click.
 pub fn ribbon_autohide_strip(app: &mut WordApp, ui: &mut Ui) {
@@ -810,10 +818,11 @@ pub fn ribbon_autohide_strip(app: &mut WordApp, ui: &mut Ui) {
             let full = ui.max_rect();
             ui.data_mut(|d| d.insert_temp(autohide_keep_id(), Some(full)));
             let resp = ui.interact(full, ui.scope_id().with("ribbon_autohide_click"), Sense::click());
-            let shade = if resp.hovered() || app.ui.ribbon_peek { t.text } else { t.text_dim };
-            icons::paint(ui.painter(), Rect::from_center_size(full.center(), vec2(12.0, 12.0)), "chevronDown", shade, t.accent);
+            // Full-strength text colour (never the dim one): the only way back must be seen.
+            icons::paint(ui.painter(), Rect::from_center_size(full.center(), vec2(AUTOHIDE_ICON, AUTOHIDE_ICON)), "chevronDown", t.text, t.accent);
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tl!("Show the ribbon")));
-            if resp.on_hover_text(tl!("Show the ribbon")).clicked() {
+            let mac = ui.ctx().os() == egui::os::OperatingSystem::Mac;
+            if resp.on_hover_text(show_ribbon_hint(mac)).clicked() {
                 app.ui.ribbon_peek = !app.ui.ribbon_peek;
             }
         },
