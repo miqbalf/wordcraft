@@ -705,6 +705,14 @@ fn desktop_live_file_shown_again_after_another_document_saves_as_usual() {
     h.state_mut().session.switch_document(live).unwrap();
     h.step();
     assert!(!has_label(&h, LEFT_LIVE), "no hosted status line on the desktop");
+    // Save writes into a temp folder, never into the source tree.
+    let dir = std::env::temp_dir().join(format!("wordcraft-left-live-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("plan.docx");
+    h.state_mut().session.path = Some(path.clone());
     let saved = h.state_mut().run("file.save", json!({}));
-    assert!(!matches!(&saved, Err(e) if e == LEFT_LIVE), "Save is not refused as a live room's file: {saved:?}");
+    let written = path.is_file();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(saved.is_ok(), "Save runs as usual and is not refused as a live room's file: {saved:?}");
+    assert!(written, "Save wrote the file");
 }
