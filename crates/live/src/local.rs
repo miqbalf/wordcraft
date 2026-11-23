@@ -38,20 +38,76 @@ pub(crate) fn outside_body_change(a: &Document, b: &Document) -> Option<&'static
     a.changed_outside_body(b)
 }
 
-/// The inline objects of the body blocks not in `other`, in order.
-fn objects_off<'a>(doc: &'a Document, other: &Document) -> Vec<&'a InlineObject> {
-    let there: HashSet<*const Block> = other.body.iter().map(Arc::as_ptr).collect();
-    doc.body.iter().filter(|b| !there.contains(&Arc::as_ptr(b))).filter_map(|b| b.as_para()).flat_map(|p| &p.objects).collect()
+/// How deep tables are looked into for inline objects.
+const TABLE_DEPTH: usize = 32;
+
+/// The inline objects of block `b`, those in its table cells too.
+fn block_objects<'a>(b: &'a Block, depth: usize, out: &mut Vec<&'a InlineObject>) {
+    match b {
+        Block::Para(p) => out.extend(&p.objects),
+        Block::Table(t) if depth < TABLE_DEPTH => {
+            for cb in t.rows.iter().flat_map(|r| &r.cells).flat_map(|c| &c.blocks) {
+                block_objects(cb, depth + 1, out);
+            }
+        }
+        Block::Table(_) => {}
+    }
 }
 
-/// Refuse an edit that changes what live editing does not share: anything outside the body, or
-/// the body's inline objects (moving them between paragraphs, as Enter and Delete do, is fine).
+/// The inline objects of the body blocks not in `other`, in order, table cells included.
+fn objects_off<'a>(doc: &'a Document, other: &Document) -> Vec<&'a InlineObject> {
+    let there: HashSet<*const Block> = other.body.iter().map(Arc::as_ptr).collect();
+    let mut out = Vec::new();
+    for b in doc.body.iter().filter(|b| !there.contains(&Arc::as_ptr(b))) {
+        block_objects(b, 0, &mut out);
+    }
+    out
+}
+
+/// Whether `now` holds only objects `was` held: some were removed, none added.
+fn only_removed(was: &[&InlineObject], now: &[&InlineObject]) -> bool {
+    let mut left = was.to_vec();
+    now.iter().all(|o| match left.iter().position(|w| w == o) {
+        Some(i) => {
+            left.swap_remove(i);
+            true
+        }
+        None => false,
+    })
+}
+
+/// Whether table `b` reads back the same from its shared form: its JSON, as the shared document
+/// holds it, parsed again. A value JSON or the shared document can't hold (a width that is not a
+/// number, an integer past `i64::MAX`) would leave the other editors with something else.
+fn survives_sharing(b: &Block) -> bool {
+    let Ok(json) = serde_json::to_value(b) else { return false };
+    let back = craft_collab::replica::to_json(&craft_collab::replica::to_any(&json));
+    serde_json::from_value::<Block>(back).is_ok_and(|r| r == *b)
+}
+
+/// Refuse an edit that changes what live editing does not share: anything outside the body, the
+/// body's inline objects, table cells' included (moving them between paragraphs, as Enter and
+/// Delete do, is fine), or a new or changed table that would not read back from its shared form.
 pub(crate) fn check_shareable(before: &Document, after: &Document, command: &str) -> Result<(), MapError> {
-    let objects_kept = match in_place(before, after) {
-        Some(changed) => changed.iter().all(|i| objects_at(before, *i) == objects_at(after, *i)),
-        None => objects_off(before, after) == objects_off(after, before),
+    let (was, now) = match in_place(before, after) {
+        Some(changed) => {
+            let at = |d| changed.iter().filter_map(|i| objects_at(d, *i)).flatten().collect::<Vec<&InlineObject>>();
+            (at(before), at(after))
+        }
+        None => (objects_off(before, after), objects_off(after, before)),
     };
-    let reason = if objects_kept { outside_body_change(before, after).map(Refusal::OutsideBody) } else { Some(Refusal::InlineObject) };
+    let reason = if was == now {
+        let there: HashSet<*const Block> = before.body.iter().map(Arc::as_ptr).collect();
+        let fresh_tables = after.body.iter().filter(|b| b.as_table().is_some() && !there.contains(&Arc::as_ptr(b)));
+        match outside_body_change(before, after) {
+            Some(part) => Some(Refusal::OutsideBody(part)),
+            None => fresh_tables.into_iter().any(|b| !survives_sharing(b)).then_some(Refusal::NotEncodable),
+        }
+    } else if only_removed(&was, &now) {
+        Some(Refusal::ObjectRemoved)
+    } else {
+        Some(Refusal::InlineObject)
+    };
     match reason {
         Some(reason) => Err(MapError::NotShareable { command: command.to_owned(), reason }),
         None => Ok(()),

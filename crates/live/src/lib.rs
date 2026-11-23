@@ -17,8 +17,10 @@
 //!
 //! Cut and paste are shared like typing: what they change is body text, runs, paragraphs and
 //! whole tables. A paste that brings what is not shared (a picture, another object, a style or
-//! list definition the document lacks) is refused by the same safety net, and
-//! [`LiveEditing::run`] pastes its text instead ([`PASTED_AS_TEXT`]).
+//! list definition the document lacks, a table that would not read back) is refused by the same
+//! safety net, and [`LiveEditing::run`] pastes its text instead ([`PASTED_AS_TEXT`]). An edit too
+//! large for one shared update ([`SHARE_BYTES`], [`SHARE_BLOCKS`]) is refused before any of it is
+//! sent.
 //!
 //! # The flow
 //!
@@ -97,8 +99,8 @@ use wordcraft_engine::{CmdError, Session};
 
 pub use map::{RECOVERED_STYLE, RECOVERED_STYLE_ID, assign_seed_pids, seed_blocks, seed_ids, write_pids};
 pub use session::{
-    Access, ENDED_KIND, LiveEditing, LiveFail, LiveStatus, NOTICE_KIND, PASTED_AS_TEXT, Peer, SAVED_KIND, SERVICE_UID, SaveEvent, Tap, Word,
-    document_from_state,
+    Access, ENDED_KIND, LiveEditing, LiveFail, LiveStatus, NOTICE_KIND, PASTED_AS_TEXT, Peer, SAVED_KIND, SERVICE_UID, SHARE_BLOCKS, SHARE_BYTES,
+    SaveEvent, Tap, Word, document_from_state,
 };
 pub use shareable::{PASTE_FALLS_BACK, SHAREABLE, is_shareable};
 
@@ -111,6 +113,11 @@ pub enum Refusal {
     /// It added, removed or changed an inline object (a picture, field, bookmark, note or
     /// comment mark…). Moving one between paragraphs, as Enter and Delete do, is fine.
     InlineObject,
+    /// It removed inline objects and added none (a delete, cut or paste over a picture…).
+    ObjectRemoved,
+    /// A table it added or changed would not read back the same from its shared form (a value
+    /// JSON or the shared document can't hold, such as a width that is not a number).
+    NotEncodable,
     /// It changed a part of the document outside the body, named here: `styles`, `numbering`,
     /// `last_section`, `settings`… Only the body is shared.
     OutsideBody(&'static str),

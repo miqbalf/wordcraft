@@ -165,6 +165,22 @@ impl Session {
         Ok(())
     }
 
+    /// Merge the equal neighbouring runs of the body's paragraphs, the form live editing's shared
+    /// copy holds them in. Not an edit: the text and its look stay, so it is not reported, adds
+    /// no undo step, leaves the history, the selection and the unsaved flag alone; the merged
+    /// paragraphs are laid out again.
+    pub fn merge_equal_runs(&mut self) {
+        let split = |b: &wordcraft_doc::Block| b.as_para().is_some_and(|p| p.runs.windows(2).any(|w| matches!(w, [x, y] if x.props == y.props)));
+        for b in &mut self.doc.body {
+            if split(b)
+                && let wordcraft_doc::Block::Para(p) = std::sync::Arc::make_mut(b)
+            {
+                p.normalize();
+                p.touch();
+            }
+        }
+    }
+
     /// Apply a peer's edit to the document the live hooks are bound to (an error while another
     /// document is active). It is not reported to the observer, and it adds no undo step: it
     /// clears the session's own undo and redo snapshots instead, since putting one of them back

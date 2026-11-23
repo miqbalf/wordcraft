@@ -42,7 +42,7 @@
 //! Recovered and forwarded text (see the crate documentation) is made outside the replica's
 //! undo history, so the user's Undo never takes it back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use craft_collab::{BlockChange, Hub, Live, LiveDoc, LiveError};
@@ -55,7 +55,18 @@ use wordcraft_engine::{CmdError, EditObserver, Registry, Session};
 use crate::{LiveMap, LocalEdit, MapError, PASTE_FALLS_BACK, Refusal, assign_seed_pids, is_shareable, seed_blocks, share_pids};
 
 /// What the user is told when a paste went in as its text only.
-pub const PASTED_AS_TEXT: &str = "Pasted as text; images and new styles are not shared in live editing yet.";
+pub const PASTED_AS_TEXT: &str = "Pasted as text; links, images and new styles are not shared in live editing yet.";
+
+/// The most bytes one local edit may send (text added, run formatting, a changed table's JSON as
+/// the relay carries it): well under the relay's cap on one update, so a large edit is refused
+/// before anything is sent instead of breaking the link after it.
+pub const SHARE_BYTES: usize = 1 << 20;
+
+/// The most blocks one local edit may add or change: each is a step of its own.
+pub const SHARE_BLOCKS: usize = 2000;
+
+const TOO_LARGE_PASTE: &str = "This paste is too large to share while others are editing. Paste it in smaller parts.";
+const TOO_LARGE: &str = "This change is too large to share while others are editing.";
 
 /// Another editor in the document, its caret `(paragraph id, char offset)`.
 pub type Peer = craft_live::Peer<(u64, usize)>;
@@ -100,19 +111,53 @@ impl EditObserver for Observer {
     }
 }
 
-/// A batch of edits the mapping refused: the command it names, whether it brought content live
-/// editing does not share ([`brings_unshared`]), and what the user was told.
+/// A batch of edits refused: the command it names, whether its text alone might go in instead
+/// ([`brings_unshared`], or too large), whether it was too large, and what the user was told.
 struct Refused {
     command: String,
-    brings_unshared: bool,
+    text_may_do: bool,
+    too_large: bool,
     why: String,
 }
 
 /// Whether a refusal is for content an edit brought that live editing does not share (an object,
-/// a style, list or picture definition, a text box story), which a text-only paste leaves out.
-/// Other refusals (tracked changes, page setup, no space yet) would refuse the text too.
+/// a style, list, picture or citation definition, a comment, a text box story, a table that would
+/// not read back), which a text-only paste leaves out. Other refusals (tracked changes, page
+/// setup, settings, an object the edit would remove, no space yet) would refuse the text too.
 fn brings_unshared(e: &MapError) -> bool {
-    matches!(e, MapError::NotShareable { reason: Refusal::InlineObject | Refusal::OutsideBody("styles" | "numbering" | "media" | "parts"), .. })
+    matches!(
+        e,
+        MapError::NotShareable {
+            reason: Refusal::InlineObject
+                | Refusal::NotEncodable
+                | Refusal::OutsideBody("styles" | "numbering" | "media" | "parts" | "comments" | "sources" | "passthrough" | "glossary"),
+            ..
+        }
+    )
+}
+
+/// Whether the edit from `before` to `after` would send more than one shared update may carry
+/// ([`SHARE_BYTES`], [`SHARE_BLOCKS`]): the text a kept paragraph gained, every new paragraph
+/// whole, and every new or changed table as the JSON the relay carries (base64, so 4/3).
+fn too_large(before: &Document, after: &Document) -> bool {
+    let kept: HashSet<*const wordcraft_doc::Block> = before.body.iter().map(Arc::as_ptr).collect();
+    let paras: HashMap<u64, &wordcraft_doc::Paragraph> =
+        before.body.iter().filter_map(|b| b.as_para()).filter(|p| p.pid != 0).map(|p| (p.pid, p)).collect();
+    let (mut bytes, mut blocks) = (0usize, 0usize);
+    for b in after.body.iter().filter(|b| !kept.contains(&Arc::as_ptr(b))) {
+        blocks += 1;
+        bytes = bytes.saturating_add(match &**b {
+            wordcraft_doc::Block::Para(p) => {
+                let gained = paras.get(&p.pid).filter(|_| p.pid != 0).map_or(p.text.len(), |q| p.text.len().saturating_sub(q.text.len()));
+                gained.saturating_add(32usize.saturating_mul(p.runs.len() + p.objects.len()))
+            }
+            wordcraft_doc::Block::Table(_) => serde_json::to_string(b).map_or(usize::MAX, |j| j.len() / 3 * 4),
+        });
+        if bytes > SHARE_BYTES || blocks > SHARE_BLOCKS {
+            return true;
+        }
+    }
+    false
 }
 
 /// One call's view of WordCraft for craft-live: the engine session and the paragraph mapping.
@@ -123,12 +168,19 @@ struct App<'a> {
     pending: &'a mut Option<LocalEdit>,
     /// The last batch refused, for a paste to go in as text instead.
     refused: &'a mut Option<Refused>,
+    /// The opened document without its body: everything live editing does not share.
+    base: &'a Document,
 }
 
 impl LiveApp<Word> for App<'_> {
     fn local(&mut self, live: &mut LiveDoc, edits: &[Box<(Document, Document, String)>]) -> Result<Vec<Vec<u8>>, LocalError> {
         let command = edits.iter().map(|e| &e.2).find(|c| !is_shareable(c)).or_else(|| edits.last().map(|e| &e.2)).cloned();
         let (Some(command), Some(last), Some(first)) = (command, edits.last(), edits.first()) else { return Ok(Vec::new()) };
+        if too_large(&first.0, &last.1) {
+            let why = if command.starts_with("edit.paste") { TOO_LARGE_PASTE } else { TOO_LARGE }.to_owned();
+            *self.refused = Some(Refused { command, text_may_do: true, too_large: true, why: why.clone() });
+            return Err(LocalError::Refused(why));
+        }
         match self.map.local_updates(live, &first.0, &last.1, &command) {
             Ok(edit) => {
                 let updates = edit.updates.clone();
@@ -137,7 +189,7 @@ impl LiveApp<Word> for App<'_> {
             }
             Err(e) if e.refused().is_some() => {
                 let why = refusal_text(&e).to_owned();
-                *self.refused = Some(Refused { command, brings_unshared: brings_unshared(&e), why: why.clone() });
+                *self.refused = Some(Refused { command, text_may_do: brings_unshared(&e), too_large: false, why: why.clone() });
                 Err(LocalError::Refused(why))
             }
             Err(e) => Err(LocalError::Failed(e.to_string())),
@@ -148,11 +200,7 @@ impl LiveApp<Word> for App<'_> {
         let Some(edit) = self.pending.take() else { return Landed::Done };
         // The replica holds runs merged; a paragraph the engine left with two equal runs side by
         // side would differ from the other editors' copy of it only there.
-        if self.session.doc.body.iter().any(|b| b.as_para().is_some_and(split_runs))
-            && let Err(e) = self.session.apply_remote(merge_runs)
-        {
-            log::warn!("live: runs were not merged: {e}");
-        }
+        self.session.merge_equal_runs();
         if let Err(e) = share_pids(self.session, &edit) {
             log::warn!("live: new paragraph ids were not written back: {e}");
             Landed::Resync
@@ -182,15 +230,24 @@ impl LiveApp<Word> for App<'_> {
         self.session.apply_remote(|d| map.apply_changes(d, live, changes)).map_err(|e| e.to_string())
     }
 
+    /// The whole body again from the replica, and everything else from the opened document: an
+    /// edit taken back without its `before` (one made after an Undo in the same batch) may have
+    /// changed what is not shared too (a picture's data, the page setup).
     fn resync(&mut self, live: &LiveDoc) -> Result<(), String> {
         let all: Vec<BlockChange> = live.order().into_iter().enumerate().map(|(at, id)| BlockChange::Inserted { at, id }).collect();
-        self.apply(live, &all)
+        let (map, base) = (&mut *self.map, self.base);
+        self.session
+            .apply_remote(|d| {
+                let body = std::mem::take(&mut d.body);
+                *d = base.clone();
+                d.body = body;
+                map.apply_changes(d, live, &all);
+            })
+            .map_err(|e| e.to_string())
     }
 
     fn reset(&mut self, space: u32) {
-        let mut base = self.session.doc.clone();
-        base.body.clear();
-        *self.map = LiveMap::new(&base, space);
+        *self.map = LiveMap::new(self.base, space);
     }
 
     fn set_space(&mut self, space: u32) {
@@ -227,6 +284,8 @@ pub struct LiveEditing<H: Hub> {
     map: LiveMap,
     pending: Option<LocalEdit>,
     refused: Option<Refused>,
+    /// The opened document without its body: everything live editing does not share.
+    base: Document,
     registry: Arc<Registry>,
 }
 
@@ -247,41 +306,50 @@ impl<H: Hub> LiveEditing<H> {
         session.assign_pids(assign_seed_pids).map_err(LiveFail::Ids)?;
         let core = craft_live::LiveEditing::start(hub, room, seed_blocks(&session.doc).as_slice(), access).map_err(LiveFail::Seed)?;
         let map = LiveMap::new(&session.doc, 0);
+        let mut base = session.doc.clone();
+        base.body.clear();
         session.set_observer(Some(Box::new(Observer(core.queue()))));
         session.live_undo_hook(Some(core.queue().history_hook()));
-        Ok(LiveEditing { core, map, pending: None, refused: None, registry: session.registry.clone() })
+        Ok(LiveEditing { core, map, pending: None, refused: None, base, registry: session.registry.clone() })
     }
 
     /// One frame: share the local edits, take in the other editors' edits, carets and saves,
     /// and say who else is here.
     pub fn pump(&mut self, session: &mut Session) -> Vec<Peer> {
-        self.core.pump(&mut App { session, map: &mut self.map, pending: &mut self.pending, refused: &mut self.refused })
+        self.core.pump(&mut App { session, map: &mut self.map, pending: &mut self.pending, refused: &mut self.refused, base: &self.base })
     }
 
     /// Run a command on the session, refused when live editing does not allow it now, and
     /// share its edit right away.
     ///
-    /// A paste ([`PASTE_FALLS_BACK`]) whose edit is not shared (it brings a picture, another
-    /// object, or a style or list definition the document lacks) is put back and its text pasted
-    /// instead, with [`PASTED_AS_TEXT`] for the user. With no text to paste, it is refused.
+    /// A command whose edit is refused is put back, with a notice, and fails. A paste
+    /// ([`PASTE_FALLS_BACK`]) whose edit is not shared (it brings a picture, a link or another
+    /// object, a style or list definition the document lacks, a table that would not read back,
+    /// or more than one update carries) has its text pasted instead, with [`PASTED_AS_TEXT`] for
+    /// the user, when that text is there and small enough.
     pub fn run(&mut self, session: &mut Session, id: &str, params: &Value) -> Result<Value, CmdError> {
         if !self.allows(id) {
             let why = self.refusal_for(id);
             self.core.push_notice(why.clone());
             return Err(CmdError::Disabled(why));
         }
-        let fallback = PASTE_FALLS_BACK.contains(&id).then(|| paste_text(session, id, params)).flatten();
+        // Edits already made go out first, so a refused paste puts back only itself.
+        self.flush(session);
         let sel = session.sel.clone();
         self.refused = None;
         let result = session.run(id, params);
         self.flush(session);
-        match (fallback, self.refused.take()) {
-            (Some(text), Some(r)) if r.brings_unshared && r.command == id => {
-                session.sel = sel;
-                self.paste_as_text(session, &text, &r.why)
+        // Its edit was refused and put back: a paste may go in as its text, else it failed.
+        let Some(r) = self.refused.take().filter(|r| r.command == id) else { return result };
+        // Putting the document back leaves the selection where the edit took it.
+        session.sel = sel;
+        if r.text_may_do && PASTE_FALLS_BACK.contains(&id) {
+            let fits = |t: &String| !r.too_large || (t.len() <= SHARE_BYTES && t.matches('\n').count() < SHARE_BLOCKS);
+            if let Some(text) = paste_text(session, id, params).filter(fits) {
+                return self.paste_as_text(session, &text, &r.why);
             }
-            _ => result,
         }
+        Err(CmdError::Disabled(r.why))
     }
 
     /// Paste `text` with Keep Text Only, in place of a paste refused with `why`: the user is
@@ -313,7 +381,7 @@ impl<H: Hub> LiveEditing<H> {
     /// Share the edits the session made since the last flush, and run the Undo and Redo it
     /// asked for. Refused edits are put back, with a notice.
     pub fn flush(&mut self, session: &mut Session) {
-        self.core.flush(&mut App { session, map: &mut self.map, pending: &mut self.pending, refused: &mut self.refused });
+        self.core.flush(&mut App { session, map: &mut self.map, pending: &mut self.pending, refused: &mut self.refused, base: &self.base });
     }
 
     /// Tell the room where this editor's caret is: paragraph `pid`, char `char_at`, and the
@@ -466,10 +534,14 @@ fn refusal_text(e: &MapError) -> &'static str {
         MapError::NotShareable { command, .. } if command.starts_with("edit.paste") && brings_unshared(e) => {
             "This paste holds pictures, objects or new styles, which can't be shared while others are editing."
         }
-        MapError::NotShareable { command, reason: Refusal::InlineObject } if command == "edit.cut" => {
+        MapError::NotShareable { command, reason: Refusal::InlineObject | Refusal::ObjectRemoved } if command == "edit.cut" => {
             "Pictures and other objects can't be cut while others are editing."
         }
-        MapError::NotShareable { command, reason: Refusal::InlineObject } => {
+        MapError::NotShareable { command, reason: Refusal::ObjectRemoved } if command.starts_with("edit.paste") => {
+            "This paste would replace a picture or another object, which can't be shared while others are editing."
+        }
+        MapError::NotShareable { reason: Refusal::NotEncodable, .. } => "This table can't be shared while others are editing.",
+        MapError::NotShareable { command, reason: Refusal::InlineObject | Refusal::ObjectRemoved } => {
             if is_image(command) {
                 "Images can't be added while others are editing."
             } else {
@@ -516,38 +588,24 @@ fn is_image(id: &str) -> bool {
     ["picture", "image", "shape", "chart", "media"].iter().any(|w| id.contains(w))
 }
 
-/// The text paste command `id` with `params` would paste, without the object characters: the
-/// `text` it was given, else our own clipboard's (or the Clipboard pane item's) text.
+/// The text of what paste command `id` with `params` pasted, without the object characters: the
+/// Clipboard pane item's text, or the text of what Paste took from the same source it did (our
+/// own copy, another program's HTML or RTF, or the clipboard's text), read in a scratch session
+/// so this one is left alone.
 fn paste_text(session: &Session, id: &str, params: &Value) -> Option<String> {
     let text = if id == "edit.pasteClipboardItem" {
         let i = params.get("index").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok())?;
         session.clip_history.items().get(i)?.text.clone()
     } else {
-        match params.get("text").and_then(Value::as_str) {
-            Some(t) => t.to_owned(),
-            None if params.get("privateClipboard").and_then(Value::as_bool) != Some(false) => session.clipboard.as_ref()?.plain_text(),
-            None => return None,
+        let mut scratch = Session::new(Document::new());
+        scratch.clipboard.clone_from(&session.clipboard);
+        match wordcraft_engine::cmd::paste::paste_content(&mut scratch, params).ok()? {
+            wordcraft_engine::cmd::paste::Pasted::Fragment(f) => f.plain_text(),
+            wordcraft_engine::cmd::paste::Pasted::Text(t) => t,
         }
     };
     let text: String = text.chars().filter(|c| *c != wordcraft_doc::para::OBJ).collect();
     (!text.is_empty()).then_some(text)
-}
-
-/// Whether paragraph `p` has two runs side by side with the same formatting.
-fn split_runs(p: &wordcraft_doc::Paragraph) -> bool {
-    p.runs.windows(2).any(|w| matches!(w, [x, y] if x.props == y.props))
-}
-
-/// Merge the equal neighbouring runs of the body's paragraphs, as the replica holds them.
-fn merge_runs(doc: &mut Document) {
-    for b in &mut doc.body {
-        if b.as_para().is_some_and(split_runs)
-            && let wordcraft_doc::Block::Para(p) = Arc::make_mut(b)
-        {
-            p.normalize();
-            p.touch();
-        }
-    }
 }
 
 /// The text of body paragraph `pid`.

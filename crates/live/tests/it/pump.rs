@@ -1221,7 +1221,7 @@ fn concurrent_cut_and_paste_in_one_paragraph_converge() {
 }
 
 fn clipboard_command(rng: &mut Rng) -> (&'static str, Value) {
-    match rng.below(10) {
+    match rng.below(14) {
         0 | 1 => ("edit.cut", json!({})),
         2 => ("edit.copy", json!({})),
         3 | 4 => ("edit.paste", json!({})),
@@ -1229,16 +1229,21 @@ fn clipboard_command(rng: &mut Rng) -> (&'static str, Value) {
         6 => ("edit.pasteMerge", json!({})),
         7 => ("text.insert", json!({"text": "ab"})),
         8 => ("format.bold", json!({})),
+        // Another program's content: formatted lines, a table, a picture, a link.
+        9 => ("edit.paste", json!({"html": "<p><b>h1</b> x</p><p>h2</p>", "text": "h1 x\nh2"})),
+        10 => ("edit.paste", json!({"html": "<table><tr><td>t1</td><td>t2</td></tr></table>", "text": "t1\tt2"})),
+        11 => ("edit.paste", json!({"html": format!("<p>i<img src=\"data:image/png;base64,{PNG}\" width=\"4\" height=\"4\">j</p>"), "text": "ij"})),
+        12 => ("edit.paste", json!({"html": "<p>see <a href=\"https://example.com/\">here</a></p>", "text": "see here"})),
         _ => ("edit.undo", json!({})),
     }
 }
 
 #[test]
 fn cut_copy_and_paste_converge_through_the_pump() {
-    for seed in 200..206 {
+    for seed in 200..248 {
         converge_with(2, seed, 120, clipboard_command);
     }
-    for seed in 300..303 {
+    for seed in 300..316 {
         converge_with(3, seed, 120, clipboard_command);
     }
 }
@@ -1286,7 +1291,8 @@ fn a_paste_with_a_picture_goes_in_as_text_on_every_side() {
     assert!(!said.iter().any(|n| n.contains("link or bookmark")), "and not the refusal: {said:?}");
     settle(&relay, &mut [&mut a, &mut b]);
     assert_same(&a, &b, "the text-only paste");
-    assert_eq!(texts(&b.s.doc), ["Start Hi there"]);
+    let got = texts(&b.s.doc).concat();
+    assert!(got.starts_with("Start") && got.contains("Hi") && got.contains("there"), "the HTML's own text: {got:?}");
     assert_eq!(objects(&a.s.doc), 0, "no picture");
     assert_eq!(a.s.doc.media.len(), media, "and no picture data");
 
@@ -1325,14 +1331,7 @@ fn a_paste_bringing_a_new_list_definition_goes_in_as_text() {
 #[test]
 fn a_cut_of_a_picture_is_put_back() {
     // A picture in the file, cut with its text: removing an inline object is not shared.
-    let mut doc = plain(&["Before", "After"]);
-    let html = format!("<p>x<img src=\"data:image/png;base64,{PNG}\" width=\"10\" height=\"10\">y</p>");
-    let mut s = Session::new(doc.clone());
-    s.sel = Selection { anchor: Pos::body(0, 6), focus: Pos::body(0, 6) };
-    s.run("edit.paste", &json!({"html": html})).unwrap();
-    assert!(objects(&s.doc) > 0, "the file has a picture");
-    doc = s.doc.clone();
-    let bytes = save_bytes("plan.docx", &doc).unwrap();
+    let bytes = picture_file();
     let relay = relay(None);
     let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
     let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
@@ -1364,4 +1363,158 @@ fn a_pasted_table_reaches_every_side() {
     assert_same(&a, &b, "the pasted table");
     assert_eq!(b.s.doc.body.iter().filter(|b| b.as_table().is_some()).count(), 1, "the other editor has the table");
     assert!(b.s.doc.plain_text(wordcraft_doc::StoryRef::Body).contains("b2"));
+}
+
+/// A file whose first paragraph holds a picture, between "Before" and "x…y".
+fn picture_file() -> Vec<u8> {
+    let html = format!("<p>x<img src=\"data:image/png;base64,{PNG}\" width=\"10\" height=\"10\">y</p>");
+    let mut s = Session::new(plain(&["Before", "After"]));
+    s.sel = Selection { anchor: Pos::body(0, 6), focus: Pos::body(0, 6) };
+    s.run("edit.paste", &json!({"html": html})).unwrap();
+    assert!(objects(&s.doc) > 0, "the file has a picture");
+    save_bytes("plan.docx", &s.doc).unwrap()
+}
+
+fn two(bytes: &[u8]) -> (Shared, Ed, Ed) {
+    let relay = relay(None);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    (relay, a, b)
+}
+
+#[test]
+fn a_paste_too_large_to_share_is_refused_and_editing_goes_on() {
+    let (relay, mut a, mut b) = two(&file(&["Start"]));
+    let before = a.s.doc.clone();
+    let huge = "x".repeat(20 << 20);
+    a.end_of(0);
+    assert!(!a.run("edit.pasteText", json!({"text": huge})), "a 20 MB paste is refused");
+    assert!(before.same_content(&a.s.doc), "and put back");
+    let said = a.le.take_notices();
+    assert!(said.iter().any(|n| n.contains("too large")), "{said:?}");
+    // Through Paste too: its text is as large, so there is nothing to fall back on.
+    assert!(!a.run("edit.paste", json!({"text": huge})));
+    assert!(before.same_content(&a.s.doc));
+    assert!(a.le.take_notices().iter().any(|n| n.contains("too large")));
+    // So is a table of ten thousand rows, and its ten thousand lines of text.
+    let rows: String = (0..10_000).map(|i| format!("<tr><td>r{i}</td><td>c</td></tr>")).collect();
+    let lines: String = (0..10_000).map(|i| format!("r{i}\tc\n")).collect();
+    assert!(!a.run("edit.paste", json!({"html": format!("<table>{rows}</table>"), "text": lines})));
+    assert!(before.same_content(&a.s.doc));
+    assert!(a.le.take_notices().iter().any(|n| n.contains("too large")));
+    // The link is still live and editing goes on.
+    assert!(a.le.editable() && matches!(a.le.status(), LiveStatus::Live { .. }), "{:?}", a.le.status());
+    assert!(a.run("text.insert", json!({"text": "!"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Start!"]);
+    assert_same(&a, &b, "after the refused pastes");
+}
+
+#[test]
+fn a_table_too_large_to_share_goes_in_as_text() {
+    let (relay, mut a, mut b) = two(&file(&["Start"]));
+    let cells: String = (0..10).map(|_| "<td>x</td>").collect();
+    let rows: String = (0..600).map(|_| format!("<tr>{cells}</tr>")).collect();
+    let text: String = (0..600).map(|_| "x\tx\tx\tx\tx\tx\tx\tx\tx\tx\n").collect();
+    a.end_of(0);
+    assert!(a.run("edit.paste", json!({"html": format!("<table>{rows}</table>"), "text": text})));
+    assert!(a.le.take_notices().iter().any(|n| n.contains("Pasted as text")));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "the table's text");
+    assert_eq!(b.s.doc.body.iter().filter(|b| b.as_table().is_some()).count(), 0, "no table");
+}
+
+#[test]
+fn an_html_only_paste_falls_back_to_its_own_text() {
+    // Our clipboard holds an older copy; the paste is another program's HTML with a picture.
+    let (relay, mut a, mut b) = two(&file(&["Start"]));
+    select(&mut a, 0, 0, 5);
+    assert!(a.run("edit.copy", json!({})));
+    a.end_of(0);
+    let html = format!("<p>Fresh <img src=\"data:image/png;base64,{PNG}\" width=\"10\" height=\"10\">words</p>");
+    assert!(a.run("edit.paste", json!({"html": html})));
+    assert!(a.le.take_notices().iter().any(|n| n.contains("Pasted as text")));
+    settle(&relay, &mut [&mut a, &mut b]);
+    let got = texts(&b.s.doc).concat();
+    assert!(got.contains("Fresh") && got.contains("words"), "the paste's own text: {got:?}");
+    assert!(!got.contains("StartStart"), "not the old copy: {got:?}");
+    assert_same(&a, &b, "after the fallback");
+}
+
+#[test]
+fn a_clipboard_pane_item_with_a_picture_goes_in_as_text() {
+    let (relay, mut a, mut b) = two(&picture_file());
+    let len = para(&a, 0).text.len();
+    select(&mut a, 0, 0, len);
+    assert!(a.run("edit.copy", json!({})));
+    a.end_of(1);
+    assert!(a.run("edit.pasteClipboardItem", json!({"index": 0})));
+    assert!(a.le.take_notices().iter().any(|n| n.contains("Pasted as text")));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "the item's text");
+    let last = texts(&b.s.doc).last().cloned().unwrap();
+    assert!(last.starts_with("After") && last.contains("Before") && last.contains("xy"), "{last:?}");
+    assert_eq!(objects(&b.s.doc), objects(&a.s.doc), "no second picture");
+}
+
+#[test]
+fn a_table_that_would_not_read_back_goes_in_as_text() {
+    // A table whose column width is not a number: its shared form would not read back.
+    let mut s = Session::new(plain(&["x"]));
+    s.run("edit.paste", &json!({"html": "<table><tr><td>t1</td><td>t2</td></tr></table>"})).unwrap();
+    let mut table = s.doc.body.iter().find_map(|b| b.as_table()).cloned().unwrap();
+    table.grid = vec![f32::INFINITY; table.grid.len().max(1)];
+    let (relay, mut a, mut b) = two(&file(&["Start"]));
+    a.s.clipboard = Some(wordcraft_doc::edit::Fragment { blocks: vec![Block::Table(table)], ..Default::default() });
+    a.end_of(0);
+    assert!(a.run("edit.paste", json!({})));
+    assert!(a.le.take_notices().iter().any(|n| n.contains("Pasted as text")));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "the table's text");
+    assert!(texts(&b.s.doc).concat().contains("t1"));
+}
+
+#[test]
+fn a_pasted_table_holding_a_bookmark_goes_in_as_text() {
+    let mut s = Session::new(plain(&["x"]));
+    s.run("edit.paste", &json!({"html": "<table><tr><td>site</td></tr></table>"})).unwrap();
+    let mut table = s.doc.body.iter().find_map(|b| b.as_table()).cloned().unwrap();
+    let cell = std::sync::Arc::make_mut(&mut table.rows[0].cells[0].blocks[0]);
+    let Block::Para(p) = cell else { panic!("a paragraph") };
+    p.insert_object(0, wordcraft_doc::InlineObject::BookmarkStart { name: "here".into() }, &Default::default()).unwrap();
+    let (relay, mut a, mut b) = two(&file(&["Start"]));
+    a.s.clipboard = Some(wordcraft_doc::edit::Fragment { blocks: vec![Block::Table(table)], ..Default::default() });
+    a.end_of(0);
+    assert!(a.run("edit.paste", json!({})));
+    assert!(a.le.take_notices().iter().any(|n| n.contains("Pasted as text")), "objects inside a table are not shared");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "the table's text");
+    assert_eq!(objects(&b.s.doc), 0);
+}
+
+#[test]
+fn edits_made_before_a_paste_are_kept_when_it_goes_in_as_text() {
+    let (relay, mut a, mut b) = two(&file(&["Start"]));
+    a.end_of(0);
+    // Typing that reached the session without a flush yet.
+    a.s.run("text.insert", &json!({"text": " typed"})).unwrap();
+    let html = format!("<p>p<img src=\"data:image/png;base64,{PNG}\" width=\"10\" height=\"10\">q</p>");
+    assert!(a.run("edit.paste", json!({"html": html, "text": " pq"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Start typedpq"], "the typing, then the HTML's text");
+    assert_same(&a, &b, "both edits");
+}
+
+#[test]
+fn a_paste_over_a_picture_says_it_would_replace_it() {
+    let (_relay, mut a, _b) = two(&picture_file());
+    let before = a.s.doc.clone();
+    let len = para(&a, 0).text.len();
+    select(&mut a, 0, 0, len);
+    assert!(!a.run("edit.paste", json!({"text": "z"})));
+    assert!(before.same_content(&a.s.doc));
+    let said = a.le.take_notices();
+    assert!(said.iter().any(|n| n.contains("replace")), "{said:?}");
+    assert!(!said.iter().any(|n| n.contains("Pasted as text") || n.contains("holds")), "{said:?}");
 }

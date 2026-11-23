@@ -379,3 +379,30 @@ fn assigning_pids_is_not_an_edit() {
     assert!(s.assign_pids(|d| d.body.truncate(1)).is_err());
     assert_eq!(s.doc.plain_text(StoryRef::Body), text);
 }
+
+#[test]
+fn merging_equal_runs_is_not_an_edit() {
+    let mut s = Session::new(Document::from_text("Alpha\nBravo\n"));
+    s.run("text.insert", &json!({"text": "Typed "})).unwrap();
+    let depth = s.undo_depth();
+    let sel = s.sel.clone();
+    s.dirty = false;
+    let log = observed(&mut s);
+    let path = s.doc.para_paths(StoryRef::Body)[1].clone();
+    // Two equal runs side by side, as an engine command may leave them.
+    if let Ok(body) = s.doc.story_mut(StoryRef::Body)
+        && let Some(b) = body.get_mut(1)
+        && let Block::Para(p) = Arc::make_mut(b)
+    {
+        let props = p.runs[0].props.clone();
+        p.runs = vec![wordcraft_doc::Run { len: 2, props: props.clone() }, wordcraft_doc::Run { len: 3, props }];
+    }
+    let rev = s.doc.para(StoryRef::Body, &path).unwrap().rev;
+    s.merge_equal_runs();
+    let p = s.doc.para(StoryRef::Body, &path).unwrap();
+    assert_eq!(p.runs.len(), 1, "merged");
+    assert_ne!(p.rev, rev, "and laid out again");
+    assert_eq!(s.undo_depth(), depth, "the undo history stays");
+    assert_eq!(s.sel, sel, "so does the selection");
+    assert!(!s.dirty && calls(&log).is_empty(), "not an edit");
+}
