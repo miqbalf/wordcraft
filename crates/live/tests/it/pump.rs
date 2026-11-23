@@ -1282,4 +1282,27 @@ fn a_drifted_window_is_rebuilt_from_the_shared_copy() {
     assert_eq!(a.le.repairs(), 1, "and counted it");
     assert_same(&a, &b, "the window shows the shared document again");
     assert_eq!(texts(&a.s.doc), ["One!", "Two"]);
+
+    // A due check waits while the window is being typed in, and runs at the first pause.
+    a.le.set_verify_every(1);
+    a.s.apply_remote(|d| {
+        if let Some(wordcraft_doc::Block::Para(p)) = d.body.get_mut(1).map(std::sync::Arc::make_mut) {
+            p.text = "Behind".into();
+            p.runs.clear();
+        }
+    })
+    .unwrap();
+    for _ in 0..2 * wordcraft_live::session::VERIFY_QUIET {
+        a.end_of(0);
+        assert!(a.run("text.insert", json!({"text": "x"})));
+        a.pump();
+    }
+    assert_eq!(a.le.repairs(), 1, "not while typing");
+    for _ in 0..=wordcraft_live::session::VERIFY_QUIET {
+        a.pump();
+    }
+    assert_eq!(a.le.repairs(), 2, "at the pause");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "rebuilt again");
+    assert_eq!(texts(&a.s.doc)[1], "Two");
 }

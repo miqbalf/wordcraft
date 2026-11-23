@@ -196,6 +196,12 @@ impl LiveApp<Word> for App<'_> {
 /// and then costs nothing.
 pub const VERIFY_EVERY: u32 = 300;
 
+/// How many pumps in a row the session and the shared copy must stay unchanged before a due
+/// check runs. A full check costs about 10 ms for 2,000 paragraphs and 30 ms for 10,000
+/// (native, `examples/verify_bench`), so it waits for a pause in the typing instead of taking a
+/// frame in the middle of it.
+pub const VERIFY_QUIET: u32 = 30;
+
 /// One document edited live: the session's side of a [`Live`] link.
 pub struct LiveEditing<H: Hub> {
     core: craft_live::LiveEditing<H, Word>,
@@ -213,6 +219,10 @@ pub struct LiveEditing<H: Hub> {
     clean_at: Option<(u64, u64)>,
     /// How many times the check found a drift and rebuilt the body.
     repairs: u64,
+    /// The session revision and the replica's newest sequence at the last pump, and for how
+    /// many pumps since they have not moved.
+    seen: (u64, u64),
+    quiet: u32,
 }
 
 impl<H: Hub> LiveEditing<H> {
@@ -244,6 +254,8 @@ impl<H: Hub> LiveEditing<H> {
             verify_every: VERIFY_EVERY,
             clean_at: None,
             repairs: 0,
+            seen: (0, 0),
+            quiet: 0,
         })
     }
 
@@ -252,7 +264,13 @@ impl<H: Hub> LiveEditing<H> {
     pub fn pump(&mut self, session: &mut Session) -> Vec<Peer> {
         let peers = self.core.pump(&mut App { session, map: &mut self.map, pending: &mut self.pending });
         self.since_verify = self.since_verify.saturating_add(1);
-        if self.verify_every > 0 && self.since_verify >= self.verify_every {
+        let now = (session.rev(), self.core.newest_seq());
+        if now == self.seen {
+            self.quiet = self.quiet.saturating_add(1);
+        } else {
+            (self.seen, self.quiet) = (now, 0);
+        }
+        if self.verify_every > 0 && self.since_verify >= self.verify_every && self.quiet >= VERIFY_QUIET {
             self.verify(session);
         }
         peers
@@ -267,7 +285,8 @@ impl<H: Hub> LiveEditing<H> {
         self.map.drift(&session.doc, self.core.live().doc()?)
     }
 
-    /// The safety net under the mapping, run every [`VERIFY_EVERY`] pumps (see
+    /// The safety net under the mapping, run every [`VERIFY_EVERY`] pumps, at a pause of
+    /// [`VERIFY_QUIET`] pumps (see
     /// [`LiveEditing::set_verify_every`]): share what is queued, then compare the window's body
     /// with the shared copy's (the document models, not the replica's bytes). When they differ,
     /// what the window shows is not what the room saves, so the body is rebuilt from the shared
