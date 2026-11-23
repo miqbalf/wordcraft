@@ -92,7 +92,7 @@ pub enum LiveMode {
     Linked(Box<LiveLink>),
     /// The room speaks a newer protocol: nothing is shared and nothing may be edited.
     Newer,
-    /// The link stopped because another document was shown ([`LEFT_LIVE`]). `document` (the
+    /// Hosted only: the link stopped because another document was shown ([`LEFT_LIVE`]). `document` (the
     /// room's file) still belongs to the room, whose page saves it: Save stays refused for it,
     /// and copies stay allowed.
     Left { document: u64 },
@@ -389,9 +389,13 @@ impl WordApp {
             if let Some(LiveMode::Linked(old)) = self.live.take() {
                 let document = old.document;
                 old.editing.stop(&mut self.session);
-                self.live = Some(LiveMode::Left { document });
+                // Only a page keeps the room's file, so only then does it stay the room's. On the
+                // desktop nothing else saves it: the link is simply over and Save works as usual.
+                if self.services.hosted {
+                    self.live = Some(LiveMode::Left { document });
+                    self.status_long(tl!(LEFT_LIVE));
+                }
             }
-            self.status_long(tl!(LEFT_LIVE));
             return;
         }
         let document = self.session.document_id();

@@ -13,7 +13,7 @@ use wordcraft_doc::Document;
 use wordcraft_engine::Session;
 use wordcraft_live::LiveEditing;
 use wordcraft_live::testing::{MemHub, MemRelay, ROOM};
-use wordcraft_ui_egui::live::{Access, COPY_DOWNLOADED, ENDED, ENDED_UNSAVED, LiveReport, LiveStatus, NEWER, NOT_SAVING, SAVED_FOR_YOU};
+use wordcraft_ui_egui::live::{Access, COPY_DOWNLOADED, ENDED, ENDED_UNSAVED, LEFT_LIVE, LiveReport, LiveStatus, NEWER, NOT_SAVING, SAVED_FOR_YOU};
 use wordcraft_ui_egui::{Services, WordApp};
 
 fn file() -> Vec<u8> {
@@ -686,4 +686,25 @@ fn hosted_live_file_shown_again_after_another_document_still_refuses_save() {
     assert_eq!(other.get(), 0, "nothing went to the page");
     h.state_mut().run("file.saveAs", json!({"path": "plan.odt"})).unwrap();
     assert_eq!(copies.borrow().last().map(String::as_str), Some("plan.odt"), "a copy still downloads");
+}
+
+/// Not hosted (the desktop), another document shown in the window just ends the link: nothing else
+/// saves the room's file, so Save is not refused when it is shown again, and autosave is not held.
+#[test]
+fn desktop_live_file_shown_again_after_another_document_saves_as_usual() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, true, Services::default());
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    let live = h.state().session.document_id();
+    h.state_mut().session.add_document(Document::from_text("Letters"));
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert!(h.state().live_link().is_none(), "the link stopped");
+    assert!(!has_label(&h, LEFT_LIVE), "no hosted notice on the desktop");
+    h.state_mut().session.switch_document(live).unwrap();
+    h.step();
+    assert!(!has_label(&h, LEFT_LIVE), "no hosted status line on the desktop");
+    let saved = h.state_mut().run("file.save", json!({}));
+    assert!(!matches!(&saved, Err(e) if e == LEFT_LIVE), "Save is not refused as a live room's file: {saved:?}");
 }
