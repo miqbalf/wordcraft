@@ -295,15 +295,18 @@ struct Nc {
     /// The next this many writes that go through are answered only after [`LATE_BY`]: the file
     /// is written at once, the answer comes after the worker gave up waiting for it.
     late_puts: u32,
+    /// The next this many `412`s are answered only after [`LATE_BY`] (the worker gave up first).
+    late_refusals: u32,
     /// Answer the room's close only after [`LATE_BY`] (it is never carried out).
     close_late: bool,
     /// A close notifies the worker again for this room first (a ticket handed out meanwhile).
     notify_on_close: Option<Arc<watch::Sender<String>>>,
 }
 
-/// How late a late answer comes, and how long the impatient worker waits for one.
-const LATE_BY: std::time::Duration = std::time::Duration::from_millis(1_500);
-const IMPATIENT: std::time::Duration = std::time::Duration::from_millis(300);
+/// How late a late answer comes, and how long the impatient worker waits for one. Far apart, so
+/// an ordinary answer on a loaded host is never taken for a late one, nor the other way round.
+const LATE_BY: std::time::Duration = std::time::Duration::from_millis(3_000);
+const IMPATIENT: std::time::Duration = std::time::Duration::from_millis(1_000);
 
 type NcState = Arc<Mutex<Nc>>;
 
@@ -350,27 +353,30 @@ async fn nc_put(State(nc): State<NcState>, Path(room): Path<String>, h: HeaderMa
     if let Some(d) = slow {
         tokio::time::sleep(d).await;
     }
-    let late = {
+    // What to answer, and whether late; decided under the lock, answered after it.
+    let (answer, late) = {
         let mut n = nc.lock().unwrap();
         let if_match = h.get(header::IF_MATCH).and_then(|v| v.to_str().ok()).unwrap_or("").trim_matches('"').to_owned();
         if if_match != etag_of(&n.files[FILE]) {
             n.calls.push("put412");
-            return (StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response();
-        }
-        if let Some(status) = n.put_status.or(n.put_status_after_copy.filter(|_| n.calls.contains(&"copy"))) {
+            let late = n.late_refusals > 0;
+            n.late_refusals = n.late_refusals.saturating_sub(1);
+            ((StatusCode::PRECONDITION_FAILED, "etag mismatch").into_response(), late)
+        } else if let Some(status) = n.put_status.or(n.put_status_after_copy.filter(|_| n.calls.contains(&"copy"))) {
             n.calls.push("putfail");
-            return (status, "no").into_response();
+            ((status, "no").into_response(), false)
+        } else {
+            n.calls.push("put");
+            n.files.insert(FILE.into(), body.to_vec());
+            let late = n.late_puts > 0;
+            n.late_puts = n.late_puts.saturating_sub(1);
+            (json_response(json!({"etag": etag_of(&body)})), late)
         }
-        n.calls.push("put");
-        n.files.insert(FILE.into(), body.to_vec());
-        let late = n.late_puts > 0;
-        n.late_puts = n.late_puts.saturating_sub(1);
-        late
     };
     if late {
         tokio::time::sleep(LATE_BY).await;
     }
-    json_response(json!({"etag": etag_of(&body)}))
+    answer
 }
 
 async fn nc_copy(State(nc): State<NcState>, Path(room): Path<String>, h: HeaderMap, body: Bytes) -> Response {
@@ -1686,5 +1692,77 @@ async fn a_notify_during_a_close_that_timed_out_is_served() {
         n.close_late = false;
         n.notify_on_close = None;
     }
+    reopened_window_is_saved(&mut w).await;
+}
+
+// ---- L2 fix round 1 ------------------------------------------------------------------------------
+
+/// L2 review I1: the server stays slow. W1 lands but its answer is lost; the retry W2 (with the
+/// edits typed meanwhile) is refused with a `412` that also comes too late; W3 then gets a prompt
+/// `412` and finds W1 in the file. W1 is still the worker's own write: no copy, no notice.
+#[tokio::test]
+async fn two_late_answers_in_a_row_make_no_conflict_copy() {
+    let mut w = impatient_world(file(&["One", "Two"]), 1).await;
+    {
+        let mut n = w.nc.lock().unwrap();
+        n.late_puts = 1;
+        n.late_refusals = 1;
+    }
+    w.eds[0].type_at_end(0, " fish");
+    w.run_for(8_000, 1_000).await;
+    assert_eq!(w.count("put"), 1, "W1 landed, its answer came too late");
+    w.eds[0].type_at_end(1, " more");
+    w.run_for(8_000, 1_000).await;
+    assert_eq!(w.count("put412"), 1, "W2 was refused, its answer came too late");
+    w.eds[0].type_at_end(1, "!");
+    w.run_for(20_000, 1_000).await;
+    assert!(w.count("put412") >= 2, "W3 found the file changed");
+    assert_eq!(conflict_copies(&w), Vec::<String>::new(), "no conflict copy of the worker's own save");
+    assert_eq!(w.relay.borrow().notices(), Vec::<String>::new());
+    assert_eq!(w.file_texts(), ["One fish", "Two more!"]);
+    assert_eq!(w.eds[0].saved_at().as_deref(), Some(etag_of(&w.file(FILE)).as_str()));
+}
+
+/// L2 review M2: the file held the worker's own late save, and the write over it then keeps
+/// failing (a server error). That is a plain failed write, retried as one (given up only after
+/// SAVE_GIVE_UP_MS), not a failed conflict (which stops after about two minutes).
+#[tokio::test]
+async fn a_failing_write_over_the_own_version_is_a_plain_failure() {
+    let mut w = impatient_world(file(&["One", "Two"]), 1).await;
+    w.nc.lock().unwrap().late_puts = 1;
+    w.eds[0].type_at_end(0, " fish");
+    w.run_for(8_000, 1_000).await;
+    assert_eq!(w.count("put"), 1, "the first save landed late");
+    w.eds[0].type_at_end(1, " more");
+    w.nc.lock().unwrap().put_status = Some(StatusCode::SERVICE_UNAVAILABLE);
+    w.run_for(180_000, 5_000).await;
+    assert!(w.count("putfail") >= 3, "the write over the own version kept failing");
+    assert!(w.worker.saving_stopped().is_none(), "not given up as a failed conflict: {:?}", w.worker.saving_stopped());
+    w.nc.lock().unwrap().put_status = None;
+    w.run_for(20_000, 1_000).await;
+    assert_eq!(conflict_copies(&w), Vec::<String>::new());
+    assert_eq!(w.file_texts(), ["One fish", "Two more"]);
+}
+
+/// L2 review M4: the app refuses the close (409) because of a ticket, and that ticket's notify
+/// comes too. It is one window: once it has joined and left, the room closes after the usual
+/// grace, not after ALONE_MS.
+#[tokio::test]
+async fn a_refused_close_and_its_notify_are_one_window() {
+    let (mut w, notify) = served_world(file(&["One", "Two"])).await;
+    {
+        let mut n = w.nc.lock().unwrap();
+        n.close_status = Some(StatusCode::CONFLICT);
+        n.notify_on_close = Some(Arc::new(notify));
+    }
+    emptied(&mut w).await;
+    assert_eq!(w.run_for(15_000, 1_000).await, Flow::Continue);
+    assert_eq!(w.count("closefail"), 1, "the close was refused");
+    {
+        let mut n = w.nc.lock().unwrap();
+        n.close_status = None;
+        n.notify_on_close = None;
+    }
+    // The window joins, edits, leaves; reopened_window_is_saved expects the close within 60 s.
     reopened_window_is_saved(&mut w).await;
 }
