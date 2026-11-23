@@ -6468,17 +6468,52 @@ fn standalone_browser_and_desktop_autosave_states_are_unchanged() {
 }
 
 /// The community (Discord) button is dropped when hosted, and kept on the desktop app and the
-/// plain web app.
+/// plain web app. The hide is runtime-only: the stored preference is untouched.
 #[test]
 fn the_discord_button_is_hidden_only_when_hosted() {
     let new = |hosted: bool| WordApp::new(Session::new(wordcraft_doc::Document::new()), Services { hosted, ..Default::default() });
-    let mut hosted = new(true);
-    assert!(hosted.ui.show_discord, "shown until the host is known");
-    hosted.apply_hosted_chrome();
-    assert!(!hosted.ui.show_discord);
-    let mut standalone = new(false);
-    standalone.apply_hosted_chrome();
-    assert!(standalone.ui.show_discord, "standalone and desktop keep it");
+    let hosted = new(true);
+    let standalone = new(false);
+    assert!(!hosted.community_button());
+    assert!(standalone.community_button(), "standalone and desktop keep it");
+    let mut off = new(false);
+    off.ui.show_discord = false;
+    assert!(!off.community_button(), "the user's own choice still hides it");
+    // Nothing is written for the hide: the hosted app's preferences equal the standalone's.
+    assert!(hosted.ui.show_discord);
+    assert_eq!(serde_json::to_string(&hosted.prefs()).unwrap(), serde_json::to_string(&standalone.prefs()).unwrap());
+    assert_eq!(serde_json::to_value(hosted.prefs()).unwrap()["showDiscord"], json!(true));
+}
+
+/// The File-menu community link follows the same rule.
+#[test]
+fn the_backstage_community_link_follows_community_button() {
+    let links = |hosted: bool| {
+        let a = WordApp::new(Session::new(wordcraft_doc::Document::new()), Services { hosted, ..Default::default() });
+        crate::backstage::bottom_links(&a).iter().any(|(_, id)| *id == "discord")
+    };
+    assert!(links(false));
+    assert!(!links(true));
+}
+
+/// The AutoSave tooltip in each mode: hosted not live, standalone browser, desktop saved,
+/// desktop unsaved. (The live tooltips are in `tests/it/live.rs`.)
+#[test]
+fn the_autosave_tooltip_says_the_right_thing_in_each_mode() {
+    let hook = || -> Option<Box<dyn Fn(&str, &[u8]) -> Result<(), String>>> { Some(Box::new(|_: &str, _: &[u8]| Ok(()))) };
+    let mut hosted = WordApp::new(Session::new(wordcraft_doc::Document::new()), Services { hosted: true, download: hook(), ..Default::default() });
+    hosted.session.path = Some("a.odt".into());
+    assert_eq!(hosted.autosave_tip(), "Save (Ctrl+S) stores this file in Nextcloud");
+    let web = WordApp::new(Session::new(wordcraft_doc::Document::new()), Services { download: hook(), ..Default::default() });
+    assert_eq!(web.autosave_tip(), AutoSaveBlock::Browser.reason());
+    assert!(web.autosave_tip().contains("Save downloads a copy"));
+    let desktop = typed();
+    assert_eq!(desktop.autosave_tip(), AutoSaveBlock::Unsaved.reason());
+    let dir = scratch("autosave-tip");
+    let mut saved = typed();
+    saved.run("file.save", json!({"path": dir.join("n.docx").to_string_lossy()})).unwrap();
+    assert_eq!(saved.autosave_tip(), "AutoSave saves every change to the file (needs a saved document)");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Cancelling the Open picker (Mod+O) left the document as it was but turned AutoSave off.

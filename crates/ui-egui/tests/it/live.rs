@@ -747,20 +747,111 @@ fn hosted_live_file_shown_again_after_another_document_still_refuses_save() {
     assert_eq!(copies.borrow().last().map(String::as_str), Some("plan.odt"), "a copy still downloads");
 }
 
-/// Hosted and live (a .docx in Nextcloud): the AutoSave switch shows on and locked, with the
-/// service's tooltip, and clicking it adds no save path and changes nothing.
+/// A hosted frame whose saves to the page are counted.
+fn counting_host() -> (Services, Rc<Cell<usize>>) {
+    let posted = Rc::new(Cell::new(0));
+    let p = Rc::clone(&posted);
+    let services = Services {
+        hosted: true,
+        host_save: Some(Box::new(move |_: &str, _: &[u8], _: bool| {
+            p.set(p.get() + 1);
+            Ok(())
+        })),
+        ..Default::default()
+    };
+    (services, posted)
+}
+
+const LOCKED_TIP: &str = "Saved to Nextcloud automatically";
+const HOSTED_TIP: &str = "Save (Ctrl+S) stores this file in Nextcloud";
+
+/// Hosted and live (a .docx in Nextcloud, a saver in the room): the AutoSave switch shows on and
+/// locked with the service's tooltip, and clicking it adds no save path: nothing is posted to
+/// the page, and nothing changes.
 #[test]
 fn hosted_live_autosave_shows_on_and_locked() {
     let relay = MemRelay::new();
-    let services = Services { hosted: true, ..Default::default() };
+    let mut bob = Bob::join(&relay);
+    let (services, posted) = counting_host();
     let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
-    h.run_steps(3);
+    settle(&relay, &mut h, &mut bob);
     let app = h.state();
     assert!(app.saved_by_service(), "the live worker saves the file");
+    assert_eq!(app.autosave_tip(), LOCKED_TIP);
     assert_eq!(app.autosave_block(), Some(wordcraft_ui_egui::AutoSaveBlock::Hosted));
     assert!(!app.autosaves(), "this window writes no copy of its own");
     h.get_by_label("AutoSave").click();
-    h.run_steps(2);
+    h.run_steps(3);
     assert!(h.state().saved_by_service(), "locked: a click changes nothing");
     assert!(!h.state().autosaves());
+    assert_eq!(posted.get(), 0, "no save message reached the page");
+    assert_eq!(h.state().autosave_tip(), LOCKED_TIP);
+}
+
+/// The lock is the service saving, not just a link: read-only, broken and saver-less live
+/// sessions fall back to the Hosted reason, and a live room in a window that is not hosted never
+/// says "Nextcloud".
+#[test]
+fn live_but_not_saved_by_the_service_is_not_locked_on() {
+    // Read-only ticket.
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (services, posted) = counting_host();
+    let (mut h, _hub) = alice_with(&relay, Access::Read, false, services);
+    settle(&relay, &mut h, &mut bob);
+    assert_eq!(status(&h), LiveStatus::ReadOnly);
+    assert!(!h.state().saved_by_service(), "read-only");
+    assert_eq!(h.state().autosave_tip(), HOSTED_TIP);
+    h.get_by_label("AutoSave").click();
+    h.run_steps(3);
+    assert_eq!(posted.get(), 0);
+    assert_eq!(h.state().autosave_tip(), HOSTED_TIP);
+
+    // A broken link (an edit ticket the relay treats as read-only).
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (services, _) = counting_host();
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, false, services);
+    settle(&relay, &mut h, &mut bob);
+    type_text(&mut h, "X");
+    settle(&relay, &mut h, &mut bob);
+    assert!(matches!(status(&h), LiveStatus::Broken(_)));
+    assert!(!h.state().saved_by_service(), "broken");
+    assert_eq!(h.state().autosave_tip(), HOSTED_TIP);
+
+    // No document service in the room for 15 s.
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (services, _) = counting_host();
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
+    let now = std::sync::Arc::new(std::sync::Mutex::new(0.0_f64));
+    let clock = std::sync::Arc::clone(&now);
+    h.state_mut().live_set_session_clock(Box::new(move || *clock.lock().unwrap()));
+    settle(&relay, &mut h, &mut bob);
+    assert!(h.state().saved_by_service(), "the service may still be on its way");
+    *now.lock().unwrap() = 16_000.0;
+    settle(&relay, &mut h, &mut bob);
+    assert!(!h.state().saved_by_service(), "no saver");
+    assert_eq!(h.state().autosave_tip(), HOSTED_TIP);
+
+    // Live but not hosted: never the Nextcloud text.
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (mut h, _hub) = alice(&relay, Access::Edit, true);
+    settle(&relay, &mut h, &mut bob);
+    assert!(!h.state().saved_by_service(), "not hosted");
+    assert!(!h.state().autosave_tip().contains("Nextcloud"), "{}", h.state().autosave_tip());
+}
+
+/// A live file that is not a .docx is not locked on either.
+#[test]
+fn hosted_live_non_docx_is_not_locked_on() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (services, _) = counting_host();
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
+    settle(&relay, &mut h, &mut bob);
+    h.state_mut().session.path = Some("plan.odt".into());
+    assert!(!h.state().saved_by_service());
+    assert_eq!(h.state().autosave_tip(), HOSTED_TIP);
 }

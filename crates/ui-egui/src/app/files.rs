@@ -454,18 +454,28 @@ impl WordApp {
         None
     }
 
-    /// Whether the host's document service saves this window's document on its own (a live
-    /// session that is linked): the AutoSave switch shows on and locked, and no save path is added.
+    /// Whether the host's document service is saving this window's .docx right now: hosted, and a
+    /// live link that is connecting, live or reconnecting with a saver in the room
+    /// ([`Self::live_saves`]). Read-only, broken, refused, saver-less and non-.docx sessions are
+    /// not: the AutoSave switch shows on and locked only for this, and no save path is added.
     pub fn saved_by_service(&self) -> bool {
-        matches!(self.live, Some(crate::live::LiveMode::Linked(_)))
+        let docx = self.session.path.as_ref().and_then(|p| p.extension()).is_some_and(|e| e.eq_ignore_ascii_case("docx"));
+        self.services.hosted && docx && self.live_saves()
     }
 
-    /// The chrome a hosted page (`?host=parent`) drops: the community (Discord) button, which
-    /// has no place inside another product. Desktop and the plain web app are unchanged.
-    pub fn apply_hosted_chrome(&mut self) {
-        if self.services.hosted {
-            self.ui.show_discord = false;
+    /// What the AutoSave switch's tooltip says.
+    pub fn autosave_tip(&self) -> String {
+        if self.saved_by_service() {
+            tl!("Saved to Nextcloud automatically").to_string()
+        } else {
+            self.autosave_block().map_or_else(|| tl!("AutoSave saves every change to the file (needs a saved document)").to_string(), |b| b.reason())
         }
+    }
+
+    /// Whether the community (Discord) button and link show: the user's choice, and never inside
+    /// a hosting page. The hide is not a preference, so it is never stored.
+    pub fn community_button(&self) -> bool {
+        self.ui.show_discord && !self.services.hosted
     }
 
     /// Whether AutoSave covers the document: it is on and nothing blocks it ([`Self::autosave_block`]).

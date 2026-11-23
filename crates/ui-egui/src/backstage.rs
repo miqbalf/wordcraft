@@ -58,9 +58,9 @@ fn back_chevron_c(band_min_x: f32, center_y: f32, fullscreen: bool, content_left
 /// The bottom of the backstage menu: About, and the community link unless the user turned the
 /// community button off — the title bar pill honors the same setting, so the menu hides the
 /// link with it.
-fn bottom_links(app: &WordApp) -> Vec<(&'static str, &'static str)> {
+pub(crate) fn bottom_links(app: &WordApp) -> Vec<(&'static str, &'static str)> {
     let mut links = vec![("About", "about")];
-    if app.ui.show_discord {
+    if app.community_button() {
         links.push(("Discord community", "discord"));
     }
     links

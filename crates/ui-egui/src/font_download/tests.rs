@@ -128,6 +128,21 @@ fn a_hosted_editor_never_opens_the_box_by_itself() {
     assert_eq!(shown(&h), Some("fontDownload"));
 }
 
+/// Font-independent: `tick` itself. Hosted, it does nothing at all (no box, and the document is
+/// not even marked as told about); not hosted, it runs and marks the document, whichever fonts
+/// this machine has.
+#[test]
+fn tick_never_opens_the_box_when_hosted_whatever_the_fonts() {
+    let mut hosted = app(true);
+    hosted.services.hosted = true;
+    tick(&mut hosted);
+    assert!(hosted.dialog.is_none());
+    assert!(hosted.font_notice_seen.is_empty(), "returned before doing anything");
+    let mut plain = app(true);
+    tick(&mut plain);
+    assert_eq!(plain.font_notice_seen.len(), 1, "not hosted: tick ran");
+}
+
 #[test]
 fn dont_show_this_again_turns_the_box_off() {
     if aptos_installed() {

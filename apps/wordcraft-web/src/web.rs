@@ -97,8 +97,6 @@ pub fn start() {
                         let doc = app.session.blank_document();
                         app.session.set_document(doc);
                     }
-                    // A framing page (Nextcloud) has no place for WordCraft's community button.
-                    app.apply_hosted_chrome();
                     let mut prefs = crate::prefs::PrefsSync::new(stored);
                     // No document to show: start on File › Home, as the desktop app does (#766).
                     if !sample {

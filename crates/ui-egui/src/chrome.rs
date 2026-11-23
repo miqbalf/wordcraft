@@ -371,26 +371,23 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                     ui.painter().rect(r, 8.0, fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
                     let knob = autosave_knob_x(rtl, on, r);
                     ui.painter().circle_filled(pos2(knob, r.center().y), 5.0, knob_fill);
-                    let tip = if by_service {
-                        tl!("Saved to Nextcloud automatically").to_string()
-                    } else {
-                        block
-                            .as_ref()
-                            .map_or_else(|| tl!("AutoSave saves every change to the file (needs a saved document)").to_string(), |b| b.reason())
-                    };
+                    let tip = app.autosave_tip();
                     let text = text.on_hover_text(tip.as_str()).on_hover_cursor(egui::CursorIcon::PointingHand);
                     let resp = resp.on_hover_text(tip.as_str()).on_hover_cursor(egui::CursorIcon::PointingHand);
                     if text.clicked() || resp.clicked() {
-                        match block {
-                            _ if by_service => app.status(tip.clone()),
-                            None => {
-                                let _ = app.run("file.autosave", json!({}));
+                        if by_service {
+                            app.status(tip.clone());
+                        } else {
+                            match block {
+                                None => {
+                                    let _ = app.run("file.autosave", json!({}));
+                                }
+                                // AutoSave comes on once Save As has saved (maybe on a later frame, #94).
+                                Some(b) if b.save_as_helps() => {
+                                    let _ = app.save_as(crate::file_dialogs::AfterSave::AutoSave);
+                                }
+                                Some(b) => app.status(b.reason()),
                             }
-                            // AutoSave comes on once Save As has saved (maybe on a later frame, #94).
-                            Some(b) if b.save_as_helps() => {
-                                let _ = app.save_as(crate::file_dialogs::AfterSave::AutoSave);
-                            }
-                            Some(b) => app.status(b.reason()),
                         }
                     }
                     ui.add_space(8.0);
@@ -403,7 +400,7 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                         // The room left of the account button and its space, less the spaces between the
                         // three controls and a gap from the Quick Access Toolbar.
                         let room = ui.available_width() - control_h - 8.0 - 3.0 * ui.spacing().item_spacing.x - 8.0;
-                        let fit = TitleBarFit::new(room, app.ui.show_discord, control_h);
+                        let fit = TitleBarFit::new(room, app.community_button(), control_h);
                         // Account / community.
                         let (r, resp) = ui.allocate_exact_size(vec2(control_h, control_h), Sense::click());
                         ui.painter().circle_filled(r.center(), control_h / 2.0 - 1.0, t.accent);
@@ -414,7 +411,7 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                             let _ = app.run("ui.backstage", json!({"value": true, "page": "options", "pane": "general"}));
                         }
                         ui.add_space(8.0);
-                        if app.ui.show_discord {
+                        if app.community_button() {
                             let (r, resp) = ui.allocate_exact_size(vec2(if fit.discord_label { 84.0 } else { 22.0 }, 22.0), Sense::click());
                             ui.painter().rect_filled(r, 11.0, if resp.hovered() { t.accent_text } else { t.accent });
                             let icon_x = if fit.discord_label { 13.0 } else { 11.0 };

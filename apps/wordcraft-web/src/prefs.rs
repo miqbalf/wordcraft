@@ -101,6 +101,24 @@ mod tests {
         assert_eq!(next.session.author, "Rob Hones");
     }
 
+    /// A hosted visit hides the community button at run time only: what it stores is what a
+    /// standalone visit would, so it never turns the button off for later visits.
+    #[test]
+    fn hosted_discord_hide_is_not_stored() {
+        let mut hosted = WordApp::new(
+            wordcraft_engine::Session::new(wordcraft_engine::sample::sample_document()),
+            Services { hosted: true, ..Services::default() },
+        );
+        assert!(!hosted.community_button());
+        hosted.run("ui.theme", json!({"value": "dark"})).unwrap();
+        let mut sync = PrefsSync::new(None);
+        let stored = sync.changed(&hosted).unwrap();
+        let mut next = app();
+        restore(&mut next, Some(&stored));
+        assert!(next.ui.show_discord, "stored preferences keep the button on");
+        assert!(next.community_button(), "a standalone visit still shows it");
+    }
+
     /// #2132: dark mode chosen on one visit is there after a reload.
     #[test]
     fn dark_mode_survives_reload() {
