@@ -265,7 +265,7 @@ fn giving_up_a_file_dialog_cancels_the_host_request() {
     a.file_dialog = Some(PendingDialog {
         rx,
         req: FileDialogRequest::Save { name: "Document1.docx".into(), dir: None },
-        after: AfterPick::Export { ext: "pdf".into() },
+        after: AfterPick::Export { ext: "pdf".into(), document: None },
     });
     a.give_up_file_dialog();
     assert!(cancelled.get(), "the host is told to stop waiting");

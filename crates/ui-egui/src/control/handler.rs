@@ -228,6 +228,11 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
                     return err(e);
                 }
             }
+            // Save As = Export without a path: this document's copy, through the one Save As
+            // function (never Save's dialog, never the active document).
+            if let Some(format) = crate::save_as::pathless_copy(id, &params) {
+                return reply(Ok::<_, String>(app.save_as_copy_of(doc, format)));
+            }
             // Save As = Export: a Save As or export to a path writes a copy; the document keeps its file.
             let params = crate::save_as::as_copy(id, params);
             let r = app.session.with_document(doc, |s| s.run(id, &params));

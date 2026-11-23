@@ -390,6 +390,9 @@ fn encrypt(s: &mut Session, v: &Value) -> CmdResult {
     Ok(json!({"encrypted": s.password.is_some()}))
 }
 
+/// The refusal of a `copy` without a path or onto the document's own file.
+pub const SAVE_AS_OWN_FILE: &str = "Save As makes copies; use Save";
+
 /// Executes `file.save`: writes the document or text to disk, preserving exact file text for
 /// unedited Markdown files, and updating session path and dirty state.
 fn save(s: &mut Session, v: &Value) -> CmdResult {
@@ -404,6 +407,11 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
     // Save As = Export (`copy`): the file is a copy and the document stays as it was: its file,
     // unsaved changes, password and save stamps. A `password` encrypts this copy only.
     let as_copy = p::bool(v, "copy").unwrap_or(false);
+    // A copy goes to another file: onto the document's own file it would be a save that leaves
+    // the document unsaved.
+    if as_copy && (p::str(v, "path").is_none() || s.find_open(&path) == Some(s.document_id())) {
+        return Err(CmdError::Params(SAVE_AS_OWN_FILE.into()));
+    }
     let mut copy_password = None;
     if let Some(pw) = v.get("password").filter(|pw| !pw.is_null()) {
         let Some(pw) = pw.as_str().filter(|pw| !pw.is_empty()) else {
@@ -491,7 +499,8 @@ fn is_word_2003_file(_path: &std::path::Path) -> bool {
 
 fn save_as(s: &mut Session, v: &Value) -> CmdResult {
     if p::str(v, "path").is_none() {
-        s.push_ui_request(json!({"open": "saveAs"}));
+        // Save As is a copy (`copy`): the front end offers its formats, never Save's dialog.
+        s.push_ui_request(json!({"open": "saveAs", "copy": true}));
         return Ok(json!({"saved": false}));
     }
     save(s, v)

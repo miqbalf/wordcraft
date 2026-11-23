@@ -385,6 +385,40 @@ mod tests {
         assert_eq!(first_para(&a), "from the browser typed");
     }
 
+    /// Only the user's Paste (ribbon, context menu, shortcut: [`WordApp::run`]) waits for the
+    /// browser's clipboard. A script, an agent or the control channel ([`WordApp::execute`],
+    /// `engine.execute`) pastes at once, as before, and its result is the paste's own.
+    #[test]
+    fn a_scripted_paste_in_a_browser_does_not_wait_for_the_clipboard() {
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let asked = reads.clone();
+        let services = Services {
+            browser_clipboard: Some(BrowserClipboard::new(Box::new(move |answer: ClipboardAnswer| {
+                asked.set(asked.get() + 1);
+                *answer.lock().unwrap() = Some("from the browser".into());
+            }))),
+            ..Default::default()
+        };
+        let mut a = app(services);
+        a.session.run("text.insert", &json!({"text": "own"})).unwrap();
+        a.run("select.all", json!({})).unwrap();
+        a.run("edit.copy", json!({})).unwrap();
+        let r = a.execute("edit.paste", json!({}));
+        assert!(r.as_ref().is_ok_and(|v| v.get("pending").is_none()), "{r:?}");
+        let ctx = egui::Context::default();
+        let (req, _reply) = crate::ControlRequest::new("engine.execute", json!({"command": "edit.paste", "params": {}}));
+        match crate::control::handle(&mut a, &ctx, &req) {
+            crate::control::Outcome::Done(v) => assert!(v["ok"] == true && v["result"].get("pending").is_none(), "{v}"),
+            crate::control::Outcome::Screenshot { .. } => panic!("not a reply"),
+        }
+        assert_eq!(reads.get(), 0, "no browser clipboard read for a script");
+        a.drain_browser_clipboard();
+        assert!(!first_para(&a).contains("from the browser"), "nothing pastes later");
+        // The user's Paste still asks the browser.
+        assert_eq!(a.run("edit.paste", json!({})).unwrap()["pending"], "clipboard");
+        assert_eq!(reads.get(), 1);
+    }
+
     /// RTF is used where the clipboard has no HTML; oversized payloads are dropped, not pasted.
     #[test]
     fn rtf_and_oversized_clipboard_payloads() {

@@ -119,15 +119,25 @@ impl WordApp {
     /// browser download. `save_as` is what the host page is told (`Services::host_save`).
     fn deliver_web_save(&self, name: &str, bytes: &[u8], save_as: bool, copy: bool) -> Result<(), String> {
         if copy {
-            return match &self.services.download_copy {
-                Some(copy) => copy(name, crate::save_as::mime_of(name), bytes),
-                None => Err("this window can't download files".to_owned()),
-            };
+            return self.download_a_copy(name, crate::save_as::mime_of(name), bytes);
         }
         match (&self.services.host_save, &self.services.download) {
             (Some(host), _) => host(name, bytes, save_as),
             (None, Some(download)) => download(name, bytes),
             (None, None) => Ok(()),
+        }
+    }
+
+    /// Web: download a Save As or Export copy through the browser ([`crate::Services::download_copy`],
+    /// wired by [`crate::browser_saves::wire`]). A window without that hook refuses: a copy never
+    /// falls back to the host page or the save download.
+    fn download_a_copy(&self, name: &str, mime: &str, bytes: &[u8]) -> Result<(), String> {
+        match &self.services.download_copy {
+            Some(copy) => copy(name, mime, bytes),
+            None => {
+                log::error!("no download_copy hook: the copy {name} was not delivered");
+                Err("this window can't download copies".to_owned())
+            }
         }
     }
 
@@ -161,11 +171,7 @@ impl WordApp {
         }
         .map_err(|e| e.to_string())?;
         let (bytes, plan) = self.session.print_pdf(params).map_err(|e| e.to_string())?;
-        let delivered = match (&self.services.download_copy, &self.services.download) {
-            (Some(copy), _) => copy(&name, "application/pdf", &bytes),
-            (None, Some(download)) => download(&name, &bytes),
-            (None, None) => Err("this window can't download files".to_owned()),
-        };
+        let delivered = self.download_a_copy(&name, "application/pdf", &bytes);
         if let Err(e) = delivered {
             let msg = i18n::fmt(tl!("Couldn't download {name}: {error}"), &[("name", &name), ("error", &e)]);
             self.status(msg.clone());
@@ -318,6 +324,11 @@ impl WordApp {
     /// UI-level commands (`ui.*`) are handled here, the rest by the engine.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
         self.clear_command_targets(id);
+        // A browser page has no updater, second window, Zotero or embedded objects: their
+        // commands are hidden there, and refused from a shortcut, the search or a script.
+        if self.browser_hides(id) {
+            return Err(tl!(crate::save_as::NOT_IN_BROWSER).to_string());
+        }
         if let Some(error) = self.document_required_error(id) {
             return Err(error);
         }
@@ -335,10 +346,6 @@ impl WordApp {
         // Live editing: an engine command it doesn't allow now is refused here, before any
         // save, download or close below could act on it.
         if let Some(r) = self.live_gate(id, &params) {
-            return r;
-        }
-        // A live session that ended: Save As downloads a copy itself, and the edits stay unsaved.
-        if let Some(r) = self.live_copy(id, &params) {
             return r;
         }
         // Save As = Export: without a path, the Save As list or the one copy; with one, a copy.
@@ -691,14 +698,28 @@ impl WordApp {
         if let Some(what) = req.get("open").and_then(Value::as_str) {
             match what {
                 "openFile" => self.open_dialog(),
-                "saveAs" => {
+                // Plain Save of an untitled document asks for its file. Save As (`copy`) is a
+                // copy: the Save As list, or for a document the window doesn't show, its copy.
+                "saveAs" if req.get("copy").and_then(Value::as_bool) != Some(true) => {
                     self.save_as_dialog();
                 }
-                "exportPdf" => {
-                    let _ = self.save_as_copy("pdf");
-                }
-                "exportPng" => {
-                    let _ = self.save_as_copy("png");
+                "saveAs" | "exportPdf" | "exportPng" => {
+                    let format = match what {
+                        "exportPdf" => "pdf",
+                        "exportPng" => "png",
+                        _ => "docx",
+                    };
+                    match req.get("document").and_then(Value::as_u64).filter(|&d| d != self.session.document_id()) {
+                        Some(doc) => {
+                            let _ = self.save_as_copy_of(doc, format);
+                        }
+                        None if what == "saveAs" => {
+                            let _ = self.save_as_command("file.saveAs", &json!({}));
+                        }
+                        None => {
+                            let _ = self.save_as_copy(format);
+                        }
+                    }
                 }
                 "insertPicture" => self.pick_picture(),
                 "addFont" => self.pick_font(),

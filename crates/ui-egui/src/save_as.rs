@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 use crate::WordApp;
 use crate::file_dialogs::{AfterPick, FileDialogRequest};
 
+/// Save As onto the document's own file: Save As makes copies, and Save writes that file.
+pub const SAVE_AS_OWN_FILE: &str = "Save As makes copies; use Save";
+
 /// The export id of a Word 2003 XML Document: an `.xml` file saved with `format: "wordml2003"`.
 pub(crate) const WORD_2003: &str = "wordml2003";
 
@@ -75,8 +78,27 @@ pub fn mime_of(name: &str) -> &'static str {
     SAVE_AS.for_ext(ext).map_or_else(|| craft_share::export::mime_for_ext(ext), |f| f.mime)
 }
 
+/// The refusal of a command a browser page hides ([`WordApp::browser_hides`]).
+pub const NOT_IN_BROWSER: &str = "This command isn't available in the browser";
+
 /// The commands a browser page hides ([`WordApp::browser_hides`]).
-const BROWSER_HIDDEN: [&str; 6] = ["ui.checkForUpdates", "view.newWindow", "view.arrangeAll", "view.sideBySide", "view.syncScroll", "insert.object"];
+const BROWSER_HIDDEN: [&str; 7] =
+    ["ui.checkForUpdates", "help.checkForUpdates", "view.newWindow", "view.arrangeAll", "view.sideBySide", "view.syncScroll", "insert.object"];
+
+/// The format of the Save As or export command `id` run without a path: the copy
+/// [`WordApp::save_as_copy`] makes for it. `None` for anything else, or with a path.
+pub(crate) fn pathless_copy(id: &str, params: &Value) -> Option<&'static str> {
+    if params.get("path").and_then(Value::as_str).is_some() {
+        return None;
+    }
+    match id {
+        "file.saveAs" => Some("docx"),
+        "file.exportPdf" => Some("pdf"),
+        "file.exportPng" => Some("png"),
+        "file.saveTemplate" => Some("dotx"),
+        _ => None,
+    }
+}
 
 /// A Save As or export with a path (a script, an agent, the control channel) writes a copy there:
 /// the document is never re-pointed to it. Other commands pass through as they are.
@@ -157,24 +179,61 @@ impl WordApp {
     /// In a browser the copy downloads at once; on the desktop the Save dialog asks where and
     /// [`Self::write_copy`] writes it. The document stays as it was either way, live or not.
     pub fn save_as_copy(&mut self, id: &str) -> Result<Value, String> {
-        let plan = match SAVE_AS.plan(self.runtime(), "", "Document", id) {
+        self.copy_document(None, id)
+    }
+
+    /// [`Self::save_as_copy`] of open document `doc`, which may wait behind the active one (the
+    /// control channel addresses any open document). The window keeps showing the active one.
+    pub(crate) fn save_as_copy_of(&mut self, doc: u64, id: &str) -> Result<Value, String> {
+        let document = (doc != self.session.document_id()).then_some(doc);
+        self.in_document(doc, |app| app.copy_document(document, id))
+    }
+
+    /// Run `f` with open document `doc` as the session's active one, then go back to the one
+    /// the window shows.
+    pub(crate) fn in_document<R>(&mut self, doc: u64, f: impl FnOnce(&mut Self) -> Result<R, String>) -> Result<R, String> {
+        let home = self.session.document_id();
+        if doc == home {
+            return f(self);
+        }
+        self.session.switch_document(doc).map_err(|e| e.to_string())?;
+        let r = f(self);
+        if self.session.document_id() != home
+            && self.session.is_open(home)
+            && let Err(e) = self.session.switch_document(home)
+        {
+            log::error!("couldn't go back to document {home}: {e}");
+        }
+        r
+    }
+
+    /// The copy of the active document in format `id`; `document` is set when the session made
+    /// a background document active for it ([`Self::in_document`]), so a Save dialog answered
+    /// later writes that one.
+    fn copy_document(&mut self, document: Option<u64>, id: &str) -> Result<Value, String> {
+        // Named after the document's title (`/` in a title is part of it, not a folder); once a
+        // live link no longer saves, `<title> (my copy <date> <time>)`.
+        let live_copy = self.live_copy_title();
+        let title = live_copy.clone().unwrap_or_else(|| self.title_stem());
+        let plan = match SAVE_AS.file_name_from_title(&title, "Document", id).and_then(|name| SAVE_AS.plan(self.runtime(), &name, "Document", id)) {
             Ok(plan) => plan,
-            Err(e) => return Err(self.fail_export(e.to_string())),
-        };
-        // Named after the document's title (`/` in a title is part of it, not a folder).
-        let file_name = match SAVE_AS.file_name_from_title(&self.title_stem(), "Document", id) {
-            Ok(name) => name,
             Err(e) => return Err(self.fail_export(e.to_string())),
         };
         match plan.delivery {
             Delivery::Download => {
-                let mut params = json!({"path": file_name, "copy": true});
+                let mut params = json!({"path": plan.file_name, "copy": true});
                 if let Some(format) = engine_format(id) {
                     params["format"] = json!(format);
                 }
                 let r = self.web_copy(&params);
                 match &r {
-                    Ok(_) => self.clear_export_error(),
+                    Ok(_) => {
+                        self.clear_export_error();
+                        if live_copy.is_some() {
+                            // The edits are in no save: the copy is the user's to keep.
+                            self.status_long(tl!(crate::live::COPY_DOWNLOADED));
+                        }
+                    }
                     Err(e) => {
                         self.fail_export(e.clone());
                     }
@@ -184,8 +243,8 @@ impl WordApp {
             Delivery::SaveDialog => {
                 // Save as Word Template starts in the user templates folder (#2852).
                 let dir = if id == "dotx" { self.templates_dir_to_save() } else { None };
-                let req = FileDialogRequest::Save { name: file_name, dir };
-                match self.ask_file(req, AfterPick::Export { ext: id.to_string() }) {
+                let req = FileDialogRequest::Save { name: plan.file_name, dir };
+                match self.ask_file(req, AfterPick::Export { ext: id.to_string(), document }) {
                     crate::file_dialogs::Asked::Done(r) => r,
                     crate::file_dialogs::Asked::Pending => Ok(json!({"pending": "saveAs"})),
                     crate::file_dialogs::Asked::Busy => Ok(json!({"saved": false})),
@@ -194,18 +253,30 @@ impl WordApp {
         }
     }
 
+    /// The path a desktop copy in format `id` is written to, from the path the Save dialog (or the
+    /// built-in file browser) picked: the format's extension made sure of. A name the dialog never
+    /// confirmed that is already taken is refused instead of written over, and so is the
+    /// document's own file: Save As makes copies, and Save writes the document's file.
+    pub(crate) fn copy_path(&mut self, picked: &str, id: &str) -> Result<String, String> {
+        let p = SAVE_AS.picked_path(picked, id).map_err(|e| self.fail_export(e.to_string()))?;
+        if self.session.find_open(std::path::Path::new(&p.path)) == Some(self.session.document_id()) {
+            return Err(self.fail_export(tl!(SAVE_AS_OWN_FILE).to_string()));
+        }
+        if p.renamed && std::path::Path::new(&p.path).exists() {
+            return Err(self.fail_export(format!("{} already exists; choose another name", p.path)));
+        }
+        Ok(p.path)
+    }
+
     /// Desktop: write the copy in format `id` at the path the Save dialog (or the built-in file
     /// browser) picked. The format's extension is made sure of; a name the dialog never confirmed
     /// that is already taken is refused instead of written over.
     pub(crate) fn write_copy(&mut self, id: &str, picked: &str) -> Result<Value, String> {
-        let p = SAVE_AS.picked_path(picked, id).map_err(|e| self.fail_export(e.to_string()))?;
-        if p.renamed && std::path::Path::new(&p.path).exists() {
-            return Err(self.fail_export(format!("{} already exists; choose another name", p.path)));
-        }
+        let path = self.copy_path(picked, id)?;
         let r = if id == "png" {
-            self.run("file.exportPng", json!({"path": p.path}))
+            self.run("file.exportPng", json!({"path": path}))
         } else {
-            let mut params = json!({"path": p.path, "copy": true});
+            let mut params = json!({"path": path, "copy": true});
             if let Some(format) = engine_format(id) {
                 params["format"] = json!(format);
             }
@@ -214,7 +285,7 @@ impl WordApp {
         match &r {
             Ok(_) => {
                 self.clear_export_error();
-                self.status(crate::i18n::fmt(tl!("Exported {path}"), &[("path", &crate::i18n::isolate_path(&p.path))]));
+                self.status(crate::i18n::fmt(tl!("Exported {path}"), &[("path", &crate::i18n::isolate_path(&path))]));
             }
             Err(e) => {
                 self.fail_export(e.clone());

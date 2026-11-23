@@ -120,3 +120,71 @@ fn closing_an_addressed_document_keeps_unsaved_work_unless_forced() {
     assert!(!a.session.is_open(clean) && a.session.is_open(second));
     assert_eq!(a.session.document_id(), active);
 }
+
+/// The text of a downloaded or written copy.
+fn copy_text(name: &str, bytes: &[u8]) -> String {
+    wordcraft_engine::io::open_bytes(name, bytes).unwrap().plain_text(wordcraft_doc::StoryRef::Body)
+}
+
+type Copies = std::rc::Rc<std::cell::RefCell<Vec<(String, Vec<u8>)>>>;
+
+/// Save As = Export on a document in the background, in a browser: `file.saveAs` without a path
+/// and the exports download that document's copy through the one Save As function, never
+/// Save's dialog and never the active document. Both documents stay as they were.
+#[test]
+fn save_as_on_an_addressed_document_downloads_its_copy_in_a_browser() {
+    let mut a = app();
+    let copies = Copies::default();
+    let c = copies.clone();
+    a.services.download_copy = Some(Box::new(move |name: &str, _: &str, bytes: &[u8]| {
+        c.borrow_mut().push((name.to_string(), bytes.to_vec()));
+        Ok(())
+    }));
+    let saved = std::rc::Rc::new(std::cell::Cell::new(0));
+    let s = saved.clone();
+    a.services.download = Some(Box::new(move |_: &str, _: &[u8]| {
+        s.set(s.get() + 1);
+        Ok(())
+    }));
+    let (first, second) = two_documents(&mut a);
+    for (command, ext) in [("file.saveAs", ".docx"), ("file.exportPdf", ".pdf"), ("file.exportPng", ".png"), ("file.saveTemplate", ".dotx")] {
+        let r = send(&mut a, "engine.execute", json!({"command": command, "params": {}, "doc": first}));
+        assert_eq!(r["ok"], true, "{command}: {r}");
+        let (name, _) = copies.borrow().last().cloned().unwrap();
+        assert!(name.ends_with(ext), "{command}: {name}");
+    }
+    let (name, bytes) = copies.borrow()[0].clone();
+    assert_eq!(copy_text(&name, &bytes).trim(), "First", "the addressed document's copy");
+    assert_eq!(saved.get(), 0, "no save download");
+    assert!(a.file_dialog.is_none() && !a.ui.backstage, "no dialog, no Save As page");
+    assert_eq!(a.session.document_id(), second, "the window keeps its document");
+    assert!(a.session.document_dirty(first) && a.session.document_dirty(second), "a copy is not a save");
+}
+
+/// The same on the desktop: the Save dialog asks for the addressed document's copy, which is
+/// written there; neither document moves to the picked file.
+#[test]
+fn save_as_on_an_addressed_document_writes_its_copy_on_the_desktop() {
+    let dir = std::env::temp_dir().join(format!("wordcraft-doc-save-as-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut a = app();
+    let folder = dir.clone();
+    a.services.pick_save = Some(Box::new(move |name: &str| Some(folder.join(name).to_string_lossy().into_owned())));
+    let (first, second) = two_documents(&mut a);
+    let r = send(&mut a, "engine.execute", json!({"command": "file.saveAs", "params": {}, "doc": first}));
+    assert_eq!(r["ok"], true, "{r}");
+    let written: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    assert_eq!(written.len(), 1, "{written:?}");
+    let name = written[0].file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.ends_with(".docx"), "{name}");
+    assert_eq!(copy_text(&name, &std::fs::read(&written[0]).unwrap()).trim(), "First");
+    let r = send(&mut a, "engine.execute", json!({"command": "file.exportPdf", "params": {}, "doc": first}));
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).any(|e| e.path().extension().is_some_and(|x| x == "pdf")));
+    assert_eq!(a.session.document_id(), second);
+    assert!(a.session.path.is_none(), "the active document isn't moved to the copy");
+    assert!(a.session.with_document(first, |s| s.path.is_none()).unwrap(), "nor the addressed one");
+    assert!(a.session.document_dirty(first));
+    let _ = std::fs::remove_dir_all(&dir);
+}

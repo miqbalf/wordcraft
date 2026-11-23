@@ -6183,6 +6183,15 @@ fn a_copy_never_becomes_the_documents_file() {
     run(&mut s, "file.saveAs", json!({"path": locked.to_string_lossy(), "copy": true, "password": "pw"}));
     assert!(crate::io::open_path(&locked).is_err(), "the copy is encrypted");
     assert!(s.password.is_none(), "the document isn't");
+    // A copy without a path, or onto the document's own file, is refused: Save writes that file.
+    let own_before = std::fs::read(&own).unwrap();
+    let own_path = json!({"path": own.to_string_lossy(), "copy": true});
+    for (id, params) in [("file.save", json!({"copy": true})), ("file.save", own_path.clone()), ("file.saveAs", own_path)] {
+        let r = s.run(id, &params);
+        assert!(matches!(&r, Err(e) if e.to_string().contains(crate::cmd::file::SAVE_AS_OWN_FILE)), "{id} {params}: {r:?}");
+    }
+    assert_eq!(std::fs::read(&own).unwrap(), own_before, "the file is left alone");
+    assert!(s.dirty);
     // Without `copy`, a Word document is still where the document goes (plain Save of a new file).
     run(&mut s, "file.saveAs", json!({"path": dir.join("moved.docx").to_string_lossy()}));
     assert_eq!(s.path.as_deref(), Some(dir.join("moved.docx").as_path()));

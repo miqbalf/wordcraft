@@ -7,6 +7,7 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast as _;
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::async_saves::{AsyncSaves, SaveOutcome};
+use wordcraft_ui_egui::browser_saves::{self, BrowserHost, CopyHook, DownloadHook};
 use wordcraft_ui_egui::{Inbox, Services, WordApp};
 
 const DOC_EXTS: &[&str] =
@@ -289,7 +290,7 @@ fn services(inbox: Inbox, ctx: egui::Context, dirty: Rc<Cell<bool>>, saves: Asyn
     let font_ctx = ctx.clone();
     let font_messages = messages.clone();
     let clipboard_ctx = ctx.clone();
-    Services {
+    let mut services = Services {
         // The ribbon and context-menu Paste read the browser's clipboard (WA F7).
         browser_clipboard: Some(wordcraft_ui_egui::system_clipboard::BrowserClipboard::new(Box::new(move |answer| {
             read_clipboard_text(answer, clipboard_ctx.clone())
@@ -328,10 +329,6 @@ fn services(inbox: Inbox, ctx: egui::Context, dirty: Rc<Cell<bool>>, saves: Asyn
         // Exports ask for a name; the browser decides where the download goes.
         pick_save: Some(Box::new(|name: &str| Some(name.to_string()))),
         async_saves: Some(saves.clone()),
-        download: Some(Box::new(move |path: &str, bytes: &[u8]| download(&saves, &save_ctx, path, bytes))),
-        // Save As / Export copies and a live copy always download here, framed or not, and never
-        // go to a host page (`save_as` and `live` in wordcraft-ui-egui).
-        download_copy: Some(Box::new(|name: &str, mime: &str, bytes: &[u8]| craft_web_host::web::download(name, mime, bytes))),
         print: Some(Box::new(print_pdf)),
         inbox: Some(inbox),
         on_dirty: Some(Box::new(move |d| dirty.set(d))),
@@ -342,7 +339,12 @@ fn services(inbox: Inbox, ctx: egui::Context, dirty: Rc<Cell<bool>>, saves: Asyn
             load_system_fonts(font_ctx.clone(), font_messages.clone());
         })),
         ..Default::default()
-    }
+    };
+    // Save As / Export copies always download here, framed or not, and never go to a host page
+    // (`browser_saves` in wordcraft-ui-egui; the host bridge rewires the rest).
+    let download_save: DownloadHook = Box::new(move |path: &str, bytes: &[u8]| download(&saves, &save_ctx, path, bytes));
+    browser_saves::wire(&mut services, BrowserHost::Plain, copy_hook(), download_save);
+    services
 }
 
 /// Most files one multi-select pick (Add Font) reads.
@@ -623,6 +625,11 @@ fn read_clipboard_text(answer: wordcraft_ui_egui::system_clipboard::ClipboardAns
         *answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text);
         ctx.request_repaint();
     });
+}
+
+/// The browser download every Save As and Export copy goes to ([`browser_saves::wire`]).
+pub(crate) fn copy_hook() -> CopyHook {
+    Box::new(|name: &str, mime: &str, bytes: &[u8]| craft_web_host::web::download(name, mime, bytes))
 }
 
 /// A plain browser download of `bytes` named `name` (craft-web-host's `<a download>`, no

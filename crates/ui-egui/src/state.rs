@@ -61,7 +61,9 @@ impl AutoSaveBlock {
             }
             AutoSaveBlock::Unsaved => tl!("Save the document to turn on AutoSave").to_string(),
             AutoSaveBlock::Format { name } => i18n::fmt(
-                tl!("AutoSave only keeps .docx, .odt and .rtf files; {name} can't keep all formatting. Save as .docx to turn on AutoSave."),
+                tl!(
+                    "AutoSave only keeps .docx, .odt and .rtf files; {name} can't keep all formatting. Click AutoSave to save it as a .docx file and turn AutoSave on."
+                ),
                 &[("name", name)],
             ),
             AutoSaveBlock::NotSavedHere => {
@@ -70,7 +72,9 @@ impl AutoSaveBlock {
         }
     }
 
-    /// Whether Save As can lift the block (everywhere but the browser).
+    /// Whether saving the document to a new file can lift the block (everywhere but the
+    /// browser): the AutoSave switch asks for that file with Save's dialog, then turns AutoSave
+    /// on. Save As makes copies, so it never lifts it.
     pub fn save_as_helps(&self) -> bool {
         !matches!(self, AutoSaveBlock::Browser)
     }

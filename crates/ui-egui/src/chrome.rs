@@ -52,7 +52,7 @@ const QAT_MENU: [&str; 10] =
 
 /// The Quick Access Toolbar's commands as shown: hosted, without what the page does itself.
 pub(crate) fn qat_ids(app: &WordApp) -> Vec<&str> {
-    app.session.ribbon.qat().into_iter().filter(|id| !app.hosted_hides(id)).collect()
+    app.session.ribbon.qat().into_iter().filter(|id| !app.hosted_hides(id) && !app.browser_hides(id)).collect()
 }
 
 /// Match the toolbar's enabled state for keyboard activation too.

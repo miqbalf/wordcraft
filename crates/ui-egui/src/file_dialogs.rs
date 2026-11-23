@@ -63,8 +63,9 @@ pub(crate) enum AfterPick {
     Picture,
     /// Save the document there, then carry on.
     SaveAs { after: AfterSave, document: u64 },
-    /// Save a copy there in this format (`pdf`, `docx`, `png`…).
-    Export { ext: String },
+    /// Save a copy there in this format (`pdf`, `docx`, `png`…): of open document `document`,
+    /// or of the active one when `None`.
+    Export { ext: String, document: Option<u64> },
     /// Write the PDF of these print settings there (File › Print › Save these pages as PDF).
     PrintPdf { settings: Value },
     /// Load the picked CSV/TSV/text file or spreadsheet as the mail-merge recipients (#240, #334).
@@ -179,7 +180,7 @@ impl WordApp {
             cancel();
         }
         let d = self.file_dialog.take()?;
-        let export = if let AfterPick::Export { ext } = &d.after { Some(ext.clone()) } else { None };
+        let export = if let AfterPick::Export { ext, .. } = &d.after { Some(ext.clone()) } else { None };
         let _ = self.finish_pick(d.after, None);
         export
     }
@@ -296,24 +297,24 @@ impl WordApp {
                 crate::dialogs_review::set_compare_path(self, revised, path);
                 Ok(json!({"picked": true}))
             }
-            AfterPick::Export { ext } => {
+            AfterPick::Export { ext, document } => {
                 let Some(path) = picked else {
                     // Cancelled: an earlier refusal is not news any more.
                     self.clear_export_error();
                     return Ok(json!({"cancelled": true}));
                 };
-                // Save As = Export: a copy there; the document stays as it was.
-                self.write_copy(&ext, &path)
+                // Save As = Export: a copy there; the document stays as it was. A copy of a
+                // document the window doesn't show is that document's.
+                match document {
+                    Some(doc) if self.session.is_open(doc) => self.in_document(doc, |app| app.write_copy(&ext, &path)),
+                    Some(_) => Err(self.fail_export("the document for this copy has been closed".into())),
+                    None => self.write_copy(&ext, &path),
+                }
             }
             AfterPick::PrintPdf { settings } => {
                 let Some(path) = picked else { return Ok(json!({"cancelled": true})) };
-                // A PDF, as every Save As copy is named; a name the dialog never confirmed that
-                // is already taken is refused instead of written over.
-                let p = crate::save_as::SAVE_AS.picked_path(&path, "pdf").map_err(|e| self.fail_export(e.to_string()))?;
-                if p.renamed && std::path::Path::new(&p.path).exists() {
-                    return Err(self.fail_export(format!("{} already exists; choose another name", p.path)));
-                }
-                let path = p.path;
+                // A PDF, checked as every Save As copy is ([`WordApp::copy_path`]).
+                let path = self.copy_path(&path, "pdf")?;
                 let mut params = settings;
                 params["path"] = json!(path);
                 let r = self.run("file.printPdf", params);

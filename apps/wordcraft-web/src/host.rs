@@ -94,6 +94,7 @@ use craft_web_host::live::{LiveError, LiveMessage, LiveState, Peer as HostPeer};
 use craft_web_host::web::{FileData, Host, Message, fetch_font};
 use wasm_bindgen::JsCast as _;
 use wordcraft_ui_egui::async_saves::{AsyncSaves, SaveOutcome};
+use wordcraft_ui_egui::browser_saves::{self, BrowserHost, DownloadHook, HostPost};
 use wordcraft_ui_egui::live::LiveReport;
 use wordcraft_ui_egui::{Inbox, Services, WordApp};
 
@@ -140,6 +141,11 @@ pub struct Bridge {
     sent: Rc<RefCell<SentSaves>>,
 }
 
+/// A plain browser download, for what a framing page doesn't take.
+fn anchor() -> DownloadHook {
+    Box::new(|name: &str, bytes: &[u8]| crate::web::anchor_download(name, bytes))
+}
+
 impl Bridge {
     /// The bridge for this page, or `None` when WordCraft isn't hosted: no `?host=parent` and no
     /// `data-host="page"` on the canvas, an unframed `?host=parent` page (it stays the normal app
@@ -176,17 +182,16 @@ impl Bridge {
             inbox
         };
         self.listen(opens, ctx, saves, events);
+        // Save As / Export copies download in every mode (`browser_saves`); only Save reaches
+        // a page that stores it.
         if self.host.mode() == Mode::Parent {
             services.hosted = true;
             services.saves_are_copies = true;
-            services.host_save = None;
-            services.download = Some(Box::new(|name: &str, bytes: &[u8]| crate::web::anchor_download(name, bytes)));
+            browser_saves::wire(services, BrowserHost::Parent, crate::web::copy_hook(), anchor());
         } else {
             let bridge = self.clone();
-            services.host_save = Some(Box::new(move |name: &str, bytes: &[u8], save_as: bool| bridge.post_save(name, bytes, save_as)));
-            // Anything else that would download goes to the host too.
-            let bridge = self.clone();
-            services.download = Some(Box::new(move |name: &str, bytes: &[u8]| bridge.post_save(name, bytes, false)));
+            let post: HostPost = Rc::new(move |name: &str, bytes: &[u8], save_as: bool| bridge.post_save(name, bytes, save_as));
+            browser_saves::wire(services, BrowserHost::Page(post), crate::web::copy_hook(), anchor());
         }
         // The browser's save picker is never used, so no save finishes later.
         services.async_saves = None;
@@ -215,7 +220,7 @@ impl Bridge {
         services.host_confirms_saves = true;
         services.async_saves = Some(saves.clone());
         let (bridge, saves) = (self.clone(), saves.clone());
-        services.host_save = Some(Box::new(move |name: &str, bytes: &[u8], save_as: bool| {
+        let post: HostPost = Rc::new(move |name: &str, bytes: &[u8], save_as: bool| {
             let ticket = saves.start();
             let id = bridge.sent.borrow_mut().ids.start();
             bridge.sent.borrow_mut().tickets.push((id.clone(), ticket));
@@ -228,7 +233,8 @@ impl Bridge {
                 saves.finish(ticket, SaveOutcome::Failed(e.clone()));
             }
             posted
-        }));
+        });
+        browser_saves::wire(services, BrowserHost::ParentSaves(post), crate::web::copy_hook(), anchor());
     }
 
     /// The host said it shares files: from now on Share posts `wordcraft:share` to it.

@@ -1113,9 +1113,9 @@ pub(crate) fn search_results(app: &mut WordApp, ui: &mut Ui, query: &str, enter:
     // An empty box suggests a few common commands, as Word's Search does.
     let mut hits: Vec<&wordcraft_engine::CommandSpec> = if query.trim().is_empty() {
         ui.label(egui::RichText::new(tl!("Suggested")).font(semibold(12.5)));
-        SEARCH_SUGGESTIONS.iter().filter_map(|id| reg.get(id)).collect()
+        SEARCH_SUGGESTIONS.iter().filter_map(|id| reg.get(id)).filter(|c| !app.browser_hides(c.id)).collect()
     } else {
-        reg.all().iter().filter(|c| !NOT_IN_SEARCH.contains(&c.id) && command_matches(c, query)).collect()
+        reg.all().iter().filter(|c| !NOT_IN_SEARCH.contains(&c.id) && !app.browser_hides(c.id) && command_matches(c, query)).collect()
     };
     hits.truncate(14);
     let mut run: Option<&str> = enter.then(|| hits.first().map(|c| c.id)).flatten();

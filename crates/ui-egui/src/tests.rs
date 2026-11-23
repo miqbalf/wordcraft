@@ -5532,7 +5532,12 @@ fn every_save_as_entry_point_writes_a_copy_on_the_desktop() {
     assert_eq!(crate::save_as::SAVE_AS.plan(a.runtime(), "plan", "Document", "odt").unwrap().delivery, craft_share::export::Delivery::SaveDialog);
     let (document, revision) = (a.session.document_id(), a.session.doc.core.revision);
     a.save_as_copy("odt").unwrap();
-    a.save_as_copy("docx").unwrap();
+    // Onto the document's own file (the dialog confirmed the overwrite): Save As makes copies,
+    // and Save writes that file. Refused with a short status; the file is left alone.
+    let own_before = std::fs::read(&own).unwrap();
+    assert_eq!(a.save_as_copy("docx"), Err(crate::save_as::SAVE_AS_OWN_FILE.to_string()));
+    assert_eq!(a.export_error, crate::save_as::SAVE_AS_OWN_FILE);
+    assert_eq!(std::fs::read(&own).unwrap(), own_before);
     a.run("ui.saveAsTemplate", json!({})).unwrap();
     a.run("file.exportPdf", json!({})).unwrap();
     a.run("file.exportPng", json!({})).unwrap();
@@ -5548,7 +5553,10 @@ fn every_save_as_entry_point_writes_a_copy_on_the_desktop() {
     // A picked name without the format's extension gets it; if that name exists, the dialog never
     // confirmed it: refused, the file left alone.
     let before = std::fs::read(dir.join("plan.odt")).unwrap();
-    let r = a.finish_pick(crate::file_dialogs::AfterPick::Export { ext: "odt".into() }, Some(dir.join("plan").to_string_lossy().into_owned()));
+    let r = a.finish_pick(
+        crate::file_dialogs::AfterPick::Export { ext: "odt".into(), document: None },
+        Some(dir.join("plan").to_string_lossy().into_owned()),
+    );
     assert!(r.is_err() && a.export_error.contains("already exists"), "{r:?}");
     assert_eq!(std::fs::read(dir.join("plan.odt")).unwrap(), before);
     let _ = std::fs::remove_dir_all(&dir);
@@ -5585,6 +5593,15 @@ fn a_browser_hides_the_desktop_only_commands() {
     web.services.download_copy = Some(Box::new(|_: &str, _: &str, _: &[u8]| Ok(())));
     assert!(ids.iter().all(|id| web.browser_hides(id)));
     assert!(!web.browser_hides("view.split") && !web.browser_hides("edit.paste"), "the rest stays");
+    // Greyed out and refused from a shortcut, the command search or a script, not only hidden on
+    // the ribbon; the desktop keeps them.
+    for id in ids {
+        assert!(!crate::widgets::enabled(&web, id), "{id} is disabled in a browser");
+        assert_eq!(web.execute(id, json!({})), Err(crate::save_as::NOT_IN_BROWSER.to_string()), "{id}");
+    }
+    let mut desktop = app();
+    assert!(crate::widgets::enabled(&desktop, "view.newWindow") && crate::widgets::enabled(&desktop, "insert.object"));
+    assert_ne!(desktop.execute("insert.object", json!({})), Err(crate::save_as::NOT_IN_BROWSER.to_string()));
     for (a, shown) in [(app(), true), (web, false)] {
         let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
             |ui, app: &mut WordApp| {
@@ -9532,4 +9549,13 @@ fn mouse_wheel_scroll_speed_does_not_alter_ctrl_wheel_zoom_distance() {
             })
             .drop_without_applying_deltas();
     }
+}
+
+/// Save As makes copies, so the AutoSave block never sends the user there: the switch itself
+/// asks for the .docx file (Save's dialog) and turns AutoSave on.
+#[test]
+fn the_autosave_format_block_points_at_the_switch_not_save_as() {
+    let reason = crate::state::AutoSaveBlock::Format { name: "notes.txt".into() }.reason();
+    assert!(!reason.contains("Save as"), "{reason}");
+    assert!(reason.contains("Click AutoSave"), "{reason}");
 }

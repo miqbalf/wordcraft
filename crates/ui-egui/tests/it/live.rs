@@ -443,13 +443,18 @@ fn save_as_after_the_link_broke_downloads_a_copy_and_stays_unsaved() {
     settle(&relay, &mut h, &mut bob);
     assert!(matches!(status(&h), LiveStatus::Broken(_)));
     assert!(h.state().session.dirty, "the edit is in no save");
-    let r = h.state_mut().run("file.saveAs", json!({}));
-    assert!(r.is_ok(), "{r:?}");
-    let copies = copies.borrow().clone();
-    assert_eq!(copies.len(), 1, "one copy downloaded");
-    let (name, bytes) = &copies[0];
-    assert!(name.starts_with("plan (my copy ") && name.ends_with(").docx"), "{name}");
-    assert!(*bytes > 0);
+    // F12 opens the Save As list like everywhere else; nothing downloads yet.
+    assert_eq!(h.state_mut().run("file.saveAs", json!({})).map(|r| r["open"].clone()), Ok(json!("saveAs")));
+    assert!(copies.borrow().is_empty(), "the list opens, no copy yet");
+    // Each format of the list makes the "my copy" download through the one Save As function.
+    for (id, ext) in [("docx", ".docx"), ("pdf", ".pdf")] {
+        let r = h.state_mut().save_as_copy(id);
+        assert!(r.is_ok(), "{id}: {r:?}");
+        let (name, bytes) = copies.borrow().last().cloned().unwrap();
+        assert!(name.starts_with("plan (my copy ") && name.ends_with(&format!("){ext}")), "{name}");
+        assert!(bytes > 0);
+    }
+    assert_eq!(copies.borrow().len(), 2, "one copy each");
     assert_eq!((hosted.get(), downloads.get()), (0, 0), "no wordcraft:save to the page, no save download");
     assert_eq!(h.state().status_msg.as_ref().map(|(m, _)| m.as_str()), Some(COPY_DOWNLOADED));
     for _ in 0..3 {
@@ -638,6 +643,11 @@ fn hosted_copies_download_in_their_format_while_live_and_after_the_link_ends() {
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
     h.state_mut().run("file.saveAs", json!({"path": "plan.odt"})).unwrap();
     assert_eq!(copies.borrow().last().map(String::as_str), Some("plan.odt"), "the chosen format, not a .docx");
+    // F12 still opens the list; a format picked from it downloads a "my copy" in that format.
+    assert_eq!(h.state_mut().run("file.saveAs", json!({})).map(|r| r["open"].clone()), Ok(json!("saveAs")));
+    h.state_mut().save_as_copy("pdf").unwrap();
+    let last = copies.borrow().last().cloned().unwrap();
+    assert!(last.starts_with("plan (my copy ") && last.ends_with(").pdf"), "{last}");
     assert_eq!(other.get(), 0, "nothing went to the page or the save picker");
 }
 

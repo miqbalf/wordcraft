@@ -246,39 +246,22 @@ impl WordApp {
         }
     }
 
-    /// Save As once the link no longer saves (broken, refused or read-only): a copy downloads
-    /// in the browser, named `<stem> (my copy <date> <time>).<ext>`, whatever page frames the app,
-    /// because the host page may not keep a save. The browser can't say whether the user kept
-    /// it, so the document stays unsaved and the leave guard stays on. `None` for anything else.
-    ///
-    /// While the service still saves, Save As without a name opens the Save As list like
-    /// anywhere else, and every copy downloads in its own format ([`crate::save_as`]).
-    pub(crate) fn live_copy(&mut self, id: &str, params: &Value) -> Option<Result<Value, String>> {
-        if id != "file.saveAs" || self.live_link().is_none() || params.get("path").and_then(Value::as_str).is_some() {
+    /// The title a Save As copy is named after once the link no longer saves (broken, refused
+    /// or read-only): `<stem> (my copy <date> <time>)`, so it is never taken for the shared file.
+    /// The copy goes through the Save As list like anywhere else ([`crate::save_as`]); the
+    /// browser can't say whether the user kept it, so the document stays unsaved and the leave
+    /// guard stays on. `None` while the service still saves, or with no link.
+    pub(crate) fn live_copy_title(&self) -> Option<String> {
+        if self.live_link().is_none() || self.live_saves() {
             return None;
         }
-        if self.live_saves() {
-            return None;
-        }
-        let file =
-            self.session.path.as_ref().and_then(|p| p.file_name()).map_or_else(|| "Document.docx".to_owned(), |n| n.to_string_lossy().into_owned());
-        let name = copy_name(&file, &crate::local_time::file_stamp(unix_secs()));
-        let delivered = wordcraft_engine::io::save_bytes(&name, &self.session.doc).and_then(|bytes| {
-            let download = self.services.download_copy.as_ref().ok_or_else(|| "this window can't download files".to_owned())?;
-            download(&name, crate::save_as::mime_of(&name), &bytes).map(|()| bytes.len())
-        });
-        Some(match delivered {
-            Ok(bytes) => {
-                self.status_long(tl!(COPY_DOWNLOADED));
-                Ok(serde_json::json!({"downloaded": name, "bytes": bytes, "copy": true}))
-            }
-            Err(error) => {
-                let msg = i18n::fmt(tl!("Couldn't download {name}: {error}"), &[("name", &name), ("error", &error)]);
-                log::error!("download of the live copy {name} failed: {error}");
-                self.status_long(msg.clone());
-                Err(msg)
-            }
-        })
+        let title = self.title_stem();
+        // A title that is a file name loses its extension: the copy gets the chosen format's.
+        let stem = match title.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() && crate::save_as::SAVE_AS.is_document_ext(ext) => stem.to_owned(),
+            _ => title,
+        };
+        Some(copy_title(&stem, &crate::local_time::file_stamp(unix_secs())))
     }
 
     /// The clock, in milliseconds, that holds the host's reports to one a second (tests).
@@ -488,14 +471,10 @@ impl WordApp {
     }
 }
 
-/// A live copy's file name: `plan.docx` at `2026-11-21 0930` is
-/// `plan (my copy 2026-11-21 0930).docx`; a name without an extension gets `.docx`.
-fn copy_name(file: &str, stamp: &str) -> String {
-    let (stem, ext) = match file.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => (stem, ext),
-        _ => (file, "docx"),
-    };
-    format!("{stem} (my copy {stamp}).{ext}")
+/// A live copy's title: `plan` at `2026-11-21 0930` is `plan (my copy 2026-11-21 0930)`; the
+/// Save As list adds the chosen format's extension.
+fn copy_title(stem: &str, stamp: &str) -> String {
+    format!("{stem} (my copy {stamp})")
 }
 
 /// Save and Save As, which write this window's copy over the file.
@@ -567,9 +546,8 @@ mod tests {
 
     #[test]
     fn a_live_copy_is_named_after_the_file_and_the_time() {
-        assert_eq!(copy_name("plan.docx", "2026-11-21 0930"), "plan (my copy 2026-11-21 0930).docx");
-        assert_eq!(copy_name("notes.v2.odt", "2026-11-21 0930"), "notes.v2 (my copy 2026-11-21 0930).odt");
-        assert_eq!(copy_name("plan", "2026-11-21 0930"), "plan (my copy 2026-11-21 0930).docx");
+        assert_eq!(copy_title("plan", "2026-11-21 0930"), "plan (my copy 2026-11-21 0930)");
+        assert_eq!(copy_title("notes.v2", "2026-11-21 0930"), "notes.v2 (my copy 2026-11-21 0930)");
     }
 
     #[test]
