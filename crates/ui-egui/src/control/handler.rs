@@ -298,6 +298,11 @@ fn handle_request(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) 
             Ok(v) => ok(v),
             Err(e) => err(e),
         },
+        "document.bytes" if !app.has_document() => err(NO_DOCUMENT),
+        "document.bytes" => match document_bytes(&app.session, p) {
+            Ok(v) => ok(v),
+            Err(e) => err(e),
+        },
         "ui.inspect" => ok(inspect(app, ctx)),
         "ui.parity" => ok(wordcraft_engine::catalog::parity(&app.session.registry)),
         "ui.click" => {
@@ -441,6 +446,21 @@ fn handle_request(app: &mut WordApp, ctx: &egui::Context, req: &ControlRequest) 
             }
         }
     }
+}
+
+/// `document.bytes {name}`: the active document written as the file `name` names (its extension
+/// picks the format, as for a save), base64 `data` in the reply. A copy for the page that hosts
+/// the app (Craft Office's Convert to .docx makes a new .docx from an .odt, say): the document
+/// keeps its file, its save stamps and its unsaved changes. A password-protected document is
+/// refused, so no copy goes out without its password.
+fn document_bytes(s: &wordcraft_engine::Session, p: &Value) -> Result<Value, String> {
+    let name = p.get("name").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty());
+    let Some(name) = name else { return Err("missing `name`: a file name whose extension picks the format".into()) };
+    if s.password.is_some() {
+        return Err("the document has a password: save it instead".into());
+    }
+    let bytes = wordcraft_engine::io::save_bytes_with(name, &s.doc, None, &wordcraft_engine::io::ExportOptions::default())?;
+    Ok(json!({"name": name, "size": bytes.len(), "data": wordcraft_engine::cmd::insert::base64_encode(&bytes)}))
 }
 
 /// Commands that write the document out to a file (Save, Save As, a template, the exports,
