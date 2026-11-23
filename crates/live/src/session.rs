@@ -190,12 +190,20 @@ impl LiveApp<Word> for App<'_> {
     }
 }
 
+/// How many pumps pass between two checks of the window's body against the shared copy
+/// ([`LiveEditing::verify`]): a few seconds at a frame rate.
+pub const VERIFY_EVERY: u32 = 300;
+
 /// One document edited live: the session's side of a [`Live`] link.
 pub struct LiveEditing<H: Hub> {
     core: craft_live::LiveEditing<H, Word>,
     map: LiveMap,
     pending: Option<LocalEdit>,
     registry: Arc<Registry>,
+    /// The session's document this link edits ([`Session::document_id`]).
+    document: u64,
+    /// Pumps since the last [`LiveEditing::verify`].
+    since_verify: u32,
 }
 
 impl<H: Hub> LiveEditing<H> {
@@ -217,13 +225,44 @@ impl<H: Hub> LiveEditing<H> {
         let map = LiveMap::new(&session.doc, 0);
         session.set_observer(Some(Box::new(Observer(core.queue()))));
         session.live_undo_hook(Some(core.queue().history_hook()));
-        Ok(LiveEditing { core, map, pending: None, registry: session.registry.clone() })
+        Ok(LiveEditing { core, map, pending: None, registry: session.registry.clone(), document: session.document_id(), since_verify: 0 })
     }
 
     /// One frame: share the local edits, take in the other editors' edits, carets and saves,
     /// and say who else is here.
     pub fn pump(&mut self, session: &mut Session) -> Vec<Peer> {
-        self.core.pump(&mut App { session, map: &mut self.map, pending: &mut self.pending })
+        let peers = self.core.pump(&mut App { session, map: &mut self.map, pending: &mut self.pending });
+        self.since_verify = self.since_verify.saturating_add(1);
+        if self.since_verify >= VERIFY_EVERY {
+            self.verify(session);
+        }
+        peers
+    }
+
+    /// Where the window's body differs from the shared copy's, in words; `None` when it does
+    /// not, or when it cannot be told now (not live, or another document is active).
+    pub fn drift(&self, session: &Session) -> Option<String> {
+        if session.document_id() != self.document || !matches!(self.core.status(), LiveStatus::Live { .. } | LiveStatus::ReadOnly) {
+            return None;
+        }
+        self.map.drift(&session.doc, self.core.live().doc()?)
+    }
+
+    /// The safety net under the mapping, run every [`VERIFY_EVERY`] pumps: share what is
+    /// queued, then compare the window's body with the shared copy's (the document models, not
+    /// the replica's bytes). When they differ, what the window shows is not what the room saves,
+    /// so the body is rebuilt from the shared copy and the drift is logged. Returns whether it
+    /// had drifted.
+    pub fn verify(&mut self, session: &mut Session) -> bool {
+        self.since_verify = 0;
+        self.flush(session);
+        let Some(why) = self.drift(session) else { return false };
+        log::warn!("live: the window's document drifted from the shared copy ({why}); it is rebuilt from the shared copy");
+        let Some(doc) = self.core.live().doc() else { return true };
+        if let Err(e) = (App { session, map: &mut self.map, pending: &mut self.pending }).resync(doc) {
+            log::warn!("live: the rebuild from the shared copy did not land: {e}");
+        }
+        true
     }
 
     /// Run a command on the session, refused when live editing does not allow it now, and

@@ -7,7 +7,9 @@ use craft_collab::LiveDoc;
 use wordcraft_doc::{Block, Document, InlineObject, Paragraph};
 
 use crate::ops::Ops;
-use crate::{LiveMap, LocalEdit, MapError, Moved, Refusal, diff, map};
+use craft_collab::SeedBlock;
+
+use crate::{LiveMap, LocalEdit, MapError, Moved, Part, Refusal, diff, map};
 
 /// The ids of the blocks of a body: paragraphs by pid, tables by the side list.
 struct Ids<'a> {
@@ -115,8 +117,8 @@ impl LiveMap {
         ops.out.pids = pids;
         let mut dirty = HashSet::new();
         self.remove_gone(&mut ops, &old, after, &want, &mut dirty);
-        let want = self.fix_order(&mut ops, &old, after, want);
-        let fresh = Self::insert_new(&mut ops, &old, after, &want, &mut dirty);
+        let mut want = self.fix_order(&mut ops, &old, after, want);
+        let fresh = self.insert_new(&mut ops, &old, after, &mut want, &mut dirty);
         Self::update_kept(&mut ops, &old, after, &want, &fresh, &dirty);
         self.tables = after.body.iter().zip(&want).filter(|(b, _)| b.as_table().is_some()).map(|(_, id)| *id).collect();
         Ok(ops.out)
@@ -218,6 +220,7 @@ impl LiveMap {
         let mut taken: HashSet<u64> = want.iter().copied().collect();
         for (i, k) in seq.iter().zip(keep) {
             let Some(was) = want.get(*i).copied().filter(|_| !k) else { continue };
+            let src = ops.live.block(was);
             ops.remove(was);
             let id = self.mint(ops.live, &taken);
             taken.insert(id);
@@ -226,8 +229,11 @@ impl LiveMap {
             }
             if let Some(p) = after.body.get(*i).and_then(|b| b.as_para()) {
                 ops.out.pids.push((*i, id));
-                let from_text = old.para(&was).map_or_else(|| p.text.clone(), |q| q.text.clone());
-                self.moved.insert(was, Moved { to: id, from_text, to_text: p.text.clone() });
+                let (from_text, from_runs) = match src {
+                    Some(b) => (b.text, b.runs),
+                    None => (old.para(&was).map_or_else(|| p.text.clone(), |q| q.text.clone()), Vec::new()),
+                };
+                self.moved.insert(was, Moved { from_text, from_runs, parts: vec![Part { start: 0, to: id, to_text: p.text.clone() }] });
             }
         }
         want
@@ -235,10 +241,15 @@ impl LiveMap {
 
     /// Add the blocks the replica lacks, in `after`'s order: a paragraph right after a kept one
     /// whose old tail it ends with is split off it. Returns the ids inserted whole.
-    fn insert_new(ops: &mut Ops, old: &Ids, after: &Document, want: &[u64], dirty: &mut HashSet<u64>) -> HashSet<u64> {
+    ///
+    /// A split inside the text is a move of the old paragraph into a new head (whose id replaces
+    /// the old one in `want`) and the new tail, so edits that race it can be forwarded (see the
+    /// [crate documentation](crate)); a split at the end moves no text and keeps the id.
+    fn insert_new(&mut self, ops: &mut Ops, old: &Ids, after: &Document, want: &mut [u64], dirty: &mut HashSet<u64>) -> HashSet<u64> {
         let mut fresh = HashSet::new();
-        for (i, id) in want.iter().enumerate() {
-            if ops.at(*id).is_some() {
+        for i in 0..want.len() {
+            let Some(id) = want.get(i).copied() else { continue };
+            if ops.at(id).is_some() {
                 continue;
             }
             let Some(block) = after.body.get(i) else { continue };
@@ -246,16 +257,56 @@ impl LiveMap {
             if let (Some((j, p)), Some(new)) = (prev, block.as_para())
                 && let Some(k) = Self::split_point(ops, old, after, j, p, new, dirty)
             {
-                ops.split(p, k, *id);
-                dirty.insert(p);
-                dirty.insert(*id);
+                let moves_text = old.para(&p).is_some_and(|w| k < w.text.chars().count());
+                let taken: HashSet<u64> = want.iter().copied().collect();
+                let moved = if moves_text { self.split_as_move(ops, p, k, id, &taken) } else { None };
+                match moved {
+                    Some(head) => {
+                        if let Some(w) = want.get_mut(j) {
+                            *w = head;
+                        }
+                        ops.out.pids.push((j, head));
+                        dirty.insert(head);
+                    }
+                    None => {
+                        ops.split(p, k, id);
+                        dirty.insert(p);
+                    }
+                }
+                dirty.insert(id);
                 continue;
             }
             let at = prev.and_then(|(_, p)| ops.at(p)).map_or(0, |j| j + 1);
-            ops.insert(at, &map::block_seed(*id, block));
-            fresh.insert(*id);
+            ops.insert(at, &map::block_seed(id, block));
+            fresh.insert(id);
         }
         fresh
+    }
+
+    /// Split block `p` at char `k` by moving it: take it out of the order (its text stays, as
+    /// the old block) and add its head under a fresh id and its tail as `tail`. Returns the head's
+    /// id; `None` when `p` could not be taken out, and nothing was done.
+    fn split_as_move(&mut self, ops: &mut Ops, p: u64, k: usize, tail: u64, taken: &HashSet<u64>) -> Option<u64> {
+        let src = ops.live.block(p)?;
+        let at = ops.at(p)?;
+        ops.remove(p);
+        if ops.at(p).is_some() {
+            return None;
+        }
+        let head = self.mint(ops.live, taken);
+        let n = src.text.chars().count();
+        let part = |id: u64, from: usize, to: usize| SeedBlock {
+            id,
+            text: src.text.chars().skip(from).take(to - from).collect(),
+            attrs: src.attrs.clone(),
+            runs: diff::slice_runs(&src.runs, from, to),
+        };
+        let (h, t) = (part(head, 0, k), part(tail, k, n));
+        ops.insert(at, &h);
+        ops.insert(at + 1, &t);
+        let parts = vec![Part { start: 0, to: head, to_text: h.text }, Part { start: k, to: tail, to_text: t.text }];
+        self.moved.insert(p, Moved { from_text: src.text, from_runs: src.runs, parts });
+        Some(head)
     }
 
     /// Where to split paragraph `p` (at `after` index `i`) so its tail becomes `new`: when `p`

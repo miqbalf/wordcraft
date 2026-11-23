@@ -408,6 +408,39 @@ fn three_editors_converge() {
     }
 }
 
+/// Seeds that once left the editors apart for good: a swap of two equal paragraphs that was
+/// never shared (149), an id whose block an undo took away (572, 917) and the rest found by
+/// the sweep below.
+#[test]
+fn editors_converge_on_seeds_that_diverged() {
+    for seed in [149, 488, 572, 820, 917, 1950] {
+        converge_through_pump(3, seed, 150);
+    }
+    for seed in [187, 250, 543, 555, 715, 717, 770] {
+        converge_through_pump(2, seed, 150);
+    }
+}
+
+/// A long sweep of [`converge_through_pump`], for a run by hand: `LIVE_SWEEP=from..to` (and
+/// `LIVE_SWEEP_EDITORS`, 3 by default). Without it the test checks nothing.
+#[test]
+fn converge_sweep_from_the_environment() {
+    let Some((from, to)) = std::env::var("LIVE_SWEEP").ok().and_then(|r| {
+        let (a, b) = r.split_once("..")?;
+        Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))
+    }) else {
+        return;
+    };
+    let n = std::env::var("LIVE_SWEEP_EDITORS").ok().and_then(|n| n.parse().ok()).unwrap_or(3);
+    let mut failed = Vec::new();
+    for seed in from..to {
+        if std::panic::catch_unwind(|| converge_through_pump(n, seed, 150)).is_err() {
+            failed.push(seed);
+        }
+    }
+    assert!(failed.is_empty(), "{n} editors, seeds {from}..{to}: {} failed: {failed:?}", failed.len());
+}
+
 #[test]
 fn joiner_after_save_matches() {
     let relay = relay(None);
@@ -1098,4 +1131,102 @@ fn a_settled_window_goes_on_after_the_room_lost_its_history() {
     settle(&relay, &mut [&mut a]);
     assert!(a.le.take_history_lost(), "told the room lost its history");
     assert!(a.le.editable(), "holding a settled document, it does not wait: {:?}", a.le.status());
+}
+
+/// Select bytes `from..to` of body block `block`.
+fn select_range(ed: &mut Ed, block: usize, from: usize, to: usize) {
+    ed.s.sel = Selection { anchor: Pos::body(block, from), focus: Pos::body(block, to) };
+}
+
+/// Whether every char of `text` in body paragraph `i` of `ed` is bold.
+fn all_bold(ed: &Ed, i: usize, text: &str) -> bool {
+    let p = ed.s.doc.body[i].as_para().unwrap();
+    let Some(from) = p.text.find(text) else { return false };
+    let mut start = 0;
+    p.runs.iter().all(|r| {
+        let (lo, hi) = (start, start + r.len);
+        start = hi;
+        hi <= from || lo >= from + text.len() || r.props.bold == Some(true)
+    })
+}
+
+/// Enter splits a paragraph while another editor edits the part that moves to the new
+/// paragraph: their delete, formatting and typing land in the new paragraph, as if made after.
+/// (A paragraph that starts in lower case is avoided: Enter's sentence capital changes the head
+/// in the same edit, which is then not seen as a split.)
+#[test]
+fn an_edit_in_the_tail_of_a_split_lands_in_the_new_paragraph() {
+    let relay = relay(None);
+    let bytes = file(&["Alpha beta gamma delta", "End of the line"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+
+    // Neither has seen the other's edit when making their own.
+    a.caret(0, 5);
+    assert!(a.run("text.newParagraph", json!({})));
+    select_range(&mut b, 0, 11, 17);
+    assert!(b.run("text.delete", json!({})), "bob deletes \"gamma \"");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "a delete against a split");
+    assert_eq!(texts(&a.s.doc), ["Alpha", " beta delta", "End of the line"], "the delete wins");
+
+    a.caret(1, 1);
+    assert!(a.run("text.newParagraph", json!({})));
+    select_range(&mut b, 1, 1, 5);
+    assert!(b.run("format.bold", json!({})), "bob bolds \"beta\"");
+    b.end_of(1);
+    assert!(b.run("text.insert", json!({"text": "!"})), "bob types at the end");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "formatting and typing against a split");
+    assert_eq!(texts(&a.s.doc), ["Alpha", " ", "beta delta!", "End of the line"], "the typing lands where it was typed");
+    assert!(all_bold(&a, 2, "beta") && all_bold(&b, 2, "beta"), "the formatting is kept");
+
+    // The new paragraph's own typing since the split is followed.
+    a.caret(3, 3);
+    assert!(a.run("text.insert", json!({"text": "X"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    a.caret(3, 2);
+    assert!(a.run("text.newParagraph", json!({})));
+    a.caret(4, 0);
+    assert!(a.run("text.insert", json!({"text": "Y"})));
+    select_range(&mut b, 3, 8, 16);
+    assert!(b.run("text.delete", json!({})), "bob deletes \"the line\"");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "a delete against a split and typing");
+    assert_eq!(texts(&a.s.doc), ["Alpha", " ", "beta delta!", "En", "YdX of "]);
+}
+
+/// The safety net: a window whose body drifted from the shared copy (here, by an edit made
+/// behind the mapping's back) is found out on the periodic check and rebuilt from the shared
+/// copy; a window that did not drift is left alone.
+#[test]
+fn a_drifted_window_is_rebuilt_from_the_shared_copy() {
+    let relay = relay(None);
+    let bytes = file(&["One", "Two"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": "!"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(a.le.drift(&a.s), None, "in step");
+    assert!(!a.le.verify(&mut a.s), "nothing to repair");
+
+    // Behind the mapping's back: an extra paragraph, and other text in a shared one.
+    a.s.apply_remote(|d| {
+        d.body.push(wordcraft_doc::para_block(wordcraft_doc::Paragraph::new()));
+        if let Some(wordcraft_doc::Block::Para(p)) = d.body.get_mut(1).map(std::sync::Arc::make_mut) {
+            p.text = "Changed".into();
+            p.runs.clear();
+        }
+    })
+    .unwrap();
+    assert!(a.le.drift(&a.s).is_some(), "the drift is seen");
+    for _ in 0..wordcraft_live::session::VERIFY_EVERY {
+        a.pump();
+    }
+    assert_eq!(a.le.drift(&a.s), None, "the periodic check rebuilt the body");
+    assert_same(&a, &b, "the window shows the shared document again");
+    assert_eq!(texts(&a.s.doc), ["One!", "Two"]);
 }

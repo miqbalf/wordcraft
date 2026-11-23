@@ -71,8 +71,9 @@ impl Anchor {
 
     /// The same place in `doc`: the same character of the paragraph with the same shared id
     /// (followed through the edit to its text, see [`follow`]); when two paragraphs have that
-    /// id, the one whose text is most like the old one; when that paragraph is gone, the start
-    /// of the paragraph now at the same index. An unshared paragraph (id 0) keeps its path. The
+    /// id, the one whose text is most like the old one; when that paragraph is gone, the paragraph
+    /// now at the same index: at the same character when it starts with the same text up to
+    /// there (the head of a split), otherwise at its start. An unshared paragraph (id 0) keeps its path. The
     /// result is clamped to the document.
     fn find(&self, doc: &Document) -> Pos {
         if self.pid == 0 {
@@ -91,7 +92,14 @@ impl Anchor {
                 Pos::new(self.story, path.clone(), off)
             }
             None => match paths.get(self.index.min(paths.len().saturating_sub(1))) {
-                Some(path) => Pos::new(self.story, path.clone(), 0),
+                // The paragraph now at its index, at the same character when that one starts
+                // with the same text up to it (the head of the paragraph split under it).
+                Some(path) => {
+                    let text = doc.para(self.story, path).map_or("", |p| p.text.as_str());
+                    let same = self.text.chars().zip(text.chars()).take_while(|(a, b)| a == b).count() >= self.chars;
+                    let off = if same { text.char_indices().nth(self.chars).map_or(text.len(), |(i, _)| i) } else { 0 };
+                    Pos::new(self.story, path.clone(), off)
+                }
                 None => doc.start_of(StoryRef::Body),
             },
         };

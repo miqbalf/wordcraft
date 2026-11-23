@@ -50,8 +50,37 @@ fn put<T: Serialize>(attrs: &mut Attributes, key: &str, v: &T) {
     }
 }
 
+/// The largest integer yrs writes as an integer; it writes any other (exactly) as a float.
+const YRS_INT_MAX: f64 = 2_147_483_647.0;
+
+/// `v` with every whole float outside yrs's integer range back as an integer.
+///
+/// yrs encodes an integer outside `±0x7FFFFFFF` as an exact float, and every replica that
+/// decodes it (another peer, a late joiner, the saver's checkpoint) reads it back as a float,
+/// which an integer field refuses: the whole attribute would read as its default there, and that
+/// peer's document would drift from the author's. A float that size is never one of ours, so it
+/// is turned back into the integer it was.
+fn whole_numbers(v: &mut Value) {
+    match v {
+        Value::Number(n) => {
+            if let Some(f) = n.as_f64().filter(|f| n.is_f64() && f.fract() == 0.0 && f.abs() > YRS_INT_MAX) {
+                if (0.0..18_446_744_073_709_551_616.0).contains(&f) {
+                    *v = Value::from(f as u64);
+                } else if (-9_223_372_036_854_775_808.0..0.0).contains(&f) {
+                    *v = Value::from(f as i64);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(whole_numbers),
+        Value::Object(m) => m.values_mut().for_each(whole_numbers),
+        _ => {}
+    }
+}
+
 fn parse<T: DeserializeOwned>(v: &Value, what: &str) -> Option<T> {
-    match serde_json::from_value(v.clone()) {
+    let mut v = v.clone();
+    whole_numbers(&mut v);
+    match serde_json::from_value(v) {
         Ok(t) => Some(t),
         Err(e) => {
             log::warn!("live: shared {what} did not read back: {e}");

@@ -88,6 +88,22 @@ fn observer_sees_every_mutating_command() {
     assert_eq!(calls(&log).len(), n + 1);
 }
 
+/// Moving an empty paragraph past another empty one changes no content, only which shared
+/// paragraph is where: it is still an edit the observer hears (seed 149 of the live fuzz).
+#[test]
+fn swapping_two_equal_paragraphs_is_reported() {
+    let mut s = Session::new(Document::from_text("Top\n\n\nEnd"));
+    share(&mut s);
+    let log = observed(&mut s);
+    let empty = s.doc.para_paths(StoryRef::Body)[1].clone();
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, empty, 0));
+    let before: Vec<u64> = s.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.pid).collect();
+    s.run("para.moveDown", &serde_json::json!({})).unwrap();
+    let after: Vec<u64> = s.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.pid).collect();
+    assert_ne!(before, after, "the two empty paragraphs changed places");
+    assert_eq!(ids(&log), ["para.moveDown"], "and that was reported");
+}
+
 #[test]
 fn repeat_is_reported_once() {
     let mut s = Session::new(Document::new());
@@ -238,6 +254,30 @@ fn apply_remote_keeps_caret_on_same_pid() {
     let now = paths.iter().position(|q| *q == at.path).unwrap();
     assert_eq!(now, index.min(paths.len() - 1), "the caret is on the paragraph now at its index");
     assert_eq!(at.off, 0);
+}
+
+/// A peer splits the caret's paragraph inside its text, which re-adds it as two new shared
+/// paragraphs: a caret in the head keeps its character.
+#[test]
+fn apply_remote_keeps_caret_in_the_head_of_a_split() {
+    let mut s = Session::new(Document::from_text("Alpha beta\nEnd\n"));
+    share(&mut s);
+    let first = s.doc.para_paths(StoryRef::Body)[0].clone();
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, first, 3));
+    s.apply_remote(|d| {
+        if let Ok(body) = d.story_mut(StoryRef::Body) {
+            body.remove(0);
+            for (i, t) in ["Alpha", " beta"].into_iter().enumerate() {
+                let mut p = Paragraph::with_text(t, Default::default());
+                p.pid = 200 + i as u64;
+                body.insert(i, Arc::new(Block::Para(p)));
+            }
+        }
+    })
+    .unwrap();
+    let at = s.sel.focus.clone();
+    let p = s.doc.para_at(&at).unwrap();
+    assert_eq!((p.text.as_str(), &p.text[..at.off]), ("Alpha", "Alp"), "the same character of the head");
 }
 
 #[test]

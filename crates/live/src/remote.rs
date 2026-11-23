@@ -76,37 +76,97 @@ impl LiveMap {
         updates.extend(ops.out.updates);
     }
 
-    /// Carry typing that landed in `old`, a block this peer moved, over to the paragraph it
-    /// moved to: the edit between the old block's text as last forwarded and its text now,
-    /// placed in the moved paragraph by following that one's own edits since.
+    /// Carry what another editor did in `old`, a block this peer moved or split, over to the
+    /// blocks it went to: the edit between the old block's text as last forwarded and its text
+    /// now, and the formatting changed on the chars both keep. Each change goes to the part of
+    /// the old text it falls in, placed by following that block's own edits since. Typing right
+    /// at a split goes to the start of the tail.
     fn forward(&mut self, live: &mut LiveDoc, old: u64, changes: &mut Vec<BlockChange>, updates: &mut Vec<Vec<u8>>) {
         let (Some(tomb), Some(m)) = (live.block(old), self.moved.get(&old).cloned()) else { return };
         let mut ops = Ops::new(live);
-        let mut to = m.to;
-        for _ in 0..REMEMBERED {
-            match self.moved.get(&to).filter(|_| ops.at(to).is_none()) {
-                Some(next) => to = next.to,
-                None => break,
+        let from_len = m.from_text.chars().count();
+        let edit = diff::text_edit(&m.from_text, &tomb.text);
+        let ins_len = edit.as_ref().map_or(0, |e| e.ins.chars().count());
+        // The stretch of the old text each part covers.
+        let spans: Vec<(usize, usize)> =
+            m.parts.iter().enumerate().map(|(i, p)| (p.start, m.parts.get(i + 1).map_or(from_len, |q| q.start).max(p.start))).collect();
+        let mut touched = Vec::new();
+        for (part, (lo, hi)) in m.parts.iter().zip(&spans) {
+            let Some((to, have)) = self.target(&ops, part.to) else {
+                log::warn!("live: an edit made in a moved paragraph was not forwarded: it is gone");
+                continue;
+            };
+            let len = have.text.chars().count();
+            let place = |at: usize| diff::follow(&part.to_text, &have.text, at.saturating_sub(*lo).min(hi - lo)).min(len);
+            if let Some(e) = &edit {
+                let (a, b) = (e.at.clamp(*lo, *hi), (e.at + e.del).clamp(*lo, *hi));
+                let last = spans.last().is_some_and(|s| s == &(*lo, *hi));
+                let takes_ins = !e.ins.is_empty() && e.at >= *lo && (e.at < *hi || last);
+                if a < b || takes_ins {
+                    let at = place(a);
+                    let end = place(b).max(at);
+                    let ins = if takes_ins { e.ins.clone() } else { String::new() };
+                    ops.edit_text(to, &diff::TextEdit { at, del: end - at, ins }, &diff::attrs_at(&tomb.runs, e.at));
+                    touched.push(to);
+                }
+            }
+            // Formatting changed on the chars of this part that the edit kept.
+            let have_now = ops.live.block(to).map(|b| b.text).unwrap_or_default();
+            let mut run: Option<(usize, usize, craft_collab::Attributes)> = None;
+            let mut calls = Vec::new();
+            for c in *lo..*hi {
+                let kept = edit.as_ref().is_none_or(|e| c < e.at || c >= e.at + e.del);
+                let now = match &edit {
+                    Some(e) if c >= e.at + e.del => c + ins_len - e.del,
+                    _ => c,
+                };
+                let p = if kept { diff::delta(&diff::attrs_at(&m.from_runs, c), &diff::attrs_at(&tomb.runs, now)) } else { None };
+                let extends = matches!((&run, &p), (Some((_, e, q)), Some(p)) if *e == c && q == p);
+                match run.as_mut() {
+                    Some((_, e, _)) if extends => *e = c + 1,
+                    _ => {
+                        calls.extend(run.take());
+                        run = p.map(|p| (c, c + 1, p));
+                    }
+                }
+            }
+            calls.extend(run);
+            for (a, b, attrs) in calls {
+                let at = diff::follow(&have.text, &have_now, place(a));
+                let end = diff::follow(&have.text, &have_now, place(b)).max(at);
+                if end > at {
+                    let r = ops.live.format(to, at, end - at, &attrs);
+                    ops.sent(r);
+                    touched.push(to);
+                }
             }
         }
-        let Some(have) = ops.live.block(to).filter(|_| ops.at(to).is_some()) else {
-            log::warn!("live: text typed into a moved paragraph was not forwarded: it is gone");
-            return;
-        };
-        if let Some(e) = diff::text_edit(&m.from_text, &tomb.text) {
-            let len = have.text.chars().count();
-            let at = diff::follow(&m.to_text, &have.text, e.at).min(len);
-            let end = diff::follow(&m.to_text, &have.text, e.at + e.del).clamp(at, len);
-            let attrs = diff::attrs_at(&tomb.runs, e.at);
-            ops.edit_text(to, &diff::TextEdit { at, del: end - at, ins: e.ins }, &attrs);
+        for to in touched.iter().copied().collect::<BTreeSet<u64>>() {
             changes.push(BlockChange::Text { id: to });
         }
-        let to_text = ops.live.block(to).map(|b| b.text).unwrap_or_default();
+        let now: Vec<String> = m.parts.iter().map(|p| self.target(&ops, p.to).map(|(_, b)| b.text).unwrap_or_default()).collect();
         if let Some(entry) = self.moved.get_mut(&old) {
+            for (p, text) in entry.parts.iter_mut().zip(now) {
+                p.start = diff::follow(&m.from_text, &tomb.text, p.start);
+                p.to_text = text;
+            }
             entry.from_text = tomb.text;
-            entry.to_text = to_text;
+            entry.from_runs = tomb.runs;
         }
         updates.extend(ops.out.updates);
+    }
+
+    /// The block in the order that block `id`'s text went to: `id` itself, or where this peer
+    /// moved it (the first part of a split), followed through later moves. With its content.
+    fn target(&self, ops: &Ops, id: u64) -> Option<(u64, SeedBlock)> {
+        let mut to = id;
+        for _ in 0..REMEMBERED {
+            if ops.at(to).is_some() {
+                break;
+            }
+            to = self.moved.get(&to)?.parts.first()?.to;
+        }
+        Some((to, ops.live.block(to).filter(|_| ops.at(to).is_some())?))
     }
 
     /// When `changes` only edit blocks `doc` has, replace just those, without reading the order.

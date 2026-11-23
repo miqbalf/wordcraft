@@ -4,6 +4,15 @@ use super::snapshot_types::RunSnapshot;
 use super::{CharProps, CmdError, Document, EditObserver, Fragment, ImeEditOutcome, Pos, Session, StoryRef, Value, document_id_mark};
 use crate::CommandSpec;
 
+/// Whether two bodies hold their shared paragraphs in the same places. Content equality ignores
+/// a paragraph's id, so a command that only swapped two paragraphs with the same content (two
+/// empty ones) looks like no change at all; the live layer must still hear of it, or the other
+/// editors keep the old order.
+fn same_body_ids(a: &Document, b: &Document) -> bool {
+    a.body.len() == b.body.len()
+        && a.body.iter().zip(&b.body).all(|(x, y)| std::sync::Arc::ptr_eq(x, y) || x.as_para().map(|p| p.pid) == y.as_para().map(|p| p.pid))
+}
+
 struct SuccessContext<'a> {
     id: &'a str,
     spec: &'a CommandSpec,
@@ -96,7 +105,7 @@ impl Session {
         if let Some(before) = &before
             && result.is_ok()
             && self.document_id == home
-            && !before.same_content(&self.doc)
+            && !(before.same_content(&self.doc) && same_body_ids(before, &self.doc))
         {
             // A copy (an edit that cloned a paragraph) is a new paragraph, not a second one
             // with the same identity.

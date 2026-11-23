@@ -76,6 +76,28 @@ pub(crate) fn attrs_at(runs: &[(usize, Attributes)], at: usize) -> Attributes {
     last
 }
 
+/// The runs over chars `from..to` of runs `runs`, in the canonical form (none when no char of
+/// the stretch is formatted).
+pub(crate) fn slice_runs(runs: &[(usize, Attributes)], from: usize, to: usize) -> Vec<(usize, Attributes)> {
+    let mut out: Vec<(usize, Attributes)> = Vec::new();
+    let mut start = 0;
+    for (n, a) in runs {
+        let (lo, hi) = (start.max(from), (start + n).min(to));
+        start += n;
+        if lo >= hi {
+            continue;
+        }
+        match out.last_mut() {
+            Some((m, b)) if b == a => *m += hi - lo,
+            _ => out.push((hi - lo, a.clone())),
+        }
+    }
+    if out.iter().all(|(_, a)| a.is_empty()) {
+        out.clear();
+    }
+    out
+}
+
 /// What turns attributes `have` into `want`: `want`, plus a null for each key only `have` sets.
 fn patch(have: &Attributes, want: &Attributes) -> Attributes {
     let mut out = want.clone();
@@ -83,6 +105,14 @@ fn patch(have: &Attributes, want: &Attributes) -> Attributes {
         out.insert(k.clone(), Value::Null);
     }
     out
+}
+
+/// Only the attributes that differ from `have` to `want`: `want`'s value, or a null where
+/// `want` drops it. `None` when they are the same.
+pub(crate) fn delta(have: &Attributes, want: &Attributes) -> Option<Attributes> {
+    let mut out: Attributes = want.iter().filter(|(k, v)| have.get(*k) != Some(*v)).map(|(k, v)| (k.clone(), v.clone())).collect();
+    out.extend(have.keys().filter(|k| !want.contains_key(*k)).map(|k| (k.clone(), Value::Null)));
+    (!out.is_empty()).then_some(out)
 }
 
 /// `(at, len, attributes)` format calls that turn runs `have` into `want` over `len` chars.
@@ -158,6 +188,14 @@ mod tests {
         assert_eq!(follow("abcdef", "abcdefZ", 3), 3);
         // Deleting around it puts it where the deletion was.
         assert_eq!(follow("abcdef", "af", 3), 1);
+    }
+
+    #[test]
+    fn slice_runs_cuts_and_drops_plain() {
+        let bold: Attributes = [("bold".to_owned(), Value::Bool(true))].into_iter().collect();
+        let runs = vec![(3, Attributes::new()), (4, bold.clone()), (2, Attributes::new())];
+        assert_eq!(slice_runs(&runs, 2, 8), vec![(1, Attributes::new()), (4, bold), (1, Attributes::new())]);
+        assert!(slice_runs(&runs, 0, 3).is_empty(), "a stretch with no formatting has no runs");
     }
 
     #[test]

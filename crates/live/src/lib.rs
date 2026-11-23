@@ -67,12 +67,21 @@
 //! at the same time would both insert one; that is accepted for phase 1.
 //!
 //! A paragraph this peer moved is re-added under a new id (the shared order cannot move a
-//! block). It is not a removal: typing that lands in the old block is forwarded into the moved
-//! paragraph instead, again by this peer only.
+//! block). It is not a removal: typing, deletes and formatting that land in the old block are
+//! forwarded into the moved paragraph instead, again by this peer only.
+//!
+//! A paragraph split inside its text (Enter, or a paste of several lines) is moved the same way,
+//! into two new paragraphs: its head and its tail. The shared document could keep the head in
+//! the old block and move only the tail, but the tail's characters would then be deleted there,
+//! and another editor's concurrent delete or formatting in the tail would land on deleted
+//! characters and be lost (their typing would land at the end of the head). Kept whole, the old
+//! block shows every such edit, and each is forwarded to the part it falls in. A split at the end
+//! of a paragraph moves no text and keeps the paragraph's id.
 //!
 //! The peer remembers the last [`REMEMBERED`] removals and moves; a race against an older one
 //! is not recovered.
 
+mod check;
 mod diff;
 mod local;
 pub mod map;
@@ -204,13 +213,25 @@ impl<V> Bounded<V> {
     }
 }
 
-/// A block this peer moved: re-added as `to`, and the two texts as last forwarded.
+/// A block this peer moved, or split, and re-added as one or more blocks: what it held when it
+/// was last forwarded from, and where each stretch of it went.
 #[derive(Clone, Debug)]
 struct Moved {
-    to: u64,
     /// The old block's text when it was last forwarded from.
     from_text: String,
-    /// The new block's text then.
+    /// Its runs then.
+    from_runs: Vec<(usize, craft_collab::Attributes)>,
+    /// Where its text went, in order: a move has one part, a split two.
+    parts: Vec<Part>,
+}
+
+/// One stretch of a moved block's text and the block it went to.
+#[derive(Clone, Debug)]
+struct Part {
+    /// The first char of the stretch in [`Moved::from_text`]; it runs to the next part's.
+    start: usize,
+    to: u64,
+    /// The new block's text when last forwarded to.
     to_text: String,
 }
 
