@@ -36,10 +36,11 @@ pub struct Services {
     /// Web: hand bytes to the browser as a download. An error means no download started (the
     /// browser can't tell the page whether the user then kept the file).
     pub download: Option<Box<dyn Fn(&str, &[u8]) -> Result<(), String>>>,
-    /// Web: hand bytes to the browser as a plain download (an `<a download>` click), whatever
-    /// page frames the app. A live session that ended keeps the user's edits this way: the host
-    /// page may not store a save.
-    pub download_copy: Option<Box<dyn Fn(&str, &[u8]) -> Result<(), String>>>,
+    /// Web: hand bytes to the browser as a plain download (`craft_web_host::web::download`: an
+    /// `<a download>` click, no network), whatever page frames the app, as `(name, MIME type,
+    /// bytes)`. Every Save As and Export copy goes this way ([`crate::save_as`]), and a live
+    /// session that ended keeps the user's edits this way: the host page never gets a copy.
+    pub download_copy: Option<Box<dyn Fn(&str, &str, &[u8]) -> Result<(), String>>>,
     /// Web: saves that `download` started and that finish later (the browser's save picker,
     /// #1315). The hook starts a ticket for such a save and reports how it ended; until then the
     /// document's save isn't confirmed, and a New/Open held back by the Save Changes prompt waits.
@@ -104,6 +105,9 @@ pub struct Services {
     /// Desktop: the text on the system clipboard, if any. Ctrl+V gets it from egui's paste event;
     /// the ribbon and context-menu Paste read it here (#584).
     pub clipboard_text: Option<Box<dyn Fn() -> Option<String>>>,
+    /// Web: the browser's clipboard, read for the ribbon and context-menu Paste (WA F7), which
+    /// answers later ([`system_clipboard::BrowserClipboard`]). Unused where `clipboard_text` is set.
+    pub browser_clipboard: Option<system_clipboard::BrowserClipboard>,
     /// Desktop: the HTML on the system clipboard — another program's formatted copy (a Word
     /// document, a web page) — if any. Paste keeps its formatting (#687); see [`system_clipboard`].
     pub clipboard_html: Option<Box<dyn Fn() -> Option<String>>>,

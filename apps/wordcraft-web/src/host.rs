@@ -180,10 +180,7 @@ impl Bridge {
             services.hosted = true;
             services.saves_are_copies = true;
             services.host_save = None;
-            services.download = Some(Box::new(|name: &str, bytes: &[u8]| {
-                let window = web_sys::window().ok_or("no window")?;
-                crate::web::trigger_anchor_download(&window, name, bytes)
-            }));
+            services.download = Some(Box::new(|name: &str, bytes: &[u8]| crate::web::anchor_download(name, bytes)));
         } else {
             let bridge = self.clone();
             services.host_save = Some(Box::new(move |name: &str, bytes: &[u8], save_as: bool| bridge.post_save(name, bytes, save_as)));

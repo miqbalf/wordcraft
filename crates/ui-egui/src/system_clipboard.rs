@@ -22,6 +22,49 @@ pub struct CopyImage {
     pub rgba: Vec<u8>,
 }
 
+/// What the browser's clipboard answered a read with (its text; empty when it was empty or the
+/// read was refused); `None` until it answers.
+pub type ClipboardAnswer = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
+/// The param marking a paste whose browser clipboard read has answered.
+const BROWSER_READ: &str = "browserClipboardRead";
+
+/// Web (WA F7): the ribbon and context-menu Paste read the browser's clipboard
+/// (`navigator.clipboard.readText()`), which answers later. `read` starts a read that puts the
+/// answer in the [`ClipboardAnswer`] it is given and wakes the UI; the paste waits meanwhile.
+pub struct BrowserClipboard {
+    read: Box<dyn Fn(ClipboardAnswer)>,
+    answer: ClipboardAnswer,
+    /// The paste command and params waiting for the answer.
+    waiting: Option<(String, Value)>,
+}
+
+impl BrowserClipboard {
+    pub fn new(read: Box<dyn Fn(ClipboardAnswer)>) -> Self {
+        Self { read, answer: ClipboardAnswer::default(), waiting: None }
+    }
+}
+
+impl WordApp {
+    /// Paste what the browser's clipboard answered (every frame): the waiting paste runs with
+    /// its text, or, empty, with WordCraft's own copy.
+    pub fn drain_browser_clipboard(&mut self) {
+        let Some(clipboard) = self.services.browser_clipboard.as_mut() else { return };
+        if clipboard.waiting.is_none() {
+            return;
+        }
+        let Some(text) = clipboard.answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else { return };
+        let Some((id, mut params)) = clipboard.waiting.take() else { return };
+        if let Some(o) = params.as_object_mut() {
+            o.insert(BROWSER_READ.into(), Value::Bool(true));
+            if !text.is_empty() && text.len() <= MAX_PASTE_BYTES {
+                o.insert("text".into(), Value::String(text));
+            }
+        }
+        let _ = self.run(&id, params);
+    }
+}
+
 /// The commands that paste the clipboard.
 pub(crate) fn is_paste(id: &str) -> bool {
     matches!(id, "edit.paste" | "edit.pasteText" | "edit.pasteMerge" | "edit.pasteSpecial")
@@ -39,6 +82,19 @@ const MAX_NAME_CHARS: usize = 60;
 pub(crate) fn fill(app: &mut WordApp, id: &str, params: &mut Value) -> Option<Result<Value, String>> {
     if !is_paste(id) {
         return None;
+    }
+    // Browser: the ribbon's Paste asks the browser's clipboard, which answers later
+    // ([`WordApp::drain_browser_clipboard`] pastes it, marked as already read).
+    let read = params.as_object_mut().is_some_and(|o| o.remove(BROWSER_READ).is_some());
+    if !read
+        && params.get("text").is_none()
+        && app.services.clipboard_text.is_none()
+        && let Some(clipboard) = app.services.browser_clipboard.as_mut()
+    {
+        clipboard.waiting = Some((id.to_string(), params.clone()));
+        *clipboard.answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        (clipboard.read)(clipboard.answer.clone());
+        return Some(Ok(serde_json::json!({"pending": "clipboard"})));
     }
     let o = params.as_object_mut()?;
     // A caller that captured ownership already (Paste Special's dialog) keeps that value.
@@ -294,6 +350,39 @@ mod tests {
         let r = a.run("edit.pasteSpecial", json!({})).unwrap();
         let ids: Vec<&str> = r["formats"].as_array().unwrap().iter().filter_map(|f| f["id"].as_str()).collect();
         assert_eq!(ids, ["html", "text"]);
+    }
+
+    /// Browser (WA F7): the ribbon's Paste has no clipboard text to read at once, so it asks the
+    /// browser (`navigator.clipboard.readText()`), and pastes the answer when it comes. A refused
+    /// or empty read pastes WordCraft's own copy, as before.
+    #[test]
+    fn ribbon_paste_in_a_browser_waits_for_the_clipboard() {
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let asked = reads.clone();
+        let services = Services {
+            browser_clipboard: Some(BrowserClipboard::new(Box::new(move |answer: ClipboardAnswer| {
+                asked.set(asked.get() + 1);
+                *answer.lock().unwrap() = Some(if asked.get() == 1 { "from the browser".into() } else { String::new() });
+            }))),
+            ..Default::default()
+        };
+        let mut a = app(services);
+        let r = a.run("edit.paste", json!({})).unwrap();
+        assert_eq!(r["pending"], "clipboard");
+        assert_eq!(first_para(&a), "", "nothing pasted before the browser answers");
+        a.drain_browser_clipboard();
+        assert_eq!(first_para(&a), "from the browser");
+        assert_eq!(reads.get(), 1, "the answer is pasted, not asked for again");
+        // Ctrl+V's paste event carries its text: no read.
+        a.run("edit.paste", json!({"text": " typed"})).unwrap();
+        assert_eq!(reads.get(), 1);
+        // An empty answer pastes the app's own copy.
+        a.run("select.all", json!({})).unwrap();
+        a.run("edit.copy", json!({})).unwrap();
+        a.run("edit.paste", json!({})).unwrap();
+        a.drain_browser_clipboard();
+        assert_eq!(reads.get(), 2);
+        assert_eq!(first_para(&a), "from the browser typed");
     }
 
     /// RTF is used where the clipboard has no HTML; oversized payloads are dropped, not pasted.

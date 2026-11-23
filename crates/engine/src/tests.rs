@@ -6157,6 +6157,38 @@ fn a_failed_save_leaves_the_save_stamps_untouched() {
     assert!(s.dirty, "still unsaved");
 }
 
+/// Save As = Export (`copy: true`): a copy in any format, the document's own included, is written
+/// and the document stays as it was: its file, its unsaved changes, its password and its stamps.
+/// A password given for the copy encrypts that copy only.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_copy_never_becomes_the_documents_file() {
+    let dir = scratch_dir("save-copy");
+    let own = dir.join("own.docx");
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "draft"}));
+    run(&mut s, "file.save", json!({"path": own.to_string_lossy()}));
+    run(&mut s, "text.insert", json!({"text": " more"}));
+    let core_before = s.doc.core.clone();
+    for name in ["copy.docx", "copy.odt", "copy.rtf", "copy.md", "copy.dotx"] {
+        let copy = dir.join(name);
+        let r = run(&mut s, "file.saveAs", json!({"path": copy.to_string_lossy(), "copy": true}));
+        assert_eq!(r["saved"], true, "{name}");
+        assert!(copy.exists(), "{name}: written");
+        assert_eq!(s.path.as_deref(), Some(own.as_path()), "{name}: the document keeps its file");
+        assert!(s.dirty, "{name}: its changes are still unsaved");
+        assert_eq!(s.doc.core, core_before, "{name}: its stamps are its own");
+    }
+    let locked = dir.join("locked.docx");
+    run(&mut s, "file.saveAs", json!({"path": locked.to_string_lossy(), "copy": true, "password": "pw"}));
+    assert!(crate::io::open_path(&locked).is_err(), "the copy is encrypted");
+    assert!(s.password.is_none(), "the document isn't");
+    // Without `copy`, a Word document is still where the document goes (plain Save of a new file).
+    run(&mut s, "file.saveAs", json!({"path": dir.join("moved.docx").to_string_lossy()}));
+    assert_eq!(s.path.as_deref(), Some(dir.join("moved.docx").as_path()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn html_pictures_load_relative_to_the_file() {

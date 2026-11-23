@@ -305,7 +305,7 @@ fn save_as_template_starts_in_the_templates_folder() {
     typed(&mut a);
     let r = a.run("ui.saveAsTemplate", json!({})).unwrap();
     assert!(own.is_dir(), "the app's templates folder is made on first use");
-    assert_eq!(r["dir"], json!(own.to_string_lossy()));
+    assert_eq!(r["pending"], "saveAs", "the Save As copy waits for the dialog");
     assert_eq!(shown.borrow()[0].0, FileDialogRequest::Save { name: "Document1.dotx".into(), dir: Some(own.to_string_lossy().into_owned()) });
     let path = own.join("Memo.dotx");
     answer(&shown, Some(&path.to_string_lossy()));
@@ -322,7 +322,10 @@ fn save_as_template_starts_in_the_templates_folder() {
     a.run("file.options", json!({"userTemplatesFolder": chosen.to_string_lossy()})).unwrap();
     assert_eq!(a.user_templates_dir(), Some(chosen.clone()));
     a.run("ui.saveAsTemplate", json!({})).unwrap();
-    assert!(matches!(&shown.borrow()[0].0, FileDialogRequest::Save { name, dir: Some(d) } if name == "Memo.dotx" && *d == chosen.to_string_lossy()));
+    assert!(
+        matches!(&shown.borrow()[0].0, FileDialogRequest::Save { name, dir: Some(d) } if name == "Document1.dotx" && *d == chosen.to_string_lossy()),
+        "the template was a copy: the document keeps its name"
+    );
     answer(&shown, None);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -408,11 +411,12 @@ fn save_as_with_a_new_filename_saves_under_it() {
     assert_eq!(a.session.path.as_deref(), Some(picked.as_path()), "the picked filename is the document's path");
     assert!(picked.is_file(), "the file is written under the picked name");
     assert!(saved_text(&picked).contains("original"));
-    // F12 (file.saveAs without a path) lands in the same dialog, suggesting the new name.
+    // F12 (file.saveAs without a path) is Save As = Export: it opens the Save As list, where
+    // every format is a copy, and no dialog yet.
     let r = a.run("file.saveAs", json!({})).unwrap();
-    assert_eq!(r, json!({"saved": false}));
-    assert!(a.file_dialog_open(), "F12's saveAs request opens the dialog");
-    assert_eq!(shown.borrow()[0].0, FileDialogRequest::Save { name: "two.docx".into(), dir: Some(dir.join("sub").to_string_lossy().into_owned()) });
+    assert_eq!(r, json!({"open": "saveAs"}));
+    assert!(!a.file_dialog_open(), "the format is chosen first");
+    assert!(a.ui.backstage && a.ui.backstage_page == "saveAs");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -472,7 +476,7 @@ fn a_second_dialog_while_one_is_open_is_ignored() {
     a.save_as_dialog();
     a.save_as_dialog();
     a.open_dialog();
-    a.export_dialog("pdf");
+    let _ = a.save_as_copy("pdf");
     a.pick_picture();
     assert_eq!(shown.borrow().len(), 1, "only the first dialog was shown");
     answer(&shown, None);
@@ -490,7 +494,7 @@ fn a_second_dialog_while_one_is_open_is_ignored() {
 fn export_pdf_without_a_path_asks_where_to_save() {
     let (mut a, shown) = async_app();
     let r = a.run("file.exportPdf", json!({})).unwrap();
-    assert_eq!(r, json!({"exported": false}));
+    assert_eq!(r, json!({"pending": "saveAs"}));
     assert_eq!(shown.borrow()[0].0, FileDialogRequest::Save { name: format!("{}.pdf", a.title_stem()), dir: None });
     let dir = scratch("export-pdf");
     let picked = dir.join("out.pdf");
@@ -505,7 +509,35 @@ fn export_pdf_without_a_path_asks_where_to_save() {
 /// A synchronous web save failure must not stamp a save that never reached its destination.
 #[test]
 fn failed_web_saves_restore_the_save_stamps() {
-    for id in ["file.save", "file.saveAs"] {
+    // Save As is a copy (`crate::save_as`): a refused copy download leaves the document as it was,
+    // and goes neither to the page nor to the save picker.
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let (downloaded, copied, hosted) = (calls.clone(), calls.clone(), calls.clone());
+    let services = Services {
+        download: Some(Box::new(move |_, _| {
+            downloaded.borrow_mut().push("download");
+            Ok(())
+        })),
+        download_copy: Some(Box::new(move |_: &str, _: &str, _: &[u8]| {
+            copied.borrow_mut().push("copy");
+            Err("download refused".into())
+        })),
+        host_save: Some(Box::new(move |_: &str, _: &[u8], _: bool| {
+            hosted.borrow_mut().push("host");
+            Ok(())
+        })),
+        ..Default::default()
+    };
+    let mut a = WordApp::new(Session::new(wordcraft_doc::Document::from_text(UNSAVED)), services);
+    a.session.path = Some("original.docx".into());
+    a.session.dirty = true;
+    let core_before = a.session.doc.core.clone();
+    assert!(a.run("file.saveAs", json!({"path": "draft.docx"})).is_err());
+    assert_eq!(*calls.borrow(), ["copy"]);
+    assert_eq!(a.session.doc.core, core_before);
+    assert!(a.session.dirty);
+    assert_eq!(a.session.path.as_deref(), Some(std::path::Path::new("original.docx")));
+    for id in ["file.save"] {
         for (name, hosted, dirty, expected_calls) in [
             ("draft.unsupported", false, true, vec![]),
             ("draft.docx", false, true, vec!["download"]),
@@ -572,7 +604,8 @@ fn web_pdf_export_keeps_an_existing_suffix_in_any_case() {
     let downloaded = Rc::new(RefCell::new(Vec::new()));
     let captured = downloaded.clone();
     let services = Services {
-        download: Some(Box::new(move |name, bytes| {
+        download: Some(Box::new(|_, _| Err("an export is a copy: never the save picker".into()))),
+        download_copy: Some(Box::new(move |name: &str, _: &str, bytes: &[u8]| {
             captured.borrow_mut().push((name.to_string(), bytes.starts_with(b"%PDF")));
             Ok(())
         })),
@@ -599,7 +632,8 @@ fn web_pdf_export_keeps_an_existing_suffix_in_any_case() {
     }
 }
 
-/// Open, Save As and Export PNG from the command search (no path) ask for a file the same way.
+/// Open and Export PNG from the command search (no path) ask for a file the same way; Save As
+/// opens the Save As list.
 #[test]
 fn file_commands_without_a_path_ask_for_one() {
     let (mut a, shown) = async_app();
@@ -608,10 +642,9 @@ fn file_commands_without_a_path_ask_for_one() {
     // A second dialog can't open while one is up, so cancel before the next command.
     answer(&shown, None);
     a.poll_file_dialog();
+    // Save As without a path chooses the format first: the Save As list, no dialog yet.
     a.run("file.saveAs", json!({})).unwrap();
-    assert!(matches!(shown.borrow()[0].0, FileDialogRequest::Save { .. }));
-    answer(&shown, None);
-    a.poll_file_dialog();
+    assert!(!a.file_dialog_open() && a.ui.backstage_page == "saveAs");
     a.run("file.exportPng", json!({})).unwrap();
     assert!(matches!(shown.borrow()[0].0, FileDialogRequest::Save { ref name, .. } if name.ends_with(".png")));
 }

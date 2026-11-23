@@ -50,9 +50,9 @@ craft-live-worker = { git = "https://github.com/miqbalf/collab-craft", rev = "75
 craft-codepage = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 craft-metafile = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 # Where Share goes (the Nextcloud page, the Nextcloud desktop client's synced folder, or "No
-# Nextcloud connected"): the miqbalf fork's feat/share-hook, the same rev as craft-web-host in
+# Nextcloud connected"): the miqbalf fork's feat/save-as (adds `export`, Save As = Export), the same rev as craft-web-host in
 # apps/wordcraft-web. std and serde only, so it adds no second copy of a storytold crate.
-craft-share = { git = "https://github.com/miqbalf/craft-libs", rev = "0434267cbc03705d1a4a22986bfc533ae92b812b", version = "0.1.0" }
+craft-share = { git = "https://github.com/miqbalf/craft-libs", rev = "f5a8116c2885800051c06ebb8d466331fa210583", version = "0.1.0" }
 
 # foundation
 kurbo = { version = "0.13", features = ["serde"] }

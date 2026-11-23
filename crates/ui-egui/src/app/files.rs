@@ -306,7 +306,7 @@ impl WordApp {
     }
 
     /// These paths have readers but no writer, so an interactive save needs another format.
-    pub(super) fn legacy_word_path(&self) -> bool {
+    pub(crate) fn legacy_word_path(&self) -> bool {
         self.session
             .path
             .as_ref()

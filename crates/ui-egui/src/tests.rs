@@ -5143,13 +5143,16 @@ fn web_downloads_that_drop_content_leave_the_document_unsaved() {
     for name in ["novel.png", "novel.txt", "novel.md"] {
         let mut a = typed();
         a.services.download = Some(Box::new(|_, _| Ok(())));
-        a.execute("file.saveAs", json!({"path": name})).unwrap();
+        a.execute("file.save", json!({"path": name})).unwrap();
         assert!(a.session.dirty, "{name}");
     }
     for name in ["novel.docx", "novel.docm", "novel.DOTX", "novel.dotm", "novel.odt", "novel.rtf"] {
         let mut a = typed();
         a.services.download = Some(Box::new(|_, _| Ok(())));
+        a.services.download_copy = Some(Box::new(|_: &str, _: &str, _: &[u8]| Ok(())));
         a.execute("file.saveAs", json!({"path": name})).unwrap();
+        assert!(a.session.dirty, "{name}: Save As is a copy, never the document's save");
+        a.execute("file.save", json!({"path": name})).unwrap();
         assert!(!a.session.dirty, "{name}");
     }
 }
@@ -5161,6 +5164,12 @@ fn host_app(fail: bool) -> (WordApp, std::rc::Rc<std::cell::RefCell<Vec<(String,
     let got = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let seen = got.clone();
     a.services.download = Some(Box::new(|_, _| Err("downloads go to the host page".into())));
+    // Save As and exports are copies that download (`crate::save_as`), marked `copy:`.
+    let copies = got.clone();
+    a.services.download_copy = Some(Box::new(move |name: &str, _: &str, bytes: &[u8]| {
+        copies.borrow_mut().push((format!("copy:{name}"), false, bytes.len()));
+        Ok(())
+    }));
     a.services.host_save = Some(Box::new(move |name: &str, bytes: &[u8], save_as: bool| {
         if fail {
             return Err("the page is gone".into());
@@ -5179,8 +5188,8 @@ fn host_open(a: &mut WordApp, name: &str) {
     assert!(a.session.dirty);
 }
 
-/// Save hands the opened file back under its own name and format; Save As says so and
-/// becomes the file the next Save writes.
+/// Save hands the opened file back under its own name and format; Save As is a downloaded copy
+/// the page never gets, and the next Save still writes the opened file.
 #[test]
 fn host_saves_go_back_to_the_opened_file() {
     let (mut a, got) = host_app(false);
@@ -5189,12 +5198,12 @@ fn host_saves_go_back_to_the_opened_file() {
     assert!(!a.session.dirty);
     a.run("text.insert", json!({"text": "More "})).unwrap();
     a.execute("file.saveAs", json!({"path": "report copy.docx"})).unwrap();
-    assert!(!a.session.dirty);
+    assert!(a.session.dirty, "a copy is not a save");
     a.run("text.insert", json!({"text": "Again "})).unwrap();
     a.execute("file.save", json!({})).unwrap();
     let got = got.borrow();
     let calls: Vec<(&str, bool)> = got.iter().map(|(n, s, _)| (n.as_str(), *s)).collect();
-    assert_eq!(calls, [("report.odt", false), ("report copy.docx", true), ("report copy.docx", false)]);
+    assert_eq!(calls, [("report.odt", false), ("copy:report copy.docx", false), ("report.odt", false)]);
     assert!(got.iter().all(|(_, _, len)| *len > 0));
 }
 
@@ -5242,12 +5251,11 @@ fn web_exports_are_named_after_the_document() {
     a.execute("file.exportPdf", json!({})).unwrap();
     a.execute("file.exportPng", json!({})).unwrap();
     let names: Vec<(String, bool)> = got.borrow().iter().map(|(n, s, _)| (n.clone(), *s)).collect();
-    assert_eq!(names, [("report.pdf".to_string(), false), ("report.png".to_string(), false)]);
+    assert_eq!(names, [("copy:report.pdf".to_string(), false), ("copy:report.png".to_string(), false)]);
     assert!(a.session.dirty, "an export is a copy");
 }
 
-/// Save As in a format that doesn't keep everything (File › Export to PDF or Markdown) is a
-/// copy: the host page isn't told the document is now that file.
+/// Save As (File › Export to PDF or Markdown) is a downloaded copy: the host page gets nothing.
 #[test]
 fn host_save_as_a_copy_format_is_not_save_as() {
     let (mut a, got) = host_app(false);
@@ -5255,7 +5263,7 @@ fn host_save_as_a_copy_format_is_not_save_as() {
     a.execute("file.saveAs", json!({"path": "report.pdf"})).unwrap();
     a.execute("file.saveAs", json!({"path": "report.md"})).unwrap();
     let calls: Vec<(String, bool)> = got.borrow().iter().map(|(n, s, _)| (n.clone(), *s)).collect();
-    assert_eq!(calls, [("report.pdf".to_string(), false), ("report.md".to_string(), false)]);
+    assert_eq!(calls, [("copy:report.pdf".to_string(), false), ("copy:report.md".to_string(), false)]);
     assert_eq!(a.session.path.as_deref(), Some(std::path::Path::new("report.docx")));
 }
 
@@ -5286,6 +5294,7 @@ fn confirming_host_app() -> (WordApp, async_saves::AsyncSaves, std::rc::Rc<std::
     }));
     a.services.async_saves = Some(saves.clone());
     a.services.host_confirms_saves = true;
+    a.services.download_copy = Some(Box::new(|_: &str, _: &str, _: &[u8]| Ok(())));
     (a, saves, last, got)
 }
 
@@ -5345,7 +5354,7 @@ fn an_export_to_a_confirming_host_is_never_the_documents_save() {
     let (mut a, saves, last, got) = confirming_host_app();
     host_open(&mut a, "report.docx");
     a.execute("file.exportPdf", json!({})).unwrap();
-    assert_eq!(*got.borrow(), [("report.pdf".to_string(), false)]);
+    assert!(got.borrow().is_empty(), "a copy downloads; the page gets nothing");
     saves.finish(last.get(), async_saves::SaveOutcome::Saved);
     a.settle_async_saves();
     assert!(a.session.dirty);
@@ -5364,7 +5373,7 @@ fn hosted_app(name: &str) -> (WordApp, Handed, Copies) {
     let (h, c) = (handed.clone(), copies.clone());
     a.services.hosted = true;
     a.services.download = Some(Box::new(|_, _| Err("the save picker is never used here".into())));
-    a.services.download_copy = Some(Box::new(move |name: &str, bytes: &[u8]| {
+    a.services.download_copy = Some(Box::new(move |name: &str, _mime: &str, bytes: &[u8]| {
         c.borrow_mut().push((name.to_string(), bytes.to_vec()));
         Ok(())
     }));
@@ -5430,20 +5439,164 @@ fn hosted_save_after_an_export_still_writes_the_opened_file() {
     assert_eq!(*handed.borrow(), [("notes.odt".to_string(), false)]);
 }
 
-/// Hosted Save As (File › Save As, which is File › Export here, and its Word template) and the
-/// Save As key download a copy in the chosen format; nothing overwrites the page's file.
+/// Save As = Export (`crate::save_as`) in a browser, framed by a page that keeps the files
+/// (hosted) or not: every Save As and Export entry point downloads a copy through the browser
+/// download, with the list's name and MIME type; nothing goes to the page or the save picker, and
+/// the document keeps its file, its unsaved changes and its stamps. Save As without a format opens
+/// the Save As list.
 #[test]
-fn hosted_save_as_page_downloads_the_chosen_format() {
-    let (mut a, handed, copies) = hosted_app("plan.docx");
-    crate::backstage::download_copy_as(&mut a, "odt").unwrap();
-    crate::backstage::download_copy_as(&mut a, "md").unwrap();
-    crate::backstage::download_copy_as(&mut a, "dotx").unwrap();
+fn every_save_as_entry_point_downloads_a_copy_in_the_browser() {
+    type Typed = std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>;
+    for hosted in [true, false] {
+        let (mut a, handed) = if hosted {
+            let (a, handed, _) = hosted_app("plan.docx");
+            (a, handed)
+        } else {
+            let mut a = app();
+            a.services.download = Some(Box::new(|_, _| Err("the save picker is never used for a copy".into())));
+            a.session.path = Some("plan.docx".into());
+            a.run("text.insert", json!({"text": "Edited "})).unwrap();
+            (a, Handed::default())
+        };
+        let typed = Typed::default();
+        let t = typed.clone();
+        a.services.download_copy = Some(Box::new(move |name: &str, mime: &str, _: &[u8]| {
+            t.borrow_mut().push((name.to_string(), mime.to_string()));
+            Ok(())
+        }));
+        assert_eq!(
+            crate::save_as::SAVE_AS.plan(a.runtime(), "plan.docx", "Document", "odt").unwrap().delivery,
+            craft_share::export::Delivery::Download
+        );
+        let (path, revision) = (a.session.path.clone(), a.session.doc.core.revision);
+        // The Save As and Export pages' items (and their keytips) call `save_as_copy` itself.
+        a.save_as_copy("odt").unwrap();
+        a.save_as_copy("tex").unwrap();
+        a.save_as_copy(crate::save_as::WORD_2003).unwrap();
+        // Save as Word Template, and the command search / control channel without a path.
+        a.run("ui.saveAsTemplate", json!({})).unwrap();
+        a.run("file.saveTemplate", json!({})).unwrap();
+        a.run("file.exportPdf", json!({})).unwrap();
+        a.execute("file.exportPng", json!({})).unwrap();
+        // A command that asks the UI (`{"open": "exportPdf"}`), and Save these pages as PDF.
+        a.handle_request(&json!({"open": "exportPdf"}));
+        a.print_pdf_dialog();
+        // A script's Save As to a name is a copy too.
+        a.execute("file.saveAs", json!({"path": "plan copy.docx"})).unwrap();
+        let want = [
+            ("plan.odt", "application/vnd.oasis.opendocument.text"),
+            ("plan.tex", "application/x-tex"),
+            ("plan.xml", "application/xml"),
+            ("plan.dotx", "application/vnd.openxmlformats-officedocument.wordprocessingml.template"),
+            ("plan.dotx", "application/vnd.openxmlformats-officedocument.wordprocessingml.template"),
+            ("plan.pdf", "application/pdf"),
+            ("plan.png", "image/png"),
+            ("plan.pdf", "application/pdf"),
+            ("plan.pdf", "application/pdf"),
+            ("plan copy.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ];
+        assert_eq!(*typed.borrow(), want.map(|(n, m)| (n.to_string(), m.to_string())), "hosted {hosted}");
+        // F12 / Cmd+Shift+S (`file.saveAs` without a path) open the Save As list; nothing downloads.
+        a.ui.backstage = false;
+        let r = a.run("file.saveAs", json!({})).unwrap();
+        assert_eq!(r["open"], "saveAs");
+        assert!(a.ui.backstage && a.ui.backstage_page == "saveAs", "hosted {hosted}: the Save As list");
+        assert_eq!(typed.borrow().len(), want.len());
+        assert!(handed.borrow().is_empty(), "hosted {hosted}: nothing reaches the page: {:?}", handed.borrow());
+        assert_eq!(a.session.path, path, "hosted {hosted}: Save As never re-points the document");
+        assert!(a.session.dirty, "hosted {hosted}: a copy is not a save");
+        assert_eq!(a.session.doc.core.revision, revision, "hosted {hosted}: nor stamped as one");
+    }
+}
+
+/// Save As = Export on the desktop: every entry point asks with the Save dialog under the list's
+/// name and writes a copy there; the document keeps its file, unsaved changes and stamps, and the
+/// window stays on it. A name the dialog never confirmed that exists is refused, not overwritten.
+#[test]
+fn every_save_as_entry_point_writes_a_copy_on_the_desktop() {
+    let dir = std::env::temp_dir().join(format!("wordcraft-ui-save-as-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let (q, folder) = (asked.clone(), dir.clone());
+    let mut a = app();
+    a.services.pick_save = Some(Box::new(move |name: &str| {
+        q.borrow_mut().push(name.to_string());
+        Some(folder.join(name).to_string_lossy().into_owned())
+    }));
+    let own = dir.join("plan.docx");
+    a.run("text.insert", json!({"text": "Plan"})).unwrap();
+    a.run("file.save", json!({"path": own.to_string_lossy()})).unwrap();
+    a.run("text.insert", json!({"text": " edited"})).unwrap();
+    assert_eq!(a.runtime(), craft_share::export::Runtime::Desktop);
+    assert_eq!(crate::save_as::SAVE_AS.plan(a.runtime(), "plan", "Document", "odt").unwrap().delivery, craft_share::export::Delivery::SaveDialog);
+    let (document, revision) = (a.session.document_id(), a.session.doc.core.revision);
+    a.save_as_copy("odt").unwrap();
+    a.save_as_copy("docx").unwrap();
+    a.run("ui.saveAsTemplate", json!({})).unwrap();
+    a.run("file.exportPdf", json!({})).unwrap();
+    a.run("file.exportPng", json!({})).unwrap();
+    a.print_pdf_dialog();
+    assert_eq!(*asked.borrow(), ["plan.odt", "plan.docx", "plan.dotx", "plan.pdf", "plan.png", "plan.pdf"]);
+    for name in ["plan.odt", "plan.dotx", "plan.pdf", "plan.png"] {
+        assert!(dir.join(name).is_file(), "{name} written");
+    }
+    assert_eq!(a.session.path.as_deref(), Some(own.as_path()), "the window stays on the document's file");
+    assert_eq!(a.session.document_id(), document);
+    assert!(a.session.dirty, "a copy is not a save");
+    assert_eq!(a.session.doc.core.revision, revision);
+    // A picked name without the format's extension gets it; if that name exists, the dialog never
+    // confirmed it: refused, the file left alone.
+    let before = std::fs::read(dir.join("plan.odt")).unwrap();
+    let r = a.finish_pick(crate::file_dialogs::AfterPick::Export { ext: "odt".into() }, Some(dir.join("plan").to_string_lossy().into_owned()));
+    assert!(r.is_err() && a.export_error.contains("already exists"), "{r:?}");
+    assert_eq!(std::fs::read(dir.join("plan.odt")).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A plain Save of a document without a file still asks where and makes that file the
+/// document's: that is Save, not Save As.
+#[test]
+fn saving_an_untitled_document_still_makes_its_file() {
+    let dir = std::env::temp_dir().join(format!("wordcraft-ui-untitled-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("new.docx");
+    let mut a = typed();
+    let t = target.clone();
+    a.services.pick_save = Some(Box::new(move |_: &str| Some(t.to_string_lossy().into_owned())));
+    a.ui.backstage = true;
+    crate::backstage::go_to_page(&mut a, "save");
+    assert!(a.ui.backstage_page == "saveAs" && a.needs_a_file_to_save(), "the Save As page offers Save's Browse…");
     a.save_as_dialog();
-    a.run("file.saveAs", json!({})).unwrap();
-    assert_eq!(copy_names(&copies), ["plan.odt", "plan.md", "plan.dotx", "plan.docx", "plan.docx"]);
-    assert!(handed.borrow().is_empty(), "{:?}", handed.borrow());
-    assert_eq!(a.session.path.as_deref(), Some(std::path::Path::new("plan.docx")));
-    assert!(a.session.dirty);
+    assert_eq!(a.session.path.as_deref(), Some(target.as_path()));
+    assert!(!a.session.dirty);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// WA F6: a browser page hides what only the desktop can do (Check for Updates, New Window,
+/// Arrange All, Side by Side, Insert › Object, the Zotero tab); the desktop keeps them.
+#[test]
+fn a_browser_hides_the_desktop_only_commands() {
+    let ids = ["ui.checkForUpdates", "view.newWindow", "view.arrangeAll", "view.sideBySide", "insert.object", "ui.zotero.addEditCitation"];
+    let desktop = app();
+    assert!(ids.iter().all(|id| !desktop.browser_hides(id)));
+    let mut web = app();
+    web.services.download_copy = Some(Box::new(|_: &str, _: &str, _: &[u8]| Ok(())));
+    assert!(ids.iter().all(|id| web.browser_hides(id)));
+    assert!(!web.browser_hides("view.split") && !web.browser_hides("edit.paste"), "the rest stays");
+    for (a, shown) in [(app(), true), (web, false)] {
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        h.run_steps(3);
+        assert_eq!(h.query_by_label("Zotero").is_some(), shown, "the Zotero tab");
+    }
 }
 
 /// Hosted, New, Open and Close are the page's: hidden, refused with a reason, and a dropped
@@ -6229,9 +6382,10 @@ fn autosave_is_blocked_with_a_reason_for_files_it_cannot_keep() {
     assert!(a.run("file.autosave", json!({"value": false})).is_ok(), "turning it off always works");
     a.autosave = true;
 
-    // Save As .docx (what the greyed switch offers) lifts the block.
+    // Saving it as .docx (what the greyed switch offers: Save's own dialog, `save_as`) lifts the
+    // block. Save As is a copy and never re-points the document.
     let docx = dir.join("notes.docx");
-    a.run("file.saveAs", json!({"path": docx.to_string_lossy()})).unwrap();
+    a.run("file.save", json!({"path": docx.to_string_lossy()})).unwrap();
     assert_eq!(a.autosave_block(), None);
     assert!(a.autosaves());
     a.run("text.insert", json!({"text": "More "})).unwrap();
@@ -6310,10 +6464,14 @@ fn web_save_keeps_the_opened_word_format() {
     let related = "http://schemas.microsoft.com/office/2006/relationships/wordVbaData\tword/vbaData.xml\tapplication/vnd.ms-word.vbaData+xml\n";
     doc.passthrough.insert("wordcraft:vbaProject.related".into(), std::sync::Arc::new(related.as_bytes().to_vec()));
     let got: std::rc::Rc<std::cell::RefCell<Vec<(String, Vec<u8>)>>> = Default::default();
-    let sink = got.clone();
+    let (sink, copies) = (got.clone(), got.clone());
     let services = Services {
         download: Some(Box::new(move |n: &str, b: &[u8]| {
             sink.borrow_mut().push((n.to_string(), b.to_vec()));
+            Ok(())
+        })),
+        download_copy: Some(Box::new(move |n: &str, _: &str, b: &[u8]| {
+            copies.borrow_mut().push((n.to_string(), b.to_vec()));
             Ok(())
         })),
         ..Default::default()
@@ -6332,7 +6490,7 @@ fn web_save_keeps_the_opened_word_format() {
             assert_eq!(back.passthrough.contains_key(part), macros, "{opened}: {part}");
         }
     }
-    // Save As with an explicit name is a conversion: a .docx can't hold macros.
+    // Save As with an explicit name is a converted copy: a .docx can't hold macros.
     a.session.path = Some("m.docm".into());
     a.run("file.saveAs", json!({"path": "m.docx"})).unwrap();
     let (name, bytes) = got.borrow_mut().pop().unwrap();

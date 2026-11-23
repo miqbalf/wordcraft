@@ -228,6 +228,8 @@ fn handle_in(app: &mut WordApp, doc: u64, method: &str, p: &Value) -> Outcome {
                     return err(e);
                 }
             }
+            // Save As = Export: a Save As or export to a path writes a copy; the document keeps its file.
+            let params = crate::save_as::as_copy(id, params);
             let r = app.session.with_document(doc, |s| s.run(id, &params));
             // UI requests the command made carry `document`, so the window can tell they aren't
             // about the document it shows.

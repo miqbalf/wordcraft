@@ -39,7 +39,8 @@ pub const ENDED_UNSAVED: &str = "Live editing ended. Download a copy to keep you
 pub const ENDED_UNSAVED_BECAUSE: &str = "Live editing ended. Download a copy to keep your changes, then reopen the file. {reason}";
 /// Live, but no document service is in the room: nothing saves the edits.
 pub const NOT_SAVING: &str = "Changes are not being saved right now. Download a copy to keep them.";
-/// Save and Save As while live: the document service writes the file for everyone.
+/// Plain Save while live: the document service writes the file for everyone. Save As and the
+/// exports are copies and always work ([`crate::save_as`]).
 pub const SAVED_FOR_YOU: &str = "While the file is edited live, it is saved for everyone automatically.";
 /// The notice when another document is shown in the window and the live link stops.
 pub const LEFT_LIVE: &str = "Another document is shown, so this file is no longer edited live here. Reopen the file to edit it live.";
@@ -250,19 +251,13 @@ impl WordApp {
     /// because the host page may not keep a save. The browser can't say whether the user kept
     /// it, so the document stays unsaved and the leave guard stays on. `None` for anything else.
     ///
-    /// Hosted (`Services::hosted`), a copy downloads in every live state, as it writes nothing
-    /// shared: Save As without a name is this copy, and one with a name (Export, the Save As page)
-    /// goes on to the web save, which downloads it in its own format.
+    /// While the service still saves, Save As without a name opens the Save As list like
+    /// anywhere else, and every copy downloads in its own format ([`crate::save_as`]).
     pub(crate) fn live_copy(&mut self, id: &str, params: &Value) -> Option<Result<Value, String>> {
-        if id != "file.saveAs" || self.live_link().is_none() {
+        if id != "file.saveAs" || self.live_link().is_none() || params.get("path").and_then(Value::as_str).is_some() {
             return None;
         }
-        let hosted = self.services.hosted;
-        if hosted && params.get("path").and_then(Value::as_str).is_some() {
-            return None;
-        }
-        let saving = self.live_saves();
-        if saving && !hosted {
+        if self.live_saves() {
             return None;
         }
         let file =
@@ -270,13 +265,9 @@ impl WordApp {
         let name = copy_name(&file, &crate::local_time::file_stamp(unix_secs()));
         let delivered = wordcraft_engine::io::save_bytes(&name, &self.session.doc).and_then(|bytes| {
             let download = self.services.download_copy.as_ref().ok_or_else(|| "this window can't download files".to_owned())?;
-            download(&name, &bytes).map(|()| bytes.len())
+            download(&name, crate::save_as::mime_of(&name), &bytes).map(|()| bytes.len())
         });
         Some(match delivered {
-            Ok(bytes) if saving => {
-                self.status(i18n::fmt(tl!("Downloaded {name}"), &[("name", &name)]));
-                Ok(serde_json::json!({"downloaded": name, "bytes": bytes, "copy": true}))
-            }
             Ok(bytes) => {
                 self.status_long(tl!(COPY_DOWNLOADED));
                 Ok(serde_json::json!({"downloaded": name, "bytes": bytes, "copy": true}))
@@ -328,11 +319,12 @@ impl WordApp {
     pub(crate) fn live_allows(&self, id: &str) -> bool {
         match &self.live {
             None => true,
-            // Saving over the file would race the document service's saves. A copy is refused
-            // while the service saves, and is how edits are kept once the link has ended.
+            // Saving over the file would race the document service's saves. Save As and the
+            // exports are copies (`crate::save_as`): they write nothing shared, so they always run,
+            // and are how edits are kept once the link has ended.
             Some(LiveMode::Linked(link)) => match id {
                 "file.save" => false,
-                "file.saveAs" => self.services.hosted || !self.live_saves(),
+                "file.saveAs" | "file.exportPdf" | "file.exportPng" | "file.saveTemplate" | "file.printPdf" => true,
                 _ => link.editing.allows(id),
             },
             Some(LiveMode::Newer) => self.session.registry.get(id).is_none_or(|spec| !spec.mutates),

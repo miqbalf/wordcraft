@@ -71,6 +71,7 @@ pub mod ribbon;
 pub mod ribbon_fit;
 pub mod rtl;
 pub mod ruler_tabs;
+pub mod save_as;
 pub mod scroll;
 pub use scroll::ScrollSpeed;
 pub mod system_clipboard;

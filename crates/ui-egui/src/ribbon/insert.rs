@@ -194,7 +194,10 @@ pub(super) fn insert(app: &mut WordApp, ui: &mut Ui) {
         stack(ui, |ui| {
             small(ui, app, "signature", None, "Signature Line", crate::widgets::ButtonAction::new("insert.signatureLine", json!({}), false));
             small(ui, app, "dateTime", None, "Date & Time", crate::widgets::ButtonAction::new("ui.dialog", json!({"name": "dateTime"}), false));
-            small(ui, app, "object", None, "Object", crate::widgets::ButtonAction::new("insert.object", json!({}), false));
+            // Object inserts the text of a file by its path, which a browser page can't give.
+            if !app.browser_hides("insert.object") {
+                small(ui, app, "object", None, "Object", crate::widgets::ButtonAction::new("insert.object", json!({}), false));
+            }
         });
     });
     group(ui, "Symbols", None, app, |ui, app| {

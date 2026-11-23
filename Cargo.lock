@@ -1594,7 +1594,7 @@ dependencies = [
 [[package]]
 name = "craft-share"
 version = "0.1.0"
-source = "git+https://github.com/miqbalf/craft-libs?rev=0434267cbc03705d1a4a22986bfc533ae92b812b#0434267cbc03705d1a4a22986bfc533ae92b812b"
+source = "git+https://github.com/miqbalf/craft-libs?rev=f5a8116c2885800051c06ebb8d466331fa210583#f5a8116c2885800051c06ebb8d466331fa210583"
 dependencies = [
  "serde",
 ]
@@ -1679,7 +1679,7 @@ dependencies = [
 [[package]]
 name = "craft-web-host"
 version = "0.1.0"
-source = "git+https://github.com/miqbalf/craft-libs?rev=0434267cbc03705d1a4a22986bfc533ae92b812b#0434267cbc03705d1a4a22986bfc533ae92b812b"
+source = "git+https://github.com/miqbalf/craft-libs?rev=f5a8116c2885800051c06ebb8d466331fa210583#f5a8116c2885800051c06ebb8d466331fa210583"
 dependencies = [
  "serde_json",
  "wasm-bindgen",

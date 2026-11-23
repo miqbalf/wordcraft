@@ -549,7 +549,8 @@ pub(crate) fn your_languages_section(app: &mut WordApp, ui: &mut Ui) {
     );
     ui.add_space(4.0);
     let backend = packs::backend();
-    if backend.is_none() {
+    // The browser has no Language packs: nothing to say about them there.
+    if backend.is_none() && !app.in_browser() {
         let why = if cfg!(target_arch = "wasm32") {
             tl!("Language packs aren't available in the browser.")
         } else {

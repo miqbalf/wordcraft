@@ -422,7 +422,7 @@ fn save_as_after_the_link_broke_downloads_a_copy_and_stays_unsaved() {
     let hosted = Rc::new(Cell::new(0));
     let downloads = Rc::new(Cell::new(0));
     let (c, hs, d) = (Rc::clone(&copies), Rc::clone(&hosted), Rc::clone(&downloads));
-    services.download_copy = Some(Box::new(move |name: &str, bytes: &[u8]| {
+    services.download_copy = Some(Box::new(move |name: &str, _mime: &str, bytes: &[u8]| {
         c.borrow_mut().push((name.to_owned(), bytes.len()));
         Ok(())
     }));
@@ -474,7 +474,7 @@ fn the_service_ending_the_session_ends_the_link_and_allows_a_copy() {
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
     type_text(&mut h, "X");
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
-    assert!(!wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "no copy while the service saves");
+    assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "Save As is a copy: it works while the service saves");
     let reason = "Saving has stopped: your changes are no longer being saved to the file. Download a copy to keep your work.";
     service_says(&mut service, "ended", json!({ "reason": reason }));
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
@@ -523,7 +523,7 @@ fn a_page_that_keeps_no_saves_gets_a_download_and_the_document_stays_unsaved() {
     let (c, p, q) = (Rc::clone(&copies), Rc::clone(&posted), Rc::clone(&posted));
     let services = Services {
         saves_are_copies: true,
-        download_copy: Some(Box::new(move |name: &str, _: &[u8]| {
+        download_copy: Some(Box::new(move |name: &str, _: &str, _: &[u8]| {
             c.borrow_mut().push(name.to_owned());
             Ok(())
         })),
@@ -543,8 +543,8 @@ fn a_page_that_keeps_no_saves_gets_a_download_and_the_document_stays_unsaved() {
     app.ui.language = "en".into();
     assert!(app.run("text.insert", json!({"text": "X"})).is_ok());
     assert!(app.session.dirty);
-    for id in ["file.save", "file.saveAs", "file.exportPdf"] {
-        let r = app.run(id, json!({}));
+    for (id, params) in [("file.save", json!({})), ("file.saveAs", json!({"path": "plan.odt"})), ("file.exportPdf", json!({}))] {
+        let r = app.run(id, params);
         assert!(r.is_ok(), "{id}: {r:?}");
     }
     assert_eq!(copies.borrow().len(), 3, "each one downloads: {:?}", copies.borrow());
@@ -563,7 +563,8 @@ fn a_room_with_no_document_service_says_nothing_is_saved_and_allows_a_copy() {
     h.state_mut().live_set_session_clock(Box::new(move || *clock.lock().unwrap()));
     settle(&relay, &mut h, &mut bob);
     assert!(matches!(status(&h), LiveStatus::Live { .. }));
-    assert!(!wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "the service may still be on its way");
+    assert!(!has_label(&h, NOT_SAVING), "the service may still be on its way");
+    assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "Save As is a copy: always allowed");
     *now.lock().unwrap() = 16_000.0;
     settle(&relay, &mut h, &mut bob);
     assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "nothing saves the edits: a copy keeps them");
@@ -574,13 +575,13 @@ fn a_room_with_no_document_service_says_nothing_is_saved_and_allows_a_copy() {
     let le = LiveEditing::start(service_hub.clone(), ROOM, &file(), "plan.docx", &mut s).unwrap();
     let mut service = Bob { s, le };
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
-    assert!(!wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"));
+    assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"));
     assert!(!has_label(&h, NOT_SAVING));
     // It leaves: counted again from then.
     relay.drop_link(&service_hub);
     *now.lock().unwrap() = 20_000.0;
     settle(&relay, &mut h, &mut bob);
-    assert!(!wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "within the wait");
+    assert!(!has_label(&h, NOT_SAVING), "within the wait");
     *now.lock().unwrap() = 36_000.0;
     settle(&relay, &mut h, &mut bob);
     assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"));
@@ -595,7 +596,7 @@ fn hosted() -> (Services, Rc<RefCell<Vec<String>>>, Rc<Cell<usize>>) {
     let (c, p, d) = (Rc::clone(&copies), Rc::clone(&other), Rc::clone(&other));
     let services = Services {
         hosted: true,
-        download_copy: Some(Box::new(move |name: &str, _: &[u8]| {
+        download_copy: Some(Box::new(move |name: &str, _: &str, _: &[u8]| {
             c.borrow_mut().push(name.to_owned());
             Ok(())
         })),
@@ -623,16 +624,14 @@ fn hosted_copies_download_in_their_format_while_live_and_after_the_link_ends() {
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
     assert!(matches!(status(&h), LiveStatus::Live { .. }), "the service saves the file");
     assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "file.saveAs"), "a copy writes nothing shared");
-    for (id, params) in [("file.saveAs", json!({"path": "plan.pdf"})), ("file.exportPng", json!({})), ("file.saveAs", json!({}))] {
+    for (id, params) in [("file.saveAs", json!({"path": "plan.pdf"})), ("file.exportPng", json!({}))] {
         let r = h.state_mut().run(id, params);
         assert!(r.is_ok(), "{id}: {r:?}");
     }
+    // Save As without a format opens the Save As list, with no refusal.
+    assert_eq!(h.state_mut().run("file.saveAs", json!({})).map(|r| r["open"].clone()), Ok(json!("saveAs")));
     assert_eq!(h.state_mut().run("file.save", json!({})), Err(SAVED_FOR_YOU.to_string()), "Save stays the service's");
-    {
-        let copies = copies.borrow();
-        assert_eq!(copies[..2], ["plan.pdf".to_string(), "plan.png".to_string()]);
-        assert!(copies[2].starts_with("plan (my copy ") && copies[2].ends_with(").docx"), "{copies:?}");
-    }
+    assert_eq!(*copies.borrow(), ["plan.pdf".to_string(), "plan.png".to_string()]);
     assert!(matches!(status(&h), LiveStatus::Live { .. }), "copies don't touch the link");
 
     assert!(h.state_mut().live_end("The live session was restarted. Reopen the file."));
@@ -642,17 +641,30 @@ fn hosted_copies_download_in_their_format_while_live_and_after_the_link_ends() {
     assert_eq!(other.get(), 0, "nothing went to the page or the save picker");
 }
 
+/// Live, framed by the page (hosted) or a plain browser page, the Save As page lists every
+/// format with no refusal, and a click downloads that copy; nothing goes to the page.
 #[test]
 fn hosted_save_as_page_while_live_offers_the_export_formats_and_no_refusal() {
+    for framed in [true, false] {
+        save_as_page_while_live(framed);
+    }
+}
+
+fn save_as_page_while_live(framed: bool) {
     let relay = MemRelay::new();
     let mut bob = Bob::join(&relay);
     let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
-    let (services, copies, other) = hosted();
+    let (mut services, copies, other) = hosted();
+    services.hosted = framed;
+    if !framed {
+        services.host_save = None;
+    }
     let (mut h, _hub) = alice_with(&relay, Access::Edit, true, services);
     settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
     h.state_mut().run("ui.backstage", json!({"value": true, "page": "saveAs"})).unwrap();
     h.step();
     h.step();
+    assert!(matches!(status(&h), LiveStatus::Live { .. }), "the service saves the file");
     assert!(!has_label(&h, SAVED_FOR_YOU), "no refusal on the page");
     assert!(!has_label(&h, "Browse…"));
     for label in ["Word document (*.docx)", "OpenDocument Text (*.odt)", "PDF document (*.pdf)", "Word template (*.dotx)"] {

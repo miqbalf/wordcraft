@@ -373,6 +373,7 @@ impl WordApp {
         self.window_work(ctx);
         self.drain_inbox();
         self.drain_pasted();
+        self.drain_browser_clipboard();
         self.watch_fonts(ctx);
         // A script, an agent or a later result may have made another document the active one.
         self.sync_document();

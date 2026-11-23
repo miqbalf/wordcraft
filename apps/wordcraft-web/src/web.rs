@@ -288,7 +288,12 @@ fn services(inbox: Inbox, ctx: egui::Context, dirty: Rc<Cell<bool>>, saves: Asyn
     let save_ctx = ctx.clone();
     let font_ctx = ctx.clone();
     let font_messages = messages.clone();
+    let clipboard_ctx = ctx.clone();
     Services {
+        // The ribbon and context-menu Paste read the browser's clipboard (WA F7).
+        browser_clipboard: Some(wordcraft_ui_egui::system_clipboard::BrowserClipboard::new(Box::new(move |answer| {
+            read_clipboard_text(answer, clipboard_ctx.clone())
+        }))),
         open_async: Some(Box::new(move |purpose: &str| {
             let inbox = open_inbox.clone();
             let ctx = ctx.clone();
@@ -324,11 +329,9 @@ fn services(inbox: Inbox, ctx: egui::Context, dirty: Rc<Cell<bool>>, saves: Asyn
         pick_save: Some(Box::new(|name: &str| Some(name.to_string()))),
         async_saves: Some(saves.clone()),
         download: Some(Box::new(move |path: &str, bytes: &[u8]| download(&saves, &save_ctx, path, bytes))),
-        // A live copy always downloads here, framed or not (`live` in wordcraft-ui-egui).
-        download_copy: Some(Box::new(|name: &str, bytes: &[u8]| {
-            let window = web_sys::window().ok_or("no window")?;
-            trigger_anchor_download(&window, name, bytes)
-        })),
+        // Save As / Export copies and a live copy always download here, framed or not, and never
+        // go to a host page (`save_as` and `live` in wordcraft-ui-egui).
+        download_copy: Some(Box::new(|name: &str, mime: &str, bytes: &[u8]| craft_web_host::web::download(name, mime, bytes))),
         print: Some(Box::new(print_pdf)),
         inbox: Some(inbox),
         on_dirty: Some(Box::new(move |d| dirty.set(d))),
@@ -490,7 +493,7 @@ fn download(saves: &AsyncSaves, ctx: &egui::Context, path: &str, bytes: &[u8]) -
     }
 
     // Fallback for browsers without showSaveFilePicker (e.g. Firefox, Safari):
-    trigger_anchor_download(&window, &name, bytes)
+    anchor_download(&name, bytes)
 }
 
 fn trigger_save_file_picker(
@@ -504,7 +507,7 @@ fn trigger_save_file_picker(
     let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
     let ext = std::path::Path::new(name).extension().and_then(std::ffi::OsStr::to_str).unwrap_or("docx").to_ascii_lowercase();
     let dot_ext = format!(".{ext}");
-    let mime = mime_for(name);
+    let mime = wordcraft_ui_egui::save_as::mime_of(name);
 
     let accept_obj = js_sys::Object::new();
     let exts_arr = js_sys::Array::new();
@@ -535,7 +538,6 @@ fn trigger_save_file_picker(
     let prom: js_sys::Promise = prom_val.dyn_into().map_err(|_| "not a promise".to_string())?;
 
     let bytes_vec = bytes.to_vec();
-    let window = window.clone();
     let saves = saves.clone();
     let ctx = ctx.clone();
     let name = name.to_string();
@@ -560,7 +562,7 @@ fn trigger_save_file_picker(
                 // A browser can expose the picker but reject its promise (for example in
                 // a cross-origin iframe). Use the same download path as an absent API;
                 // cancelling a picker must never start an unwanted download (#1246).
-                crate::save_fallback::picker_rejected(&err_name, || trigger_anchor_download(&window, &name, &bytes_vec))
+                crate::save_fallback::picker_rejected(&err_name, || anchor_download(&name, &bytes_vec))
             }
         };
         saves.finish(ticket, outcome);
@@ -595,28 +597,38 @@ async fn write_file_handle(handle: &wasm_bindgen::JsValue, bytes: &[u8]) -> Resu
     Ok(())
 }
 
-pub(crate) fn trigger_anchor_download(window: &web_sys::Window, name: &str, bytes: &[u8]) -> Result<(), String> {
-    let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
-    let document = window.document().ok_or("no document")?;
-    let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
-    let opts = web_sys::BlobPropertyBag::new();
-    opts.set_type(mime_for(name));
-    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts).map_err(js)?;
-    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(js)?;
-    let a: web_sys::HtmlAnchorElement = document.create_element("a").map_err(js)?.dyn_into().map_err(|_| "not an anchor".to_string())?;
-    a.set_href(&url);
-    a.set_download(name);
-    a.style().set_property("display", "none").map_err(js)?;
-    let body = document.body().ok_or("no body")?;
-    body.append_child(&a).map_err(js)?;
-    a.click();
-    a.remove();
-    // Revoke after the click has been dispatched; the download keeps its own reference.
-    let revoke = wasm_bindgen::closure::Closure::once_into_js(move || {
-        web_sys::Url::revoke_object_url(&url).ok();
+/// Read the browser's clipboard text (`navigator.clipboard.readText()`) into `answer` and wake
+/// the app; a browser without it, or a refused read, answers empty (the app's own copy pastes).
+fn read_clipboard_text(answer: wordcraft_ui_egui::system_clipboard::ClipboardAnswer, ctx: egui::Context) {
+    let get = |target: &wasm_bindgen::JsValue, key: &str| js_sys::Reflect::get(target, &wasm_bindgen::JsValue::from_str(key)).ok();
+    let promise = web_sys::window()
+        .and_then(|w| get(&w, "navigator"))
+        .and_then(|n| get(&n, "clipboard"))
+        .filter(|c| !c.is_undefined() && !c.is_null())
+        .and_then(|c| {
+            let read = get(&c, "readText")?.dyn_into::<js_sys::Function>().ok()?;
+            read.call0(&c).ok()?.dyn_into::<js_sys::Promise>().ok()
+        });
+    wasm_bindgen_futures::spawn_local(async move {
+        let text = match promise {
+            Some(p) => match wasm_bindgen_futures::JsFuture::from(p).await {
+                Ok(v) => v.as_string().unwrap_or_default(),
+                Err(e) => {
+                    log::warn!("the browser refused to read the clipboard: {e:?}");
+                    String::new()
+                }
+            },
+            None => String::new(),
+        };
+        *answer.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text);
+        ctx.request_repaint();
     });
-    window.set_timeout_with_callback_and_timeout_and_arguments_0(revoke.unchecked_ref(), 10_000).map_err(js)?;
-    Ok(())
+}
+
+/// A plain browser download of `bytes` named `name` (craft-web-host's `<a download>`, no
+/// network), typed by its extension.
+pub(crate) fn anchor_download(name: &str, bytes: &[u8]) -> Result<(), String> {
+    craft_web_host::web::download(name, wordcraft_ui_egui::save_as::mime_of(name), bytes)
 }
 
 /// The hidden iframe the last print loaded its PDF into.
@@ -685,23 +697,4 @@ fn print_pdf(bytes: &[u8]) -> Result<(), String> {
     iframe.set_onload(Some(on_load.unchecked_ref()));
     iframe.set_src(&url);
     Ok(())
-}
-
-fn mime_for(name: &str) -> &'static str {
-    match name.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("pdf") => "application/pdf",
-        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        Some("odt") => "application/vnd.oasis.opendocument.text",
-        Some("ott") => "application/vnd.oasis.opendocument.text-template",
-        Some("fodt") => "application/vnd.oasis.opendocument.text-flat-xml",
-        Some("rtf") => "application/rtf",
-        Some("html") => "text/html",
-        Some("md" | "txt") => "text/plain",
-        Some("tex") => "application/x-tex",
-        Some("json") => "application/json",
-        Some("xml") => "application/xml",
-        _ => "application/octet-stream",
-    }
 }

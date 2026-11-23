@@ -297,49 +297,23 @@ impl WordApp {
                 Ok(json!({"picked": true}))
             }
             AfterPick::Export { ext } => {
-                let Some(mut path) = picked else {
+                let Some(path) = picked else {
                     // Cancelled: an earlier refusal is not news any more.
                     self.clear_export_error();
                     return Ok(json!({"cancelled": true}));
                 };
-                let r = if ext == "png" {
-                    self.run("file.exportPng", json!({"path": path}))
-                } else if ext == "xml" || ext == crate::print_page::EXPORT_WORD_2003 {
-                    // The engine takes an explicit format only for an .xml path, and a system Save
-                    // dialog lets the user type any name: give it the extension, as the built-in
-                    // browser does (`notes.docx` becomes `notes.xml`, `notes.v2` `notes.v2.xml`).
-                    let named = crate::print_page::export_name(&path, "xml");
-                    if named != path {
-                        path = named;
-                        // The dialog only confirmed the name it was given, not this one.
-                        if std::path::Path::new(&path).exists() {
-                            // Callers drop the result, so say it where the person sees it.
-                            return Err(self.fail_export(format!("{path} already exists; choose another name")));
-                        }
-                    }
-                    // Word XML even over a Word 2003 XML file, which a save by path would keep.
-                    let format = if ext == "xml" { wordcraft_engine::cmd::file::FORMAT_FLAT_OPC } else { crate::print_page::EXPORT_WORD_2003 };
-                    self.run("file.saveAs", json!({"path": path, "format": format}))
-                } else {
-                    self.run("file.saveAs", json!({"path": path}))
-                };
-                match &r {
-                    Ok(_) if self.services.hosted => {
-                        self.clear_export_error();
-                        self.status(crate::i18n::fmt(tl!("Downloaded {name}"), &[("name", &crate::i18n::isolate_path(&path))]));
-                    }
-                    Ok(_) => {
-                        self.clear_export_error();
-                        self.status(crate::i18n::fmt(tl!("Exported {path}"), &[("path", &crate::i18n::isolate_path(&path))]));
-                    }
-                    Err(e) => {
-                        self.fail_export(e.clone());
-                    }
-                }
-                r
+                // Save As = Export: a copy there; the document stays as it was.
+                self.write_copy(&ext, &path)
             }
             AfterPick::PrintPdf { settings } => {
                 let Some(path) = picked else { return Ok(json!({"cancelled": true})) };
+                // A PDF, as every Save As copy is named; a name the dialog never confirmed that
+                // is already taken is refused instead of written over.
+                let p = crate::save_as::SAVE_AS.picked_path(&path, "pdf").map_err(|e| self.fail_export(e.to_string()))?;
+                if p.renamed && std::path::Path::new(&p.path).exists() {
+                    return Err(self.fail_export(format!("{} already exists; choose another name", p.path)));
+                }
+                let path = p.path;
                 let mut params = settings;
                 params["path"] = json!(path);
                 let r = self.run("file.printPdf", params);
@@ -362,9 +336,10 @@ impl WordApp {
                 // otherwise dropped: a failed write (no permission, disk full, a bad path) left the
                 // Save As page sitting there with nothing to say why, since its own render loop
                 // skips the status bar while Backstage is open. `fail_save_as` reaches both.
-                // Hosted, Save As downloads a copy and never writes over the page's file.
-                let id = if self.save_as_is_export() { "file.saveAs" } else { "file.save" };
-                let result = picked.map(|path| self.run(id, json!({"path": path})));
+                // This is plain Save's own dialog (an untitled document, an import-only .doc, the
+                // Save Changes prompt, AutoSave): the picked file becomes the document's. Save As
+                // is a copy and never comes here (`crate::save_as`).
+                let result = picked.map(|path| self.run("file.save", json!({"path": path})));
                 let saved = matches!(&result, Some(Ok(v)) if v.get("saved").and_then(Value::as_bool) == Some(true) || v.get("downloaded").is_some());
                 if saved {
                     self.ui.backstage = false;
@@ -400,7 +375,9 @@ impl WordApp {
         }
     }
 
-    /// Ask where to save, then save there (File › Save As).
+    /// Plain Save's dialog: ask where to save a document that has no file yet (or only an
+    /// import-only one), then save there; that file becomes the document's. Save As is a copy and
+    /// goes through [`Self::save_as_copy`] instead.
     pub fn save_as_dialog(&mut self) {
         let _ = self.save_as(AfterSave::Nothing);
     }
@@ -418,13 +395,13 @@ impl WordApp {
 
     /// An export failed or was refused: say so on the status bar and, for the Export page,
     /// there too, since Backstage's render loop skips the status bar (callers drop the result).
-    fn fail_export(&mut self, error: String) -> String {
+    pub(crate) fn fail_export(&mut self, error: String) -> String {
         self.status(error.clone());
         self.export_error = error.clone();
         error
     }
 
-    fn clear_export_error(&mut self) {
+    pub(crate) fn clear_export_error(&mut self) {
         self.export_error.clear();
     }
 
@@ -464,37 +441,22 @@ impl WordApp {
         }
     }
 
-    /// File › Save As › Save as Word Template (#2852): ask where to save a `.dotx`, starting in
-    /// the user templates folder (the app's own is made on first use), then save there as Save As
-    /// does. Returns the folder the dialog starts in.
-    pub(crate) fn save_as_template_dialog(&mut self) -> Option<String> {
-        let dir = self.user_templates_dir();
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(d) = &dir
-            && !d.is_dir()
-            && let Err(e) = std::fs::create_dir_all(d)
-        {
-            log::warn!("couldn't make the templates folder {}: {e}", d.display());
-        }
-        let dir = dir.filter(|d| d.is_dir()).map(|d| d.to_string_lossy().into_owned());
-        let name = format!("{}.dotx", self.title_stem());
-        let after = AfterPick::SaveAs { after: AfterSave::Nothing, document: self.session.document_id() };
-        let _ = self.ask_file(FileDialogRequest::Save { name, dir: dir.clone() }, after);
-        dir
-    }
-
-    /// File › Export: ask where to save a copy in this format, then write it.
-    pub(crate) fn export_dialog(&mut self, ext: &str) {
-        let name = format!("{}.{}", self.title_stem(), crate::print_page::export_file_ext(ext));
-        // A refusal or failure is reported by `finish_pick` itself (Export page and status bar).
-        let _ = self.ask_file(FileDialogRequest::Save { name, dir: None }, AfterPick::Export { ext: ext.to_string() });
-    }
-
     /// File › Print › Save these pages as PDF: ask where, then write the pages the print
     /// settings choose.
     pub(crate) fn print_pdf_dialog(&mut self) {
-        let name = format!("{}.pdf", self.title_stem());
         let settings = self.ui.print.params();
+        // A browser downloads the copy at once (Save As = Export: `crate::save_as`).
+        if self.runtime() != craft_share::export::Runtime::Desktop {
+            let _ = self.run("file.printPdf", settings);
+            return;
+        }
+        let name = match crate::save_as::SAVE_AS.file_name_from_title(&self.title_stem(), "Document", "pdf") {
+            Ok(name) => name,
+            Err(e) => {
+                self.fail_export(e.to_string());
+                return;
+            }
+        };
         let _ = self.ask_file(FileDialogRequest::Save { name, dir: None }, AfterPick::PrintPdf { settings });
     }
 

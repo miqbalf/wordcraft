@@ -120,7 +120,7 @@ impl WordApp {
     fn deliver_web_save(&self, name: &str, bytes: &[u8], save_as: bool, copy: bool) -> Result<(), String> {
         if copy {
             return match &self.services.download_copy {
-                Some(copy) => copy(name, bytes),
+                Some(copy) => copy(name, crate::save_as::mime_of(name), bytes),
                 None => Err("this window can't download files".to_owned()),
             };
         }
@@ -153,12 +153,16 @@ impl WordApp {
     /// Web: File › Print › Save these pages as PDF (`file.printPdf`) builds the PDF of the print
     /// settings and downloads it as a copy; the engine writes no file in the browser.
     fn download_print_pdf(&mut self, params: &Value) -> Result<Value, String> {
-        let name = params.get("path").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("{}.pdf", self.title_stem()));
-        let name = std::path::Path::new(&name).file_name().map_or(name.clone(), |n| n.to_string_lossy().into_owned());
-        let name = if name.to_ascii_lowercase().ends_with(".pdf") { name } else { format!("{name}.pdf") };
+        // Named as every Save As copy is: the document's name, or the given one, as a .pdf.
+        let list = crate::save_as::SAVE_AS;
+        let name = match params.get("path").and_then(Value::as_str) {
+            Some(path) => list.file_name(path, "Document", "pdf"),
+            None => list.file_name_from_title(&self.title_stem(), "Document", "pdf"),
+        }
+        .map_err(|e| e.to_string())?;
         let (bytes, plan) = self.session.print_pdf(params).map_err(|e| e.to_string())?;
         let delivered = match (&self.services.download_copy, &self.services.download) {
-            (Some(copy), _) => copy(&name, &bytes),
+            (Some(copy), _) => copy(&name, "application/pdf", &bytes),
             (None, Some(download)) => download(&name, &bytes),
             (None, None) => Err("this window can't download files".to_owned()),
         };
@@ -173,10 +177,12 @@ impl WordApp {
 
     /// Web: Save, Save As and the exports become downloads, or go to the host page
     /// ([`Services::host_save`]); hosted, everything but a plain Save is a downloaded copy.
-    fn web_save(&mut self, id: &str, params: &Value) -> Result<Value, String> {
-        // Hosted, everything but a plain Save of the page's document is a downloaded copy
-        // that changes nothing about the document: not its file, stamps, password or state.
-        let hosted_copy = self.services.hosted && !self.hosted_save_goes_to_page(id, params);
+    pub(crate) fn web_save(&mut self, id: &str, params: &Value) -> Result<Value, String> {
+        // Save As = Export (`copy`, see `crate::save_as`), and hosted everything but a plain Save
+        // of the page's document, is a downloaded copy that changes nothing about the document:
+        // not its file, stamps, password or state.
+        let hosted_copy =
+            params.get("copy").and_then(Value::as_bool) == Some(true) || (self.services.hosted && !self.hosted_save_goes_to_page(id, params));
         let name = params.get("path").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| self.web_save_name(id));
         // Inspect only the suffix bytes: no full-name allocation or UTF-8 slicing.
         let has_pdf_suffix = name.as_bytes().last_chunk::<4>().is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".pdf"));
@@ -335,6 +341,11 @@ impl WordApp {
         if let Some(r) = self.live_copy(id, &params) {
             return r;
         }
+        // Save As = Export: without a path, the Save As list or the one copy; with one, a copy.
+        if let Some(r) = self.save_as_command(id, &params) {
+            return r;
+        }
+        let params = crate::save_as::as_copy(id, params);
         if id == "file.close" {
             return self.close_document(&params);
         }
@@ -683,8 +694,12 @@ impl WordApp {
                 "saveAs" => {
                     self.save_as_dialog();
                 }
-                "exportPdf" => self.export_dialog("pdf"),
-                "exportPng" => self.export_dialog("png"),
+                "exportPdf" => {
+                    let _ = self.save_as_copy("pdf");
+                }
+                "exportPng" => {
+                    let _ = self.save_as_copy("png");
+                }
                 "insertPicture" => self.pick_picture(),
                 "addFont" => self.pick_font(),
                 "loadSystemFonts" => self.load_system_fonts(),
@@ -987,12 +1002,12 @@ impl WordApp {
                 self.open_dialog();
                 json!({})
             }
-            // File › Save As › Save as Word Template (#2852): the Save dialog for a .dotx, in the
-            // user templates folder. Opens system UI, like `ui.openFileDialog`.
-            "ui.saveAsTemplate" => {
-                let dir = self.save_as_template_dialog();
-                json!({"dir": dir})
-            }
+            // Save as Word Template (#2852): the Save As copy as a .dotx; on the desktop its Save
+            // dialog starts in the user templates folder. Opens system UI, like `ui.openFileDialog`.
+            "ui.saveAsTemplate" => match self.save_as_copy("dotx") {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            },
             // The built-in file browser (#576), for when the system's file dialog doesn't show up
             // (desktop only): `purpose` is document (default), picture, recipients, save or export. A system
             // dialog still waiting for an answer is given up as cancelled.
@@ -1334,14 +1349,6 @@ pub const HOSTED_RENAME: &str = "Rename the file in Nextcloud Files.";
 pub const HOSTED_ONE_FILE: &str = "This window already edits a file from Nextcloud. Open other files from Nextcloud Files.";
 
 impl WordApp {
-    /// Whether Save As is File › Export: a copy in a chosen format that never becomes the
-    /// document's file (the Save As page shows the Export formats, and its Browse saves a copy).
-    /// The one switch for it: today only a hosted frame (`Services::hosted`), where the copy
-    /// downloads; the desktop is to follow, writing the copy through its file dialog.
-    pub fn save_as_is_export(&self) -> bool {
-        self.services.hosted
-    }
-
     /// Whether the page hosting the frame does command `id` instead ([`HOSTED_HIDDEN`]).
     pub fn hosted_hides(&self, id: &str) -> bool {
         self.services.hosted && HOSTED_HIDDEN.contains(&id)

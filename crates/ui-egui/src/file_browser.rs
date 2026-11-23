@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use egui::{Align2, Rect, Sense, Ui, pos2, vec2};
 
 use crate::file_dialogs::{AfterPick, FileDialogRequest, open_filters};
-use crate::print_page::{EXPORT_FORMATS, export_file_ext, export_name, is_document_ext};
+use crate::save_as::{SAVE_AS, export_ext, export_name, retyped_name};
 use crate::theme::{Tokens, regular};
 use crate::{WordApp, icons};
 
@@ -166,9 +166,9 @@ impl FileBrowser {
         // Exporting (#3535): File › Export's formats are the types, starting on the one asked for.
         let (filters, filter, exports) = match &after {
             AfterPick::Export { ext } => (
-                EXPORT_FORMATS.iter().map(|&(l, f)| (l.to_string(), vec![export_file_ext(f).to_string()])).collect(),
-                EXPORT_FORMATS.iter().position(|&(_, f)| f == ext.as_str()).unwrap_or(0),
-                EXPORT_FORMATS.iter().map(|&(_, f)| f.to_string()).collect(),
+                SAVE_AS.formats().iter().map(|f| (f.label.to_string(), vec![f.ext.to_string()])).collect(),
+                SAVE_AS.formats().iter().position(|f| f.id == ext.as_str()).unwrap_or(0),
+                SAVE_AS.formats().iter().map(|f| f.id.to_string()).collect(),
             ),
             _ => (filters, 0, Vec::new()),
         };
@@ -210,8 +210,8 @@ impl FileBrowser {
     fn type_changed(&mut self) {
         let Some(format) = self.exports.get(self.filter).cloned() else { return };
         // Only a known document extension is replaced; `notes.v2` keeps its `.v2`.
-        if Path::new(&self.name).extension().and_then(|e| e.to_str()).is_some_and(is_document_ext) {
-            self.name = export_name(&self.name, &format);
+        if Path::new(&self.name).extension().and_then(|e| e.to_str()).is_some_and(|e| SAVE_AS.is_document_ext(e)) {
+            self.name = retyped_name(&self.name, &format);
         }
         self.after = AfterPick::Export { ext: format };
     }
@@ -324,7 +324,7 @@ impl WordApp {
             ),
             "export" => {
                 let ext = pending.unwrap_or_else(|| "pdf".into());
-                let name = format!("{}.{}", self.title_stem(), export_file_ext(&ext));
+                let name = format!("{}.{}", self.title_stem(), export_ext(&ext));
                 (FileDialogRequest::Save { name, dir: None }, AfterPick::Export { ext })
             }
             _ => (FileDialogRequest::Open { purpose: "document".into() }, AfterPick::OpenDocument { document: self.session.document_id() }),
@@ -901,7 +901,7 @@ mod tests {
         a.run("text.insert", json!({"text": "Exported in WordCraft"})).unwrap();
         a.run("ui.fileBrowser", json!({"purpose": "export"})).unwrap();
         let b = a.file_browser.open.as_mut().expect("the built-in browser is open");
-        assert_eq!(b.filters.len(), EXPORT_FORMATS.len());
+        assert_eq!(b.filters.len(), SAVE_AS.formats().len());
         assert_eq!(b.filters[b.filter].0, "PDF document (*.pdf)");
         assert!(b.name.ends_with(".pdf"), "{}", b.name);
         b.filter = b.filters.iter().position(|(l, _)| l == "Plain text (*.txt)").unwrap();
@@ -909,33 +909,33 @@ mod tests {
         assert!(b.name.ends_with(".txt"), "{}", b.name);
         assert!(matches!(&b.after, AfterPick::Export { ext } if ext == "txt"));
         b.navigate(dir.clone());
-        // A name typed afterwards with another document extension gets the chosen format's instead,
-        // and a name with an unknown one keeps it.
+        // A name typed afterwards is kept whole and gets the chosen format's extension unless it
+        // already has it (the shared picked-name rule, `craft_share::export::ExportList::picked_path`).
         b.name = "notes.v2".into();
         let Step::Pick(v2) = b.accept() else { panic!("picked") };
         assert_eq!(v2.file_name().unwrap(), "notes.v2.txt");
         b.name = "notes.docx".into();
         let Step::Pick(path) = b.accept() else { panic!("picked") };
-        assert_eq!(path.file_name().unwrap(), "notes.txt");
+        assert_eq!(path.file_name().unwrap(), "notes.docx.txt");
         for (typed, want) in [
-            ("a.PDF", "a.txt"),
-            ("a.htm", "a.txt"),
+            ("a.PDF", "a.PDF.txt"),
+            ("a.htm", "a.htm.txt"),
             ("a", "a.txt"),
             ("a.TXT", "a.TXT"),
-            ("sub/a.rtf", "sub/a.txt"),
-            (".txt", ".txt.txt"),
+            ("sub/a.rtf", "sub/a.rtf.txt"),
+            (".txt", ".txt"),
             (".docx", ".docx.txt"),
             ("sub/.docx", "sub/.docx.txt"),
             ("a.", "a.txt"),
             ("a..", "a.txt"),
         ] {
-            assert_eq!(crate::print_page::export_name(typed, "txt"), want);
+            assert_eq!(crate::save_as::export_name(typed, "txt"), want);
         }
         a.close_file_browser(Some(path.clone()));
         assert!(std::fs::read_to_string(&path).unwrap().contains("Exported in WordCraft"));
         // Word 2003 XML starts on its own type, though Word XML writes .xml too.
         let req = FileDialogRequest::Save { name: "x.xml".into(), dir: None };
-        let b = FileBrowser::new(req, AfterPick::Export { ext: crate::print_page::EXPORT_WORD_2003.into() }, dir.clone(), false);
+        let b = FileBrowser::new(req, AfterPick::Export { ext: crate::save_as::WORD_2003.into() }, dir.clone(), false);
         assert_eq!(b.filters[b.filter].0, "Word 2003 XML Document (*.xml)");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -976,7 +976,7 @@ mod tests {
             ..Default::default()
         };
         let mut a = WordApp::new(Session::new(wordcraft_doc::Document::new()), services);
-        a.export_dialog("rtf");
+        let _ = a.save_as_copy("rtf");
         assert!(a.file_dialog.is_some(), "waiting on the system dialog");
         a.run("ui.fileBrowser", json!({"purpose": "export"})).unwrap();
         assert!(a.file_dialog.is_none(), "the system dialog is given up");
@@ -994,7 +994,7 @@ mod tests {
         let path = dir.join("letter.xml").to_string_lossy().into_owned();
         let mut a = WordApp::new(Session::new(wordcraft_doc::Document::new()), Services::default());
         a.run("text.insert", json!({"text": "Dear reader"})).unwrap();
-        a.finish_pick(AfterPick::Export { ext: crate::print_page::EXPORT_WORD_2003.into() }, Some(path.clone())).unwrap();
+        a.finish_pick(AfterPick::Export { ext: crate::save_as::WORD_2003.into() }, Some(path.clone())).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("w:wordDocument"));
         a.finish_pick(AfterPick::Export { ext: "xml".into() }, Some(path.clone())).unwrap();
         let xml = std::fs::read_to_string(&path).unwrap();
@@ -1013,10 +1013,10 @@ mod tests {
         a.finish_pick(AfterPick::Export { ext: "xml".into() }, Some(bare)).unwrap();
         let xml = std::fs::read_to_string(dir.join("letter.xml")).unwrap();
         assert!(xml.contains("pkg:package"), "Word XML written at letter.xml");
-        // A known document extension gives way to .xml; an unknown one stays.
+        // The picked name is kept whole: `.xml` is added to a known document extension too.
         let docx = dir.join("notes.docx").to_string_lossy().into_owned();
         a.finish_pick(AfterPick::Export { ext: "xml".into() }, Some(docx)).unwrap();
-        assert!(dir.join("notes.xml").is_file());
+        assert!(dir.join("notes.docx.xml").is_file());
         let v2 = dir.join("notes.v2").to_string_lossy().into_owned();
         a.finish_pick(AfterPick::Export { ext: "xml".into() }, Some(v2)).unwrap();
         assert!(dir.join("notes.v2.xml").is_file());
@@ -1034,7 +1034,7 @@ mod tests {
         let dir = scratch("export_xml_dotfile");
         let mut a = WordApp::new(Session::new(wordcraft_doc::Document::new()), Services::default());
         a.run("text.insert", json!({"text": "Dear reader"})).unwrap();
-        for format in ["xml", crate::print_page::EXPORT_WORD_2003] {
+        for format in ["xml", crate::save_as::WORD_2003] {
             let typed = dir.join(".docx").to_string_lossy().into_owned();
             a.finish_pick(AfterPick::Export { ext: format.into() }, Some(typed)).unwrap();
             let written = dir.join(".docx.xml");

@@ -302,6 +302,9 @@ pub(crate) fn go_to_page(app: &mut WordApp, id: &str) {
         // A document without a file goes to the Save As page (as in Word) instead
         // of `file.save`, which would also open the native Save As dialog.
         // In the browser a save is a download, so it saves right away.
+        // A document without a file goes to the Save As page (as in Word), whose Browse… is
+        // Save's own dialog for it ([`save_as_page`]), instead of `file.save`, which would also
+        // open the native Save As dialog. In the browser a save is a download, so it saves right away.
         "save" if app.session.path.is_none() && app.services.download.is_none() => {
             app.ui.backstage_page = "saveAs".into();
         }
@@ -311,6 +314,7 @@ pub(crate) fn go_to_page(app: &mut WordApp, id: &str) {
                 app.ui.backstage = false;
                 app.canvas.want_focus = true;
             } else {
+                // The Save As page says why a save failed (Backstage hides the status bar).
                 app.ui.backstage_page = "saveAs".into();
             }
         }
@@ -841,66 +845,32 @@ fn open_page(app: &mut WordApp, ui: &mut Ui) {
     open_list(app, ui);
 }
 
-/// Save As: Browse… asks where to save. It has no recent-documents list: clicking one of those
-/// opens it, which is not what Save As is for.
+/// Save As = Export ([`crate::save_as`]): every format WordCraft writes, each a copy. In a
+/// browser the copy downloads to the user's computer (framed by a page such as Nextcloud too, live
+/// or not); on the desktop the Save dialog writes it, a Word template starting in the user
+/// templates folder. The document's file and state stay as they were. It has no recent-documents
+/// list: clicking one of those opens it, which is not what Save As is for.
 fn save_as_page(app: &mut WordApp, ui: &mut Ui) {
-    if app.save_as_is_export() {
-        save_as_export_page(app, ui);
-        return;
-    }
     heading(ui, "Save As");
+    // A failed plain Save (an untitled document's dialog, AutoSave) is said here too, since
+    // Backstage hides the status bar.
     let error = ui.ctx().data(|d| d.get_temp::<String>(save_as_error_id())).unwrap_or_default();
     if !error.is_empty() {
         ui.label(egui::RichText::new(&error).color(ui.visuals().error_fg_color));
         ui.add_space(6.0);
     }
-    if ui.button(egui::RichText::new(tl!("Browse…")).font(medium(14.0))).clicked() {
-        app.save_as_dialog();
+    // Plain Save of a document with no file of its own yet (or only an import-only .doc) asks
+    // where here, as before: Browse… is Save's dialog, and the picked file becomes the
+    // document's. Everything below is a copy.
+    if app.needs_a_file_to_save() {
+        if ui.button(egui::RichText::new(tl!("Browse…")).font(medium(14.0))).clicked() {
+            app.save_as_dialog();
+        }
+        ui.add_space(12.0);
     }
-    // Linux and the BSDs (#3535): WordCraft's own browser when the system dialog doesn't appear.
-    #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
-    if ui.button(egui::RichText::new(tl!("Browse in WordCraft…")).font(medium(14.0))).clicked() {
-        let _ = app.run("ui.fileBrowser", json!({"purpose": "save"}));
-    }
-    // A Word template in the user templates folder, which File › New lists under Personal (#2852).
-    ui.add_space(8.0);
-    if ui
-        .button(egui::RichText::new(tl!("Save as Word Template…")).font(medium(14.0)))
-        .on_hover_text(tl!("Saves a .dotx template in your templates folder. It shows up in File › New under Personal."))
-        .clicked()
-    {
-        let _ = app.run("ui.saveAsTemplate", json!({}));
-    }
-}
-
-/// Save As as File › Export ([`WordApp::save_as_is_export`]): the same formats through the same
-/// flow (`export_dialog`), plus a Word template. Only the delivery is the platform's: hosted in a
-/// browser page the copy downloads to the user's computer, live or not; on the desktop the file
-/// dialog writes it. The document's file and state stay as they were.
-fn save_as_export_page(app: &mut WordApp, ui: &mut Ui) {
-    heading(ui, "Save As");
     ui.label(tl!("Save a copy in another format. Printing goes through a PDF you can print from any viewer."));
     ui.add_space(12.0);
     crate::print_page::export_formats(app, ui);
-    if ui.add(egui::Button::new(egui::RichText::new(tl!("Word template (*.dotx)")).font(medium(13.5))).min_size(vec2(320.0, 34.0))).clicked() {
-        let _ = download_copy_as(app, "dotx");
-    }
-}
-
-/// Download a copy of the document in `format` (an Export format or `dotx`), as the hosted Save
-/// As page's Download a copy does. The document's file and state don't change.
-pub(crate) fn download_copy_as(app: &mut WordApp, format: &str) -> Result<serde_json::Value, String> {
-    if format == "dotx" {
-        let name = format!("{}.dotx", app.title_stem());
-        let r = app.run("file.saveAs", json!({"path": name}));
-        match &r {
-            Ok(_) => app.export_error.clear(),
-            Err(e) => app.export_error = e.clone(),
-        }
-        return r;
-    }
-    app.export_dialog(format);
-    if app.export_error.is_empty() { Ok(json!({"downloaded": true})) } else { Err(app.export_error.clone()) }
 }
 
 fn info_page(app: &mut WordApp, ui: &mut Ui) {
