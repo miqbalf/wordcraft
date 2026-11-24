@@ -30,6 +30,9 @@ pub const SHAREABLE: &[&str] = &[
     "text.copyright",
     "text.registered",
     "text.trademark",
+    // Proofing fixes and Improve with AI replace text in place (Ruling R15).
+    "review.applySuggestion",
+    "review.improveApply",
     // Character formatting.
     "format.bold",
     "format.italic",
