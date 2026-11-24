@@ -1184,7 +1184,7 @@ source = "git+https://github.com/storytold/craft-libs?rev=93dac78c93a7f1fd66e202
 [[package]]
 name = "craft-collab"
 version = "0.1.0"
-source = "git+https://github.com/miqbalf/collab-craft?rev=d2470615c0a7b295901845882b2a3b422d59763d#d2470615c0a7b295901845882b2a3b422d59763d"
+source = "git+https://github.com/miqbalf/collab-craft?rev=2e26890c6b7d9ee9b3264919d032e4461fafef3a#2e26890c6b7d9ee9b3264919d032e4461fafef3a"
 dependencies = [
  "base64 0.23.1",
  "js-sys",
@@ -1389,7 +1389,7 @@ dependencies = [
 [[package]]
 name = "craft-live"
 version = "0.1.0"
-source = "git+https://github.com/miqbalf/collab-craft?rev=d2470615c0a7b295901845882b2a3b422d59763d#d2470615c0a7b295901845882b2a3b422d59763d"
+source = "git+https://github.com/miqbalf/collab-craft?rev=2e26890c6b7d9ee9b3264919d032e4461fafef3a#2e26890c6b7d9ee9b3264919d032e4461fafef3a"
 dependencies = [
  "craft-collab",
  "log",
@@ -1399,7 +1399,7 @@ dependencies = [
 [[package]]
 name = "craft-live-worker"
 version = "0.1.0"
-source = "git+https://github.com/miqbalf/collab-craft?rev=d2470615c0a7b295901845882b2a3b422d59763d#d2470615c0a7b295901845882b2a3b422d59763d"
+source = "git+https://github.com/miqbalf/collab-craft?rev=2e26890c6b7d9ee9b3264919d032e4461fafef3a#2e26890c6b7d9ee9b3264919d032e4461fafef3a"
 dependencies = [
  "axum",
  "base64 0.23.1",

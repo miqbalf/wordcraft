@@ -516,7 +516,7 @@ fn read_ticket_cannot_send() {
 }
 
 #[test]
-fn edits_are_refused_until_live() {
+fn edits_wait_for_the_first_join_but_not_for_a_rejoin() {
     let relay = relay(None);
     let bytes = file(&["Hello"]);
     let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
@@ -533,17 +533,17 @@ fn edits_are_refused_until_live() {
     settle(&relay, &mut [&mut a, &mut b]);
     assert!(a.le.editable());
 
-    // A dropped link pauses editing until the rejoin.
+    // A dropped link keeps taking typing (LP2): it waits in the replica for the rejoin.
     relay.borrow_mut().drop_link(0);
     a.pump();
     assert_eq!(a.le.status(), &LiveStatus::Reconnecting);
+    assert!(a.le.editable() && a.le.allows("text.insert"));
     a.end_of(0);
-    assert!(!a.run("text.insert", json!({"text": " offline"})));
-    let _ = a.s.run("text.insert", &json!({"text": " offline"}));
+    assert!(a.run("text.insert", json!({"text": " offline"})));
     a.pump();
-    assert_eq!(texts(&a.s.doc), ["Hello"]);
-    b.end_of(0);
-    assert!(b.run("text.insert", json!({"text": " world"})));
+    assert_eq!(texts(&a.s.doc), ["Hello offline"], "kept while reconnecting");
+    b.caret(0, 0);
+    assert!(b.run("text.insert", json!({"text": "Oh "})));
     relay.borrow_mut().restore_link(0);
     settle(&relay, &mut [&mut a, &mut b]);
     assert!(a.le.editable(), "live again: {:?}", a.le.status());
@@ -551,7 +551,66 @@ fn edits_are_refused_until_live() {
     assert!(a.run("text.insert", json!({"text": "!"})));
     settle(&relay, &mut [&mut a, &mut b]);
     assert_same(&a, &b, "after the rejoin");
-    assert_eq!(texts(&b.s.doc), ["Hello world!"]);
+    assert_eq!(texts(&b.s.doc), ["Oh Hello offline!"]);
+}
+
+/// LP2: N keystrokes typed one by one while the link is down, and while it rejoins (the
+/// socket is back, the relay's join answer not yet taken), all land on both editors, in
+/// order, while the other editor types elsewhere; both converge, show what their replicas
+/// hold, and the safety net never ran.
+#[test]
+fn keystrokes_typed_while_the_link_rejoins_reach_every_editor() {
+    let relay = relay(None);
+    let bytes = file(&["E2x8", "Other"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+
+    relay.borrow_mut().drop_link(0);
+    a.pump();
+    assert_eq!(a.le.status(), &LiveStatus::Reconnecting);
+    a.end_of(0);
+    for c in ["2", "0", "4", "6"] {
+        assert!(a.run("text.insert", json!({"text": c})), "keystroke {c} taken while down");
+        a.pump();
+    }
+    b.end_of(1);
+    assert!(b.run("text.insert", json!({"text": " side"})));
+    b.pump();
+    relay.borrow_mut().restore_link(0);
+    // Typed before the pump that takes the relay's join answer.
+    assert!(a.run("text.insert", json!({"text": "0"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(matches!(a.le.status(), LiveStatus::Live { .. }), "{:?}", a.le.status());
+    assert_eq!(texts(&a.s.doc), ["E2x820460", "Other side"]);
+    assert_same(&a, &b, "every keystroke reached the other editor");
+    for e in [&a, &b] {
+        assert_eq!(e.le.drift(&e.s), None, "the window shows what its replica holds");
+        assert_eq!(e.le.repairs(), 0, "the safety net never ran");
+    }
+    assert!(a.le.take_notices().iter().all(|n| !n.contains("paused")), "no keystroke was refused");
+}
+
+/// LP2: an Undo while the link is down is shared after the rejoin, like typing.
+#[test]
+fn undo_while_reconnecting_reaches_every_editor_after_the_rejoin() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    relay.borrow_mut().drop_link(0);
+    a.pump();
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": " there"})));
+    assert!(a.run("text.insert", json!({"text": " you"})));
+    assert!(a.run("edit.undo", json!({})));
+    a.pump();
+    assert_eq!(texts(&a.s.doc), ["Hello there"]);
+    relay.borrow_mut().restore_link(0);
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "after the rejoin");
+    assert_eq!(texts(&b.s.doc), ["Hello there"]);
 }
 
 #[test]

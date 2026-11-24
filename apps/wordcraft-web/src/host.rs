@@ -473,7 +473,13 @@ impl Live {
         let access = crate::live_ticket::ticket_access(message.ticket());
         let started = relay_on_page_host(&message.relay_url)
             .and_then(|()| craft_collab::web::WebHub::connect(&message.relay_url, message.ticket(), None).map_err(|e| e.to_string()))
-            .and_then(|hub| app.start_live(Box::new(hub), &message.room, bytes, &message.file_name, access));
+            .and_then(|hub| {
+                // A renewed ticket opens a second link that takes over once it has joined, so
+                // the old ticket's expiry never drops the link (LP2).
+                let url = message.relay_url.clone();
+                let hub = craft_collab::Handover::new(hub, move |ticket: &str| craft_collab::web::WebHub::connect(&url, ticket, None));
+                app.start_live(Box::new(hub), &message.room, bytes, &message.file_name, access)
+            });
         match started {
             Ok(()) => {
                 self.joining.borrow_mut().joined(&message.room, access);
