@@ -175,7 +175,8 @@ fn ignored_rules_change_invalidates_every_paragraph() {
     let d = Document::from_text("first paragraph here\nsecond paragraph here\nthird one");
     let mut c = LayoutCache::new();
     let o = || ProofOverlay { remote: vec![remote(7, 16, IssueKind::Grammar, "R_X")], ..Default::default() };
-    layout(&d, &mut c, &LayoutOptions { proof_overlays: overlays(vec![(rev(&d, 1), o())], &[]), ..proofed() });
+    let shown = layout(&d, &mut c, &LayoutOptions { proof_overlays: overlays(vec![(rev(&d, 1), o())], &[]), ..proofed() });
+    assert!(squiggles(&shown, 1).contains(&(7, 16, true)), "the remote mark is shown before its rule is ignored");
     let misses = c.misses;
     let l = layout(&d, &mut c, &LayoutOptions { proof_overlays: overlays(vec![(rev(&d, 1), o())], &["R_X"]), ..proofed() });
     assert_eq!(c.misses, misses + d.body.len() as u64, "every paragraph is laid out again");

@@ -221,6 +221,10 @@ pub struct Session {
     /// Proofing results from a remote checker and this viewer's ignores, by paragraph revision:
     /// merged with the built-in issues in the squiggles and the `review.*` proofing commands.
     pub proof_overlays: Option<Arc<wordcraft_layout::para::ProofOverlays>>,
+    /// The remote proof source ([`crate::proof_remote::RemoteProof`]): what to send to the host's
+    /// grammar route and what came back, and this viewer's ignores per document. Shared by the
+    /// open documents; it follows the active one.
+    pub proof_remote: crate::proof_remote::RemoteProof,
     /// Equations are typed in LaTeX rather than the linear format.
     pub math_latex: bool,
     /// Text typed into equations is normal (non-math) text.
@@ -275,4 +279,29 @@ pub struct Session {
 impl Session {
     /// File name of the persisted custom dictionary inside the settings folder.
     pub const USER_DICT_FILE: &str = "custom-dictionary.txt";
+
+    /// Lets the remote proof source look at the active document at `now_ms`: what to send to
+    /// the host now and when to poll again. [`Self::proof_overlays`] follows any change.
+    pub fn proof_poll(&mut self, now_ms: f64) -> crate::proof_remote::Poll {
+        self.proof_remote.set_document(self.document_id);
+        let poll = self.proof_remote.poll(&self.doc, self.rev, now_ms);
+        if self.proof_remote.take_change() {
+            self.proof_refresh();
+        }
+        poll
+    }
+
+    /// The host's answer to request `id` ([`Self::proof_poll`]).
+    pub fn proof_receive(&mut self, id: &str, reply: Result<crate::proof_remote::ProofReply, crate::proof_remote::ProofFailure>, now_ms: f64) {
+        self.proof_remote.receive(id, reply, now_ms);
+        if self.proof_remote.take_change() {
+            self.proof_refresh();
+        }
+    }
+
+    /// Rebuild [`Self::proof_overlays`] for the active document, after its remote results or
+    /// ignores changed.
+    pub(crate) fn proof_refresh(&mut self) {
+        self.proof_overlays = self.proof_remote.overlays(self.document_id);
+    }
 }

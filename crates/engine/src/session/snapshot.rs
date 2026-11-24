@@ -116,6 +116,7 @@ impl Session {
             typing: _,
             // Proofing results and ignores, keyed by paragraph revision: not an edit.
             proof_overlays: _,
+            proof_remote: _,
             originals: _,
             md_source: _,
             md_file: _,

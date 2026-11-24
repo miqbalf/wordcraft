@@ -279,8 +279,11 @@ impl Session {
             last_highlight: _,
             // Keyed by document id and revision, so one cache serves every document.
             protect_facts: _,
-            // Keyed by paragraph revision, which no paragraph of another document shares.
+            // Rebuilt for the document that becomes active (below): the overlays carry its
+            // ignored rules and words, which must not reach another document.
             proof_overlays: _,
+            // Follows the active document; its ignores are kept per document.
+            proof_remote: _,
             // The input method talks to the window, whichever document it shows; the IME
             // context is keyed by `document_id`.
             ime_state_revision: _,
@@ -404,6 +407,7 @@ impl Session {
         swap(&mut self.go_back_step, go_back_step);
         // A picked Drawing Canvas member (#2637) belongs to the document left behind.
         self.member = None;
+        self.proof_refresh();
     }
 
     /// Make document `id` active without anything else a switch by the user does.

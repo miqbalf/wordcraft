@@ -14124,3 +14124,83 @@ fn a_range_paste_formatting_keeps_the_targets_link_and_tracked_marks() {
     assert!(c.ins.is_some(), "Paste Formatting kept the insertion mark");
     assert_eq!(c.bold, Some(true));
 }
+
+/// Drives the session's remote proof source until it sends: the document is seen at `t` and
+/// sent once idle.
+fn proof_request(s: &mut Session, t: f64) -> crate::proof_remote::ProofRequest {
+    let mut at = t;
+    while at < t + 10_000.0 {
+        if let Some(r) = s.proof_poll(at).send.into_iter().next() {
+            return r;
+        }
+        at += 250.0;
+    }
+    panic!("nothing was sent");
+}
+
+/// A reply with one match on `word` of the request.
+fn proof_reply(r: &crate::proof_remote::ProofRequest, word: &str, rule: &str) -> crate::proof_remote::ProofReply {
+    use crate::proof_remote::{ProofReply, RemoteKind, RemoteMatch};
+    let at = r.text.find(word).unwrap();
+    let offset = r.text[..at].chars().count();
+    let m = RemoteMatch {
+        offset,
+        length: word.chars().count(),
+        kind: RemoteKind::Grammar,
+        message: "remote".into(),
+        replacements: vec!["rug".into()],
+        rule: rule.into(),
+    };
+    ProofReply { matches: vec![m], indonesian: Vec::new() }
+}
+
+fn remote_rules(s: &mut Session) -> Vec<String> {
+    let issues = run(s, "review.issues", json!({}));
+    issues.as_array().unwrap().iter().filter(|i| i["source"] == "remote").map(|i| i["rule"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn session_poll_and_receive_put_remote_issues_into_review_issues() {
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "The cat sat on the mat today."}));
+    s.proof_remote.set_enabled(true);
+    let r = proof_request(&mut s, 0.0);
+    assert!(r.text.contains("mat"));
+    assert!(remote_rules(&mut s).is_empty());
+    s.proof_receive(&r.id, Ok(proof_reply(&r, "mat", "REMOTE_RULE")), 20_000.0);
+    let issues = run(&mut s, "review.issues", json!({}));
+    let remote: Vec<_> = issues.as_array().unwrap().iter().filter(|i| i["source"] == "remote").collect();
+    assert_eq!(remote.len(), 1, "{issues}");
+    assert_eq!(remote[0]["text"], "mat");
+    assert_eq!(remote[0]["rule"], "REMOTE_RULE");
+}
+
+#[test]
+fn ignored_rule_in_one_document_does_not_hide_issues_in_another() {
+    let text = "The cat sat on the mat today.";
+    let mut s = s();
+    let a = s.document_id();
+    run(&mut s, "text.insert", json!({"text": text}));
+    s.proof_remote.set_enabled(true);
+    let r = proof_request(&mut s, 0.0);
+    s.proof_receive(&r.id, Ok(proof_reply(&r, "mat", "R_X")), 20_000.0);
+    assert_eq!(remote_rules(&mut s), vec!["R_X"]);
+    s.proof_remote.ignore_rule(a, "R_X");
+    s.proof_poll(20_000.0);
+    assert!(remote_rules(&mut s).is_empty(), "ignored in A");
+
+    run(&mut s, "file.new", json!({}));
+    run(&mut s, "text.insert", json!({"text": text}));
+    assert_ne!(s.document_id(), a);
+    assert!(remote_rules(&mut s).is_empty(), "nothing checked in B yet");
+    // B has the same text: the cached result applies without a request, and A's ignore does not.
+    for t in 0..40 {
+        assert!(s.proof_poll(30_000.0 + f64::from(t) * 250.0).send.is_empty());
+    }
+    assert_eq!(remote_rules(&mut s), vec!["R_X"], "B shows the rule A ignored");
+
+    s.activate(a).unwrap();
+    assert!(remote_rules(&mut s).is_empty(), "still ignored in A");
+    s.proof_poll(60_000.0);
+    assert!(remote_rules(&mut s).is_empty(), "still ignored in A after a poll");
+}
