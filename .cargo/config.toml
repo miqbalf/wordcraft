@@ -1,2 +1,9 @@
 [alias]
 xtask = "run --package xtask --"
+
+# Wasm SIMD for the web build. vello_cpu rasterises the pages through fearless_simd, which falls
+# back to scalar code unless simd128 is enabled at compile time. PERF1 (2026-11-24, GPU Chromium on
+# udinpc, 30-page document): key-to-paint p50 36 -> 24 ms, short document 36 -> 22 ms, scroll
+# 50 -> 54 fps. Needs wasm SIMD in the browser (Chrome 91, Firefox 89, Safari 16.4 and later).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
