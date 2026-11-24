@@ -527,3 +527,24 @@ fn objects_are_not_shared() {
         assert!(a.s.doc.same_content(&kept));
     }
 }
+
+/// yrs writes an integer outside `±0x7FFFFFFF` as a float, and a replica that decodes it reads a
+/// float back. A value that size inside a shared attribute (here a content control's id, which
+/// Word draws at random over 32 bits) must still read back on another replica: in the saver's
+/// checkpoint and on a peer joining from it.
+#[test]
+fn a_large_integer_in_a_shared_attribute_reads_back_from_the_state() {
+    let mut doc = Document::new();
+    let control = |id: i64| wordcraft_doc::InlineObject::ControlStart {
+        control: Box::new(wordcraft_doc::ContentControl { id: Some(id), ..Default::default() }),
+    };
+    let mut p = Paragraph::with_text("\u{FFFC}Name\u{FFFC} and \u{FFFC}more\u{FFFC}", Default::default());
+    p.objects =
+        vec![control(3_000_000_000), wordcraft_doc::InlineObject::ControlEnd, control(-3_000_000_000), wordcraft_doc::InlineObject::ControlEnd];
+    doc.body = vec![para_block(p)];
+    assign_seed_pids(&mut doc);
+    let state = LiveDoc::seeded(&seed_blocks(&doc)).unwrap().state();
+    let saved = wordcraft_live::document_from_state(&doc, &state).unwrap();
+    let objects = |d: &Document| d.body[0].as_para().unwrap().objects.clone();
+    assert_eq!(objects(&saved), objects(&doc), "the checkpoint keeps the ids");
+}

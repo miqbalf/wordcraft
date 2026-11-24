@@ -52,6 +52,15 @@ fn follow(old: &str, new: &str, at: usize) -> usize {
     }
 }
 
+/// The one stretch where `old` and `new` differ: their common prefix's length, and where the
+/// common suffix starts in each.
+fn stretch(old: &[char], new: &[char]) -> (usize, usize, usize) {
+    let pre = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let room = old.len().min(new.len()) - pre;
+    let suffix = old.iter().rev().zip(new.iter().rev()).take(room).take_while(|(a, b)| a == b).count();
+    (pre, old.len() - suffix, new.len() - suffix)
+}
+
 /// How alike two texts are: the length of their common prefix plus their common suffix.
 fn likeness(a: &str, b: &str) -> usize {
     let prefix = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
@@ -69,14 +78,73 @@ impl Anchor {
         Anchor { story: pos.story, pid, index, chars, text, pos: pos.clone() }
     }
 
+    /// The same character in the paragraphs from index `index` on that are the parts of the
+    /// paragraph split under it (the head and the tail): joined, they are the old text with at
+    /// most one stretch changed, and at least half of them is the same. `None` when no such
+    /// paragraphs follow.
+    ///
+    /// The stretch is usually this window's own typing that the peer split the paragraph
+    /// without (the peer passes it on into the part later). A caret inside or right after it
+    /// goes to where it was, in the part it will come back to, with that text and that part's
+    /// id: the caret waits there and goes past the text when it arrives (`apply_remote`).
+    fn in_split(&self, doc: &Document, paths: &[super::Path], index: usize) -> Option<(Pos, Option<(u64, String)>)> {
+        let old: Vec<char> = self.text.chars().collect();
+        // The next few paragraphs from `index` (a split makes two; a part moved on, three).
+        let parts: Vec<(&super::Path, Vec<char>, u64)> = paths
+            .get(index..)?
+            .iter()
+            .take(3)
+            .map_while(|path| doc.para(self.story, path).map(|p| (path, p.text.chars().collect(), p.pid)))
+            .collect();
+        // As many of them as make the joined text most like the old one: most of it the same,
+        // with one stretch changed.
+        let (k, pre, old_end, new_end) = (1..=parts.len())
+            .filter_map(|k| {
+                let joined: Vec<char> = parts[..k].iter().flat_map(|p| p.1.iter().copied()).collect();
+                let (pre, old_end, new_end) = stretch(&old, &joined);
+                let kept = pre + (old.len() - old_end);
+                (kept > 0 && 2 * kept >= joined.len()).then_some((k, pre, old_end, new_end, (old_end - pre) + (new_end - pre)))
+            })
+            .min_by_key(|c| (c.4, c.0))
+            .map(|(k, pre, old_end, new_end, _)| (k, pre, old_end, new_end))?;
+        let c = self.chars;
+        // This window's own text the parts lack, up to the caret.
+        let awaited = (new_end == pre && c > pre && c <= old_end).then(|| old[pre..c].iter().collect::<String>());
+        let at = if c <= pre {
+            c
+        } else if c >= old_end {
+            c - old_end + new_end
+        } else {
+            pre
+        };
+        // The part holding char `at`: at a boundary the earlier part, except for a caret waiting
+        // for its text, which comes back into the later one (an insert at a split point goes to
+        // the tail).
+        let mut start = 0;
+        for (n, (path, text, pid)) in parts[..k].iter().enumerate() {
+            let end = start + text.len();
+            let last = n + 1 == k;
+            if at < end || (at == end && (awaited.is_none() || last)) {
+                let line: String = text.iter().collect();
+                let off = line.char_indices().nth(at - start).map_or(line.len(), |(i, _)| i);
+                let pos = Pos::new(self.story, (*path).clone(), off);
+                return Some((pos, awaited.map(|t| (*pid, t))));
+            }
+            start = end;
+        }
+        None
+    }
+
     /// The same place in `doc`: the same character of the paragraph with the same shared id
     /// (followed through the edit to its text, see [`follow`]); when two paragraphs have that
-    /// id, the one whose text is most like the old one; when that paragraph is gone, the start
-    /// of the paragraph now at the same index. An unshared paragraph (id 0) keeps its path. The
+    /// id, the one whose text is most like the old one; when that paragraph is gone, the same
+    /// character in the paragraphs from its index on when their texts, joined, start like the
+    /// old text up to it (the head and tail of a split), otherwise the start of the paragraph now
+    /// at its index. An unshared paragraph (id 0) keeps its path. The
     /// result is clamped to the document.
-    fn find(&self, doc: &Document) -> Pos {
+    fn find(&self, doc: &Document) -> (Pos, Option<(u64, String)>) {
         if self.pid == 0 {
-            return doc.clamp(&self.pos);
+            return (doc.clamp(&self.pos), None);
         }
         let paths = doc.para_paths(self.story);
         let found = paths
@@ -84,18 +152,28 @@ impl Anchor {
             .filter_map(|path| doc.para(self.story, path).filter(|p| p.pid == self.pid).map(|p| (path, p)))
             .rev()
             .max_by_key(|(_, p)| likeness(&p.text, &self.text));
+        let mut awaits = None;
         let pos = match found {
             Some((path, p)) => {
                 let chars = follow(&self.text, &p.text, self.chars);
                 let off = p.text.char_indices().nth(chars).map_or(p.text.len(), |(i, _)| i);
                 Pos::new(self.story, path.clone(), off)
             }
-            None => match paths.get(self.index.min(paths.len().saturating_sub(1))) {
-                Some(path) => Pos::new(self.story, path.clone(), 0),
-                None => doc.start_of(StoryRef::Body),
-            },
+            None => {
+                let index = self.index.min(paths.len().saturating_sub(1));
+                match paths.get(index) {
+                    Some(path) => match self.in_split(doc, &paths, index) {
+                        Some((pos, waits)) => {
+                            awaits = waits;
+                            pos
+                        }
+                        None => Pos::new(self.story, path.clone(), 0),
+                    },
+                    None => doc.start_of(StoryRef::Body),
+                }
+            }
         };
-        doc.clamp(&pos)
+        (doc.clamp(&pos), awaits)
     }
 }
 
@@ -122,6 +200,8 @@ impl Session {
     /// one, a command pays one branch for it.
     pub fn set_observer(&mut self, o: Option<Box<dyn EditObserver>>) {
         self.observer = o;
+        // A caret waiting for its text belongs to the link that is going.
+        self.live_awaits = None;
         self.bind_live();
     }
 
@@ -191,7 +271,27 @@ impl Session {
         self.doc.touch_changed_since(&before);
         drop(before);
         self.doc.ensure_nonempty();
-        self.sel = Selection { anchor: anchor.find(&self.doc), focus: focus.find(&self.doc) };
+        let ((a, _), (f, awaits)) = (anchor.find(&self.doc), focus.find(&self.doc));
+        let mut sel = Selection { anchor: a, focus: f };
+        // A caret left waiting at the end of a split paragraph's part (see `Anchor::in_split`)
+        // for this window's own text: when that text has come right after it, it goes past it,
+        // where this window typed it.
+        // It keeps waiting through other edits while it stays in that paragraph.
+        let mut still = None;
+        if let Some((pid, text)) = self.live_awaits.take().filter(|_| sel.anchor == sel.focus) {
+            let here = self.doc.para_at(&sel.focus).filter(|p| p.pid == pid).map(|p| p.text.get(sel.focus.off..).unwrap_or(""));
+            let was = focus.text.get(focus.pos.off..).unwrap_or("");
+            if here.is_some_and(|t| t.starts_with(&text)) && !was.starts_with(&text) {
+                sel.focus.off += text.len();
+                sel.anchor = sel.focus.clone();
+            } else if here.is_some() {
+                still = Some((pid, text));
+            }
+        }
+        if sel.anchor == sel.focus {
+            self.live_awaits = awaits.or(still);
+        }
+        self.sel = sel;
         // Selections that name places the peer's edit may have moved are dropped.
         self.column = None;
         self.widened = None;

@@ -264,6 +264,9 @@ pub struct Session {
     /// The document the live hooks are bound to ([`Session::set_observer`]): they act only
     /// while it is the active one.
     live_doc: Option<u64>,
+    /// A caret a peer's split left at the end of a paragraph part, waiting for this window's
+    /// own text (that part's id, the text) to come back after it (see `Session::apply_remote`).
+    live_awaits: Option<(u64, String)>,
 }
 
 impl Session {

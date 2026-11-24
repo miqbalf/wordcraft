@@ -355,12 +355,15 @@ fn random_command(rng: &mut Rng) -> (&'static str, Value) {
 }
 
 /// `n` editors, `steps` commands, pumps and partial deliveries interleaved at random. A
-/// quarter of the commands go straight to the session, so the pump's flush picks them up.
+/// quarter of the commands go straight to the session, so the pump's flush picks them up. The
+/// safety net is off, so the mapping alone must keep every window equal to its own replica (what
+/// the saver writes) and to the others.
 fn converge_through_pump(n: usize, seed: u64, steps: usize) {
     let relay = relay(Some(seed ^ 0x5eed));
     let bytes = file(&["Alpha beta", "Gamma", "Delta epsilon zeta", ""]);
     let mut eds: Vec<Ed> = (0..n).map(|k| Ed::open(&relay, &format!("u{k}"), Access::Edit, &bytes)).collect();
     for e in &mut eds {
+        e.le.set_verify_every(0);
         e.pump();
     }
     let mut rng = Rng(seed);
@@ -385,6 +388,10 @@ fn converge_through_pump(n: usize, seed: u64, steps: usize) {
     assert!(ran >= steps / 2, "seed {seed}: the editors went live and ran commands ({ran})");
     let mut refs: Vec<&mut Ed> = eds.iter_mut().collect();
     settle(&relay, &mut refs);
+    for (k, e) in eds.iter().enumerate() {
+        assert_eq!(e.le.drift(&e.s), None, "seed {seed}, {n} editors: editor {k} shows what its replica holds");
+        assert_eq!(e.le.repairs(), 0, "seed {seed}: the safety net never ran");
+    }
     for e in &eds[1..] {
         assert_same(&eds[0], e, &format!("seed {seed}, {n} editors"));
     }
@@ -406,6 +413,39 @@ fn three_editors_converge() {
     for seed in 100..106 {
         converge_through_pump(3, seed, 150);
     }
+}
+
+/// Seeds that once left the editors apart for good: a swap of two equal paragraphs that was
+/// never shared (149), an id whose block an undo took away (572, 917) and the rest found by
+/// the sweep below.
+#[test]
+fn editors_converge_on_seeds_that_diverged() {
+    for seed in [149, 488, 572, 820, 917, 1950] {
+        converge_through_pump(3, seed, 150);
+    }
+    for seed in [187, 250, 543, 555, 715, 717, 770] {
+        converge_through_pump(2, seed, 150);
+    }
+}
+
+/// A long sweep of [`converge_through_pump`], for a run by hand: `LIVE_SWEEP=from..to` (and
+/// `LIVE_SWEEP_EDITORS`, 3 by default). Without it the test checks nothing.
+#[test]
+fn converge_sweep_from_the_environment() {
+    let Some((from, to)) = std::env::var("LIVE_SWEEP").ok().and_then(|r| {
+        let (a, b) = r.split_once("..")?;
+        Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))
+    }) else {
+        return;
+    };
+    let n = std::env::var("LIVE_SWEEP_EDITORS").ok().and_then(|n| n.parse().ok()).unwrap_or(3);
+    let mut failed = Vec::new();
+    for seed in from..to {
+        if std::panic::catch_unwind(|| converge_through_pump(n, seed, 150)).is_err() {
+            failed.push(seed);
+        }
+    }
+    assert!(failed.is_empty(), "{n} editors, seeds {from}..{to}: {} failed: {failed:?}", failed.len());
 }
 
 #[test]
@@ -1098,4 +1138,283 @@ fn a_settled_window_goes_on_after_the_room_lost_its_history() {
     settle(&relay, &mut [&mut a]);
     assert!(a.le.take_history_lost(), "told the room lost its history");
     assert!(a.le.editable(), "holding a settled document, it does not wait: {:?}", a.le.status());
+}
+
+/// Select bytes `from..to` of body block `block`.
+fn select_range(ed: &mut Ed, block: usize, from: usize, to: usize) {
+    ed.s.sel = Selection { anchor: Pos::body(block, from), focus: Pos::body(block, to) };
+}
+
+/// Whether every char of `text` in body paragraph `i` of `ed` is bold.
+fn all_bold(ed: &Ed, i: usize, text: &str) -> bool {
+    let p = ed.s.doc.body[i].as_para().unwrap();
+    let Some(from) = p.text.find(text) else { return false };
+    let mut start = 0;
+    p.runs.iter().all(|r| {
+        let (lo, hi) = (start, start + r.len);
+        start = hi;
+        hi <= from || lo >= from + text.len() || r.props.bold == Some(true)
+    })
+}
+
+/// Enter splits a paragraph while another editor edits the part that moves to the new
+/// paragraph: their delete, formatting and typing land in the new paragraph, as if made after.
+/// (A paragraph that starts in lower case is avoided: Enter's sentence capital changes the head
+/// in the same edit, which is then not seen as a split.)
+#[test]
+fn an_edit_in_the_tail_of_a_split_lands_in_the_new_paragraph() {
+    let relay = relay(None);
+    let bytes = file(&["Alpha beta gamma delta", "End of the line"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+
+    // Neither has seen the other's edit when making their own.
+    a.caret(0, 5);
+    assert!(a.run("text.newParagraph", json!({})));
+    select_range(&mut b, 0, 11, 17);
+    assert!(b.run("text.delete", json!({})), "bob deletes \"gamma \"");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "a delete against a split");
+    assert_eq!(texts(&a.s.doc), ["Alpha", " beta delta", "End of the line"], "the delete wins");
+
+    a.caret(1, 1);
+    assert!(a.run("text.newParagraph", json!({})));
+    select_range(&mut b, 1, 1, 5);
+    assert!(b.run("format.bold", json!({})), "bob bolds \"beta\"");
+    b.end_of(1);
+    assert!(b.run("text.insert", json!({"text": "!"})), "bob types at the end");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "formatting and typing against a split");
+    assert_eq!(texts(&a.s.doc), ["Alpha", " ", "beta delta!", "End of the line"], "the typing lands where it was typed");
+    assert!(all_bold(&a, 2, "beta") && all_bold(&b, 2, "beta"), "the formatting is kept");
+
+    // The new paragraph's own typing since the split is followed.
+    a.caret(3, 3);
+    assert!(a.run("text.insert", json!({"text": "X"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    a.caret(3, 2);
+    assert!(a.run("text.newParagraph", json!({})));
+    a.caret(4, 0);
+    assert!(a.run("text.insert", json!({"text": "Y"})));
+    select_range(&mut b, 3, 8, 16);
+    assert!(b.run("text.delete", json!({})), "bob deletes \"the line\"");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "a delete against a split and typing");
+    assert_eq!(texts(&a.s.doc), ["Alpha", " ", "beta delta!", "En", "YdX of "]);
+}
+
+/// The browser e2e's steps: Enter mid-paragraph while the other editor types at its end, then
+/// Enter at the start of that tail while the other editor goes on typing there. The typing
+/// stays at the end of the tail.
+#[test]
+fn typing_at_the_end_follows_two_splits() {
+    let relay = relay(None);
+    let bytes = file(&["T7 test report", "This is a small test document for the share proof."]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+
+    a.caret(1, 10);
+    assert!(a.run("text.newParagraph", json!({})));
+    b.end_of(1);
+    assert!(b.run("text.insert", json!({"text": " TAILONE"})));
+    // Bob gets the split before Alice forwards his typing into the tail.
+    b.pump();
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["T7 test report", "This is a ", "small test document for the share proof. TAILONE"]);
+
+    a.caret(2, 0);
+    assert!(a.run("text.newParagraph", json!({})));
+    assert!(b.run("text.insert", json!({"text": " T"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(b.run("text.insert", json!({"text": "AILTWO"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "two splits and typing");
+    assert_eq!(texts(&a.s.doc), ["T7 test report", "This is a ", "", "small test document for the share proof. TAILONE TAILTWO"]);
+}
+
+/// An editor typing in the middle of a paragraph that another editor splits, getting the split
+/// before its typing is passed on into the new paragraph: its next keystroke lands right after
+/// its typing, in the head and in the tail.
+#[test]
+fn typing_mid_paragraph_follows_a_split() {
+    for (at, what) in [(3, "head"), (20, "tail")] {
+        let relay = relay(None);
+        let bytes = file(&["T7 test report", "This is a small test document for the share proof."]);
+        let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+        let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+        settle(&relay, &mut [&mut a, &mut b]);
+        a.caret(1, 10);
+        assert!(a.run("text.newParagraph", json!({})));
+        b.caret(1, at);
+        assert!(b.run("text.insert", json!({"text": "X"})));
+        // Bob gets the split before Alice has his X.
+        b.pump();
+        settle(&relay, &mut [&mut a, &mut b]);
+        assert!(b.run("text.insert", json!({"text": "Y"})));
+        settle(&relay, &mut [&mut a, &mut b]);
+        assert_same(&a, &b, what);
+        let t = texts(&a.s.doc);
+        assert!(t.iter().any(|p| p.contains("XY")), "typing in the {what}: {t:?}");
+    }
+}
+
+/// A split that reaches the other editor one message at a time (as a browser can get it):
+/// that editor's caret, at the end of the split paragraph, stays at the end of the tail.
+#[test]
+fn a_split_delivered_in_pieces_keeps_the_caret() {
+    let relay = relay(None);
+    let bytes = file(&["T7 test report", "This is a small test document for the share proof."]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    b.end_of(1);
+    a.caret(1, 10);
+    assert!(a.run("text.newParagraph", json!({})));
+    relay.borrow_mut().one_per_poll = true;
+    for _ in 0..10 {
+        b.pump();
+    }
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(b.run("text.insert", json!({"text": "X"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "a split in pieces");
+    assert_eq!(texts(&a.s.doc), ["T7 test report", "This is a ", "small test document for the share proof.X"]);
+}
+
+/// Typing a char at a time at the end of a paragraph while another editor splits it, with the
+/// split arriving at every point of the typing: the caret stays at the end of the typing.
+#[test]
+fn typing_char_by_char_follows_a_split() {
+    for at in 0..=8 {
+        for a_at in 0..=8 {
+            let relay = relay(None);
+            let bytes = file(&["T7 test report", "This is a small test document for the share proof."]);
+            let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+            let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+            settle(&relay, &mut [&mut a, &mut b]);
+            b.end_of(1);
+            for (i, c) in " TAILONE".chars().enumerate() {
+                if i == at {
+                    a.caret(1, 10);
+                    assert!(a.run("text.newParagraph", json!({})));
+                }
+                if i == a_at {
+                    a.pump();
+                }
+                assert!(b.run("text.insert", json!({"text": c.to_string()})));
+                b.pump();
+            }
+            settle(&relay, &mut [&mut a, &mut b]);
+            assert!(b.run("text.insert", json!({"text": "X"})));
+            settle(&relay, &mut [&mut a, &mut b]);
+            assert_same(&a, &b, "char by char");
+            let t = texts(&a.s.doc);
+            assert!(t.last().is_some_and(|l| l.ends_with("TAILONEX")), "split at {at}, alice pumps at {a_at}: {t:?}");
+        }
+    }
+}
+
+/// Two separate edits racing a split, one in the head and one in the tail, reach the splitter
+/// together; each lands in its own part, and the split stays where it was made.
+#[test]
+fn two_edits_racing_a_split_land_in_their_own_parts() {
+    let relay = relay(None);
+    let bytes = file(&["Alpha beta", "End"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+
+    a.caret(0, 5);
+    assert!(a.run("text.newParagraph", json!({})));
+    select_range(&mut b, 0, 1, 2);
+    assert!(b.run("text.delete", json!({})), "bob deletes the \"l\"");
+    b.end_of(0);
+    assert!(b.run("text.insert", json!({"text": "!"})), "bob types at the end");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "two edits against a split");
+    assert_eq!(texts(&a.s.doc), ["Apha", " beta!", "End"]);
+}
+
+/// A paragraph's own formatting set while another editor splits it reaches both its head and
+/// its tail.
+#[test]
+fn centring_a_paragraph_while_it_is_split_centres_both_parts() {
+    let relay = relay(None);
+    let bytes = file(&["Alpha beta gamma delta", "End of the line"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+
+    a.caret(0, 5);
+    assert!(a.run("text.newParagraph", json!({})));
+    b.caret(0, 2);
+    assert!(b.run("para.alignCenter", json!({})), "bob centres the paragraph");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "centring against a split");
+    assert_eq!(texts(&a.s.doc), ["Alpha", " beta gamma delta", "End of the line"]);
+    for e in [&a, &b] {
+        let align: Vec<_> = e.s.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.props.align).collect();
+        assert_eq!(align[..2], [Some(wordcraft_doc::Align::Center); 2], "both parts are centred");
+        assert_ne!(align[2], Some(wordcraft_doc::Align::Center), "the next paragraph is not");
+    }
+}
+
+/// The safety net: a window whose body drifted from the shared copy (here, by an edit made
+/// behind the mapping's back) is found out on the periodic check and rebuilt from the shared
+/// copy; a window that did not drift is left alone.
+#[test]
+fn a_drifted_window_is_rebuilt_from_the_shared_copy() {
+    let relay = relay(None);
+    let bytes = file(&["One", "Two"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": "!"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(a.le.drift(&a.s), None, "in step");
+    assert!(!a.le.verify(&mut a.s), "nothing to repair");
+
+    // Behind the mapping's back: an extra paragraph, and other text in a shared one.
+    a.s.apply_remote(|d| {
+        d.body.push(wordcraft_doc::para_block(wordcraft_doc::Paragraph::new()));
+        if let Some(wordcraft_doc::Block::Para(p)) = d.body.get_mut(1).map(std::sync::Arc::make_mut) {
+            p.text = "Changed".into();
+            p.runs.clear();
+        }
+    })
+    .unwrap();
+    assert!(a.le.drift(&a.s).is_some(), "the drift is seen");
+    for _ in 0..wordcraft_live::session::VERIFY_EVERY {
+        a.pump();
+    }
+    assert_eq!(a.le.drift(&a.s), None, "the periodic check rebuilt the body");
+    assert_eq!(a.le.repairs(), 1, "and counted it");
+    assert_same(&a, &b, "the window shows the shared document again");
+    assert_eq!(texts(&a.s.doc), ["One!", "Two"]);
+
+    // A due check waits while the window is being typed in, and runs at the first pause.
+    a.le.set_verify_every(1);
+    a.s.apply_remote(|d| {
+        if let Some(wordcraft_doc::Block::Para(p)) = d.body.get_mut(1).map(std::sync::Arc::make_mut) {
+            p.text = "Behind".into();
+            p.runs.clear();
+        }
+    })
+    .unwrap();
+    for _ in 0..2 * wordcraft_live::session::VERIFY_QUIET {
+        a.end_of(0);
+        assert!(a.run("text.insert", json!({"text": "x"})));
+        a.pump();
+    }
+    assert_eq!(a.le.repairs(), 1, "not while typing");
+    for _ in 0..=wordcraft_live::session::VERIFY_QUIET {
+        a.pump();
+    }
+    assert_eq!(a.le.repairs(), 2, "at the pause");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "rebuilt again");
+    assert_eq!(texts(&a.s.doc)[1], "Two");
 }

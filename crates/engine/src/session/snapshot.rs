@@ -140,6 +140,7 @@ impl Session {
             observer: _,
             live_undo: _,
             live_doc: _,
+            live_awaits: _,
             ime_body_epoch,
             // The IME revision and its caret token are process-global evidence, not document
             // state: a rollback must not reuse a revision.

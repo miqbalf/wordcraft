@@ -88,6 +88,22 @@ fn observer_sees_every_mutating_command() {
     assert_eq!(calls(&log).len(), n + 1);
 }
 
+/// Moving an empty paragraph past another empty one changes no content, only which shared
+/// paragraph is where: it is still an edit the observer hears (seed 149 of the live fuzz).
+#[test]
+fn swapping_two_equal_paragraphs_is_reported() {
+    let mut s = Session::new(Document::from_text("Top\n\n\nEnd"));
+    share(&mut s);
+    let log = observed(&mut s);
+    let empty = s.doc.para_paths(StoryRef::Body)[1].clone();
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, empty, 0));
+    let before: Vec<u64> = s.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.pid).collect();
+    s.run("para.moveDown", &serde_json::json!({})).unwrap();
+    let after: Vec<u64> = s.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.pid).collect();
+    assert_ne!(before, after, "the two empty paragraphs changed places");
+    assert_eq!(ids(&log), ["para.moveDown"], "and that was reported");
+}
+
 #[test]
 fn repeat_is_reported_once() {
     let mut s = Session::new(Document::new());
@@ -238,6 +254,113 @@ fn apply_remote_keeps_caret_on_same_pid() {
     let now = paths.iter().position(|q| *q == at.path).unwrap();
     assert_eq!(now, index.min(paths.len() - 1), "the caret is on the paragraph now at its index");
     assert_eq!(at.off, 0);
+}
+
+/// A peer splits the caret's paragraph inside its text, which re-adds it as two new shared
+/// paragraphs: a caret in the head keeps its character.
+#[test]
+fn apply_remote_keeps_caret_in_the_head_of_a_split() {
+    let mut s = Session::new(Document::from_text("Alpha beta\nEnd\n"));
+    share(&mut s);
+    let first = s.doc.para_paths(StoryRef::Body)[0].clone();
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, first, 3));
+    s.apply_remote(|d| {
+        if let Ok(body) = d.story_mut(StoryRef::Body) {
+            body.remove(0);
+            for (i, t) in ["Alpha", " beta"].into_iter().enumerate() {
+                let mut p = Paragraph::with_text(t, Default::default());
+                p.pid = 200 + i as u64;
+                body.insert(i, Arc::new(Block::Para(p)));
+            }
+        }
+    })
+    .unwrap();
+    let at = s.sel.focus.clone();
+    let p = s.doc.para_at(&at).unwrap();
+    assert_eq!((p.text.as_str(), &p.text[..at.off]), ("Alpha", "Alp"), "the same character of the head");
+}
+
+/// A split of the caret's paragraph that does not hold this window's own typing yet (the peer
+/// split it before the typing reached it): the caret goes where that typing was, in the part it
+/// belongs to, and past it once the peer passes it on. `typed` is the window's text, `parts`
+/// the split without the typing, `caret` the char after it, `want` the part and the text
+/// before the caret, then the same after the forward.
+fn caret_through_a_split_without_its_typing(
+    typed: &str,
+    caret: usize,
+    parts: [&str; 2],
+    forwarded: [&str; 2],
+    want: (&str, &str),
+    after: (&str, &str),
+) {
+    let mut s = Session::new(Document::from_text(&format!("{typed}\nEnd\n")));
+    share(&mut s);
+    let first = s.doc.para_paths(StoryRef::Body)[0].clone();
+    let off = typed.char_indices().nth(caret).map_or(typed.len(), |(i, _)| i);
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, first, off));
+    let put = |s: &mut Session, texts: [&str; 2]| {
+        s.apply_remote(|d| {
+            if let Ok(body) = d.story_mut(StoryRef::Body) {
+                if body.len() == 2 {
+                    body.remove(0);
+                } else {
+                    body.remove(0);
+                    body.remove(0);
+                }
+                for (i, t) in texts.into_iter().enumerate() {
+                    let mut p = Paragraph::with_text(t, Default::default());
+                    p.pid = 400 + i as u64;
+                    body.insert(i, Arc::new(Block::Para(p)));
+                }
+            }
+        })
+        .unwrap();
+    };
+    let at = |s: &Session| {
+        let at = s.sel.focus.clone();
+        let p = s.doc.para_at(&at).unwrap();
+        (p.text.clone(), p.text[..at.off].to_string())
+    };
+    put(&mut s, parts);
+    assert_eq!(at(&s), (want.0.to_string(), want.1.to_string()), "where the typing was");
+    put(&mut s, forwarded);
+    assert_eq!(at(&s), (after.0.to_string(), after.1.to_string()), "past the typing, once it is passed on");
+}
+
+#[test]
+fn apply_remote_keeps_caret_after_typing_in_the_tail_a_split_lacks() {
+    // "Alpha beXta": X typed in the tail; the split at 5 came without it.
+    caret_through_a_split_without_its_typing("Alpha beXta", 9, ["Alpha", " beta"], ["Alpha", " beXta"], (" beta", " be"), (" beXta", " beX"));
+}
+
+#[test]
+fn apply_remote_keeps_caret_after_typing_in_the_head_a_split_lacks() {
+    // "AlXpha beta": X typed in the head.
+    caret_through_a_split_without_its_typing("AlXpha beta", 3, ["Alpha", " beta"], ["AlXpha", " beta"], ("Alpha", "Al"), ("AlXpha", "AlX"));
+}
+
+/// The same split, with the caret in the part that moved to the new paragraph: it stays on its
+/// character there.
+#[test]
+fn apply_remote_keeps_caret_in_the_tail_of_a_split() {
+    let mut s = Session::new(Document::from_text("Alpha beta\nEnd\n"));
+    share(&mut s);
+    let first = s.doc.para_paths(StoryRef::Body)[0].clone();
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, first, 8));
+    s.apply_remote(|d| {
+        if let Ok(body) = d.story_mut(StoryRef::Body) {
+            body.remove(0);
+            for (i, t) in ["Alpha", " beta"].into_iter().enumerate() {
+                let mut p = Paragraph::with_text(t, Default::default());
+                p.pid = 300 + i as u64;
+                body.insert(i, Arc::new(Block::Para(p)));
+            }
+        }
+    })
+    .unwrap();
+    let at = s.sel.focus.clone();
+    let p = s.doc.para_at(&at).unwrap();
+    assert_eq!((p.text.as_str(), &p.text[..at.off]), (" beta", " be"), "the same character of the tail");
 }
 
 #[test]

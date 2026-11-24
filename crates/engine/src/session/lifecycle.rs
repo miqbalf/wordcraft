@@ -180,6 +180,7 @@ impl Session {
             observer: None,
             live_undo: None,
             live_doc: None,
+            live_awaits: None,
         }
     }
 }
