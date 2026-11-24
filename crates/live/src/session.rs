@@ -54,6 +54,13 @@ use wordcraft_engine::{CmdError, EditObserver, Registry, Session};
 
 use crate::{LiveMap, LocalEdit, MapError, Refusal, assign_seed_pids, is_shareable, seed_blocks, share_pids};
 
+/// The notice after a paste that brought what live editing does not share (pictures, tables,
+/// fields, new styles…): it came in as text ([`crate::SHAREABLE`]).
+pub const PASTED_AS_TEXT: &str = "Pasted as text: pictures and tables can't be shared while others are editing.";
+
+/// The notice when a paste still could not be shared: nothing of it was applied.
+pub const PASTE_REFUSED: &str = "This paste can't be shared while others are editing, so nothing was pasted.";
+
 /// Another editor in the document, its caret `(paragraph id, char offset)`.
 pub type Peer = craft_live::Peer<(u64, usize)>;
 
@@ -341,15 +348,22 @@ impl<H: Hub> LiveEditing<H> {
     }
 
     /// Run a command on the session, refused when live editing does not allow it now, and
-    /// share its edit right away.
+    /// share its edit right away. A paste that came in as text says so
+    /// ([`PASTED_AS_TEXT`]) once it is shared.
     pub fn run(&mut self, session: &mut Session, id: &str, params: &Value) -> Result<Value, CmdError> {
         if !self.allows(id) {
             let why = self.refusal_for(id);
             self.core.push_notice(why.clone());
             return Err(CmdError::Disabled(why));
         }
+        let body = session.doc.body.clone();
         let result = session.run(id, params);
         self.flush(session);
+        // A refused edit was put back to the very blocks it started from.
+        let kept = body.len() != session.doc.body.len() || body.iter().zip(&session.doc.body).any(|(a, b)| !Arc::ptr_eq(a, b));
+        if kept && result.as_ref().is_ok_and(|v| v.get("asText").and_then(Value::as_bool) == Some(true)) {
+            self.core.push_notice(PASTED_AS_TEXT.to_owned());
+        }
         result
     }
 
@@ -506,6 +520,11 @@ impl<H: Hub> LiveEditing<H> {
 fn refusal_text(e: &MapError) -> &'static str {
     match e {
         MapError::NoSpace { .. } => CONNECTING,
+        // A paste is kept to what is shared before it runs; one still refused is refused whole.
+        MapError::NotShareable { command, .. } if command.starts_with("edit.paste") => PASTE_REFUSED,
+        MapError::NotShareable { command, reason: Refusal::InlineObject } if command == "edit.cut" => {
+            "Pictures and other objects can't be cut while others are editing."
+        }
         MapError::NotShareable { command, reason: Refusal::InlineObject } => {
             if is_image(command) {
                 "Images can't be added while others are editing."
@@ -542,8 +561,9 @@ fn command_text(id: &str) -> &'static str {
         "Bullets and numbering are locked during live editing."
     } else if id.starts_with("review.") || has(&["comment"]) {
         "Comments and tracked changes are off during live editing."
-    } else if id == "edit.paste" || id == "edit.cut" || id.starts_with("edit.paste") {
-        "Paste and cut are off during live editing."
+    } else if id.starts_with("edit.paste") {
+        // Paste and Keep Text Only are shared; the Clipboard pane and Paste Formatting are not.
+        "This paste option is off during live editing. Use Paste or Keep Text Only."
     } else {
         "This command isn't available while others are editing."
     }

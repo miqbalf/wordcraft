@@ -108,7 +108,8 @@ use wordcraft_engine::{CmdError, Session};
 
 pub use map::{RECOVERED_STYLE, RECOVERED_STYLE_ID, assign_seed_pids, seed_blocks, seed_ids, write_pids};
 pub use session::{
-    Access, ENDED_KIND, LiveEditing, LiveFail, LiveStatus, NOTICE_KIND, Peer, SAVED_KIND, SERVICE_UID, SaveEvent, Tap, Word, document_from_state,
+    Access, ENDED_KIND, LiveEditing, LiveFail, LiveStatus, NOTICE_KIND, PASTE_REFUSED, PASTED_AS_TEXT, Peer, SAVED_KIND, SERVICE_UID, SaveEvent, Tap,
+    Word, document_from_state,
 };
 pub use shareable::{SHAREABLE, is_shareable};
 

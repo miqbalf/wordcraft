@@ -488,7 +488,10 @@ fn a_command_is_reported_once_and_put_back_whole() {
 #[test]
 fn objects_are_not_shared() {
     assert!(!is_shareable("insert.picture"), "pictures are not shared");
-    assert!(!is_shareable("edit.paste"), "paste may carry objects");
+    // Paste and cut are shared: what a paste brings that is not (pictures, tables, new styles…)
+    // comes in as text, and the safety net below still refuses what slips through.
+    assert!(is_shareable("edit.paste") && is_shareable("edit.cut"), "paste and cut are shared");
+    assert!(!is_shareable("edit.pasteClipboardItem"), "the Clipboard pane is not");
     assert!(is_shareable("text.insert") && is_shareable("para.moveUp"));
     let commands = wordcraft_engine::cmd::registry();
     for id in wordcraft_live::SHAREABLE {

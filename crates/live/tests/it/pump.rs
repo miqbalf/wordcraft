@@ -14,6 +14,8 @@ use wordcraft_live::{Access, ENDED_KIND, LiveEditing, LiveStatus, NOTICE_KIND, S
 
 use super::{Rng, plain, random_off, texts};
 
+mod paste;
+
 const ROOM: &str = "doc:inst:42";
 
 /// One connection as the fake relay sees it.
