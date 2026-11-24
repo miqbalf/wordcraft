@@ -55,6 +55,7 @@ fn find(p: &Paragraph, word: &str) -> usize {
 fn improve_replaces_only_changed_words() {
     let mut s = session(&["she go to school yesterday", "Untouched paragraph."]);
     format(&mut s, 0, 0, 3, &|c| c.italic = Some(true));
+    format(&mut s, 0, 4, 6, &|c| c.underline = Some(wordcraft_doc::props::Underline::Single));
     format(&mut s, 0, 17, 26, &|c| c.bold = Some(true));
     select(&mut s, (0, 2), (0, 2));
     let before = s.doc.clone();
@@ -69,6 +70,7 @@ fn improve_replaces_only_changed_words() {
     let (go, went) = (find(old, "go"), find(new, "went"));
     assert_eq!(oc[..go], nc[..went], "the words before the change keep their formatting");
     assert_eq!(oc[go + 2..], nc[went + 4..], "the words after the change keep their formatting");
+    assert!(nc[went..went + 4].iter().all(|(_, c)| *c == oc[go].1), "the new word takes the formatting of the word it replaces");
     assert!(new.run_ranges().all(|(_, c)| c.ins.is_none() && c.del.is_none()), "nothing tracked with Track Changes off");
     assert!(Arc::ptr_eq(&before.body[1], &s.doc.body[1]), "the other paragraph is the same block");
 }
@@ -95,8 +97,10 @@ fn partial_selection_changes_only_the_selected_text() {
     select(&mut s, (0, 3), (0, 13));
     let src = s.run("review.improveSource", &json!({})).unwrap();
     assert_eq!(src["text"], para(&s, 0).text[3..13], "only the selected part is sent");
-    improve(&mut s, "ha this be").unwrap();
-    assert_eq!(para(&s, 0).text, "alpha this beta", "the text outside the selection is kept");
+    improve(&mut s, "ha these be").unwrap();
+    assert_eq!(para(&s, 0).text, "alpha these beta", "the text outside the selection is kept");
+    let (a, b) = s.sel.ordered();
+    assert_eq!(&para(&s, 0).text[a.off..b.off], "ha these be", "the improved text is left selected");
 }
 
 #[test]
@@ -280,4 +284,79 @@ fn summary_source_caps_at_204800_bytes_on_a_char_boundary() {
     assert!(text.len() <= SUMMARIZE_MAX_BYTES && text.len() + 4 > SUMMARIZE_MAX_BYTES, "{}", text.len());
     assert!(big.starts_with(text), "a prefix of the body");
     assert_eq!(r["truncated"], true);
+}
+
+#[test]
+fn a_replaced_word_keeps_its_own_bold_and_link() {
+    let mut s = session(&["The deadline is Friday, see the documnet now"]);
+    format(&mut s, 0, 4, 12, &|c| c.bold = Some(true));
+    let link = s.doc.body[0].as_para().unwrap().text.find("documnet").unwrap();
+    format(&mut s, 0, link, link + 8, &|c| c.link = Some("https://example.com/doc".into()));
+    select(&mut s, (0, 0), (0, 0));
+    improve(&mut s, "The due date is Friday, see the document now").unwrap();
+    let p = para(&s, 0);
+    let (due, doc) = (find(p, "due date"), find(p, "document"));
+    assert!((due..due + 8).all(|i| p.props_of_char(i).bold == Some(true)), "a rephrased bold word stays bold: {:?}", p.runs);
+    let linked: Vec<Option<String>> = (doc..doc + 8).map(|i| p.props_of_char(i).link.clone()).collect();
+    assert!(linked.iter().all(|l| l.as_deref() == Some("https://example.com/doc")), "the corrected word stays in its link: {linked:?}");
+    assert!(p.props_of_char(find(p, " now")).link.is_none(), "the link does not grow past its word");
+}
+
+#[test]
+fn inserted_words_skip_note_anchors_and_symbols_before_them() {
+    let setups: [(&str, &dyn Fn(&mut Session)); 2] = [
+        ("footnote", &|s| {
+            select(s, (0, 16), (0, 16));
+            s.run("references.footnote", &json!({"text": "Source."})).unwrap();
+        }),
+        ("symbol", &|s| {
+            select(s, (0, 16), (0, 16));
+            s.run("insert.symbol", &json!({"char": "\u{F0E0}", "font": "Wingdings"})).unwrap();
+        }),
+    ];
+    for (what, setup) in setups {
+        let mut s = session(&["It was measured. The tree go fast."]);
+        setup(&mut s);
+        let text = para(&s, 0).text.clone();
+        let start = text.find("The").unwrap();
+        let plain = para(&s, 0).props_of_char(start).clone();
+        select(&mut s, (0, start), (0, text.len()));
+        improve(&mut s, "Indeed The tree goes fast.").unwrap();
+        let p = para(&s, 0);
+        let at = find(p, "Indeed");
+        let got = p.props_of_char(at);
+        assert!(!matches!(got.style.as_deref(), Some("FootnoteReference" | "EndnoteReference")), "{what}: not a note number: {got:?}");
+        assert!(got.sym_font.is_none() && got.font == plain.font, "{what}: not in the symbol's font: {got:?}");
+        assert_eq!(*got, plain, "{what}: formatted as the text around it");
+    }
+}
+
+#[test]
+fn a_blank_line_inside_a_paragraph_is_refused_at_the_source() {
+    let mut s = session(&["line one\n\nline two"]);
+    assert_eq!(failed(s.run("review.improveSource", &json!({}))), BLANK_LINE);
+    let mut s = session(&["line one\nline two"]);
+    assert_eq!(s.run("review.improveSource", &json!({})).unwrap()["text"], "line one\nline two", "one line break is allowed");
+}
+
+#[test]
+fn single_newlines_in_a_reply_are_spaces_unless_the_paragraph_had_line_breaks() {
+    let mut s = session(&["she go to school"]);
+    improve(&mut s, "she went to\nschool").unwrap();
+    assert_eq!(para(&s, 0).text, "she went to school", "a wrapped reply is not a line break");
+    let mut s = session(&["one fsh\ntwo fsh"]);
+    improve(&mut s, "one fish\ntwo fish").unwrap();
+    assert_eq!(para(&s, 0).text, "one fish\ntwo fish", "the paragraph's own line break stays");
+}
+
+#[test]
+fn objects_and_control_characters_in_a_reply_are_left_out() {
+    let mut s = session(&["she go to school"]);
+    improve(&mut s, "she went\u{000B} to\u{FFFC}\u{000C} school\r").unwrap();
+    let p = para(&s, 0);
+    assert_eq!(p.text, "she went to school");
+    assert!(p.objects.is_empty() && s.doc.body.len() == 1, "no object, break or new paragraph");
+    let mut s = session(&["she go to school"]);
+    improve(&mut s, "she went\rto school").unwrap();
+    assert_eq!(para(&s, 0).text, "she went to school", "a lone carriage return is a line end, then a space");
 }

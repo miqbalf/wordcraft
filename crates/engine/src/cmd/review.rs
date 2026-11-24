@@ -24,8 +24,8 @@ use comments::{
 };
 pub use comments::{comment_list, comment_range_at_caret};
 pub use improve::{
-    ACROSS_CELLS, EMPTY_DOCUMENT, HAS_CHANGES, HAS_OBJECTS, IMPROVE_MAX_BYTES, NO_TEXT, PARAGRAPHS_CHANGED, SUMMARIZE_MAX_BYTES, TEXT_CHANGED,
-    TOO_LONG,
+    ACROSS_CELLS, BLANK_LINE, EMPTY_DOCUMENT, HAS_CHANGES, HAS_OBJECTS, IMPROVE_MAX_BYTES, NO_TEXT, PARAGRAPHS_CHANGED, SUMMARIZE_MAX_BYTES,
+    TEXT_CHANGED, TOO_LONG,
 };
 use proofing::{all_issues, issue_at, next_issue, suggestions, thesaurus, word_count};
 

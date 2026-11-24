@@ -32,6 +32,7 @@ pub const TOO_LONG: &str = "This text is too long to improve. Select less text."
 pub const TEXT_CHANGED: &str = "The text changed while the AI was working, so nothing was replaced.";
 pub const PARAGRAPHS_CHANGED: &str = "The proposal changed the number of paragraphs, so nothing was replaced.";
 pub const EMPTY_DOCUMENT: &str = "The document is empty.";
+pub const BLANK_LINE: &str = "Improve can't keep an empty line inside a paragraph. Select text without it.";
 
 /// Paragraphs are sent, and come back, separated by a blank line.
 const SEPARATOR: &str = "\n\n";
@@ -103,6 +104,11 @@ fn source(s: &Session, anchor: &Pos, focus: &Pos) -> Result<Source, &'static str
             // White space only (an empty paragraph between two others): not sent, left alone.
             continue;
         }
+        // An empty line inside the paragraph would read as the paragraph separator, so no reply
+        // could keep the paragraph count: refused before the AI is asked.
+        if has_blank_line(para.text.get(start..end).unwrap_or("")) {
+            return Err(BLANK_LINE);
+        }
         for run in wordcraft_layout::para::proof_runs(&s.doc, para, None) {
             let overlap = run.range.end.min(end).saturating_sub(run.range.start.max(start));
             if overlap > 0 && !run.skip {
@@ -171,28 +177,40 @@ pub(super) fn improve_source(s: &mut Session, _: &Value) -> CmdResult {
     Ok(json!({"text": src.text, "language": src.language, "anchor": pos_json(&src.start), "focus": pos_json(&src.end)}))
 }
 
-/// The proposal's paragraphs: line ends normalised, the whole trimmed, split on blank lines,
-/// each trimmed. Characters that would split a paragraph or stand for an object or a break are
-/// left out; a single line end stays a line break.
-fn proposal_paragraphs(proposal: &str) -> Vec<String> {
+/// Whether `text` holds an empty line: a line end, then only white space, then another.
+fn has_blank_line(text: &str) -> bool {
+    let lines: Vec<&str> = text.split('\n').collect();
+    lines.get(1..lines.len().saturating_sub(1)).is_some_and(|inner| inner.iter().any(|l| l.trim().is_empty()))
+}
+
+/// The proposal's paragraphs, each as its lines: line ends normalised, the whole trimmed, split
+/// on blank lines. Characters that would split a paragraph or stand for an object or a break are
+/// left out.
+fn proposal_paragraphs(proposal: &str) -> Vec<Vec<String>> {
     let text = proposal.replace("\r\n", "\n").replace(['\r', '\u{2028}', '\u{2029}'], "\n");
     let clean: String = text.chars().filter(|c| *c == '\n' || *c == '\t' || (!c.is_control() && *c != OBJ)).collect();
-    let mut out: Vec<String> = Vec::new();
-    let mut cur: Vec<&str> = Vec::new();
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
     for line in clean.trim().split('\n') {
         if line.trim().is_empty() {
             if !cur.is_empty() {
-                out.push(cur.join("\n").trim().to_string());
-                cur.clear();
+                out.push(std::mem::take(&mut cur));
             }
         } else {
-            cur.push(line);
+            cur.push(line.to_string());
         }
     }
     if !cur.is_empty() {
-        out.push(cur.join("\n").trim().to_string());
+        out.push(cur);
     }
     out
+}
+
+/// One paragraph of the proposal as text for a part: its lines joined by a line break when the
+/// part had line breaks of its own, else by a space (a reply wrapped at a fixed width is not a
+/// line break), then trimmed.
+fn paragraph_text(lines: &[String], line_breaks: bool) -> String {
+    if line_breaks { lines.join("\n").trim().to_string() } else { lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ").trim().to_string() }
 }
 
 /// A word and the white space after it, as byte ranges of the text (punctuation stays with its
@@ -294,23 +312,50 @@ fn hunks(old: &str, new: &str) -> Vec<(usize, usize, String)> {
     out
 }
 
-/// The formatting of text replacing `at..`: the word before it (the character before, past any
-/// white space), or at the paragraph's start the first replaced character, without its link or
-/// revision marks.
-fn props_before(p: &Paragraph, at: usize) -> CharProps {
-    let before = p.text.get(..at).unwrap_or("");
-    let word = before.char_indices().rev().find(|(_, c)| !c.is_whitespace()).map(|(i, _)| i);
-    let prev = before.char_indices().next_back().map(|(i, _)| i);
-    let props = match word.or(prev) {
+/// Formatting as the editor gives typed text: never a note number's style, a symbol's own font
+/// or a revision mark.
+fn typed(mut c: CharProps) -> CharProps {
+    if matches!(c.style.as_deref(), Some("FootnoteReference" | "EndnoteReference")) {
+        c.style = None;
+    }
+    c.ins = None;
+    c.del = None;
+    c.fmt_change = None;
+    c.rtl = None;
+    c.without_symbol()
+}
+
+/// Whether the character at `i` is part of a word whose formatting new words may take: not
+/// white space, an object (a note anchor, a field…) or a symbol.
+fn is_word_char(p: &Paragraph, i: usize, c: char) -> bool {
+    if c.is_whitespace() || c == OBJ {
+        return false;
+    }
+    let props = p.props_of_char(i);
+    let symbol = props.sym_font.as_deref().is_some_and(|f| !f.trim().is_empty())
+        || props.font.as_deref().is_some_and(wordcraft_doc::symbol_fonts::is_symbol_font);
+    !symbol && !matches!(props.style.as_deref(), Some("FootnoteReference" | "EndnoteReference"))
+}
+
+/// The formatting of the text replacing `x..y`.
+///
+/// Text that replaces words takes the formatting of the first word it replaces, link included,
+/// as typing over a selection does: a rephrased bold word stays bold, a corrected word in a link
+/// stays in it. Inserted words take the formatting of the word before them (past white space,
+/// objects and symbols), without its link; at the paragraph's start, that of the text after.
+fn props_for(p: &Paragraph, x: usize, y: usize) -> CharProps {
+    let replaced = p.text.get(x..y).unwrap_or("");
+    if let Some((i, _)) = replaced.char_indices().find(|(_, c)| !c.is_whitespace()) {
+        return typed(p.props_of_char(x + i).clone());
+    }
+    let before = p.text.get(..x).unwrap_or("");
+    let word = before.char_indices().rev().find(|(i, c)| is_word_char(p, *i, *c)).map(|(i, _)| i);
+    let props = match word {
         Some(i) => p.props_of_char(i),
-        None if at < p.len() => p.props_of_char(at),
-        None => p.props_at(at),
+        None if x < p.len() => p.props_of_char(x),
+        None => p.props_at(x),
     };
-    let mut out = props.unlinked();
-    out.ins = None;
-    out.del = None;
-    out.fmt_change = None;
-    out
+    typed(props.unlinked())
 }
 
 /// `review.improveApply`: replace the range's text with the proposal, word by word.
@@ -328,8 +373,20 @@ pub(super) fn improve_apply(s: &mut Session, v: &Value) -> CmdResult {
     if src.text != original {
         return Err(changed());
     }
-    let paras = proposal_paragraphs(proposal);
-    if paras.len() != src.parts.len() || paras.iter().any(String::is_empty) {
+    let pieces = proposal_paragraphs(proposal);
+    if pieces.len() != src.parts.len() {
+        return Err(CmdError::Failed(PARAGRAPHS_CHANGED.into()));
+    }
+    let paras: Vec<String> = src
+        .parts
+        .iter()
+        .zip(&pieces)
+        .map(|(part, lines)| {
+            let own = s.doc.para(src.story, &part.path).and_then(|q| q.text.get(part.start..part.end)).is_some_and(|t| t.contains('\n'));
+            paragraph_text(lines, own)
+        })
+        .collect();
+    if paras.iter().any(String::is_empty) {
         return Err(CmdError::Failed(PARAGRAPHS_CHANGED.into()));
     }
     let end_len = s.doc.para_at(&src.end).map(Paragraph::len).unwrap_or(0);
@@ -339,7 +396,7 @@ pub(super) fn improve_apply(s: &mut Session, v: &Value) -> CmdResult {
         let old = s.doc.para(src.story, &part.path).and_then(|q| q.text.get(part.start..part.end)).unwrap_or("").to_string();
         for (x, y, text) in hunks(&old, new).into_iter().rev() {
             let (x, y) = (part.start + x, part.start + y);
-            let props = s.doc.para(src.story, &part.path).map(|q| props_before(q, x)).unwrap_or_default();
+            let props = s.doc.para(src.story, &part.path).map(|q| props_for(q, x, y)).unwrap_or_default();
             s.sel = Selection { anchor: at(x), focus: at(y) };
             s.pending = Some(props);
             if text.is_empty() {
