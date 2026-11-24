@@ -294,10 +294,6 @@ impl LiveMap {
         if k > n {
             return None;
         }
-        ops.remove(p);
-        if ops.at(p).is_some() {
-            return None;
-        }
         let head = self.mint(ops.live, taken);
         let part = |id: u64, from: usize, to: usize| SeedBlock {
             id,
@@ -306,8 +302,18 @@ impl LiveMap {
             runs: diff::slice_runs(&src.runs, from, to),
         };
         let (h, t) = (part(head, 0, k), part(tail, k, n));
-        ops.insert(at, &h);
-        ops.insert(at + 1, &t);
+        // The parts go in right after the paragraph and only then is it taken out: each of
+        // these is its own update, and an editor that gets them one at a time then never sees
+        // the paragraph gone with nothing in its place (its caret would have nowhere to go).
+        ops.insert(at + 1, &h);
+        ops.insert(at + 2, &t);
+        ops.remove(p);
+        if ops.at(p).is_some() {
+            // The paragraph is in the order twice: take the parts out again.
+            ops.remove(head);
+            ops.remove(tail);
+            return None;
+        }
         let parts = vec![Part { start: 0, to: head, to_text: h.text }, Part { start: k, to: tail, to_text: t.text }];
         self.moved.insert(p, Moved { from_text: src.text, from_runs: src.runs, from_attrs: src.attrs, parts });
         Some(head)

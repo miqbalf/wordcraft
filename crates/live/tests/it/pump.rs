@@ -1234,6 +1234,62 @@ fn typing_at_the_end_follows_two_splits() {
     assert_eq!(texts(&a.s.doc), ["T7 test report", "This is a ", "", "small test document for the share proof. TAILONE TAILTWO"]);
 }
 
+/// A split that reaches the other editor one message at a time (as a browser can get it):
+/// that editor's caret, at the end of the split paragraph, stays at the end of the tail.
+#[test]
+fn a_split_delivered_in_pieces_keeps_the_caret() {
+    let relay = relay(None);
+    let bytes = file(&["T7 test report", "This is a small test document for the share proof."]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    b.end_of(1);
+    a.caret(1, 10);
+    assert!(a.run("text.newParagraph", json!({})));
+    relay.borrow_mut().one_per_poll = true;
+    for _ in 0..10 {
+        b.pump();
+    }
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(b.run("text.insert", json!({"text": "X"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "a split in pieces");
+    assert_eq!(texts(&a.s.doc), ["T7 test report", "This is a ", "small test document for the share proof.X"]);
+}
+
+/// Typing a char at a time at the end of a paragraph while another editor splits it, with the
+/// split arriving at every point of the typing: the caret stays at the end of the typing.
+#[test]
+fn typing_char_by_char_follows_a_split() {
+    for at in 0..=8 {
+        for a_at in 0..=8 {
+            let relay = relay(None);
+            let bytes = file(&["T7 test report", "This is a small test document for the share proof."]);
+            let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+            let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+            settle(&relay, &mut [&mut a, &mut b]);
+            b.end_of(1);
+            for (i, c) in " TAILONE".chars().enumerate() {
+                if i == at {
+                    a.caret(1, 10);
+                    assert!(a.run("text.newParagraph", json!({})));
+                }
+                if i == a_at {
+                    a.pump();
+                }
+                assert!(b.run("text.insert", json!({"text": c.to_string()})));
+                b.pump();
+            }
+            settle(&relay, &mut [&mut a, &mut b]);
+            assert!(b.run("text.insert", json!({"text": "X"})));
+            settle(&relay, &mut [&mut a, &mut b]);
+            assert_same(&a, &b, "char by char");
+            let t = texts(&a.s.doc);
+            assert!(t.last().is_some_and(|l| l.ends_with("TAILONEX")), "split at {at}, alice pumps at {a_at}: {t:?}");
+        }
+    }
+}
+
 /// Two separate edits racing a split, one in the head and one in the tail, reach the splitter
 /// together; each lands in its own part, and the split stays where it was made.
 #[test]
