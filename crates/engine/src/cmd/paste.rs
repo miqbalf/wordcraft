@@ -444,7 +444,7 @@ pub struct Lost {
     /// Footnote and endnote marks.
     pub notes: bool,
     /// Formatting only: a paragraph or character style or a list the document lacks, a section
-    /// break, a tracked change the document does not hold, a content control, a phonetic guide.
+    /// break, a tracked change, a content control, a phonetic guide.
     pub formatting: bool,
     /// Something visible was taken out and no text is left: nothing is pasted.
     pub nothing_left: bool,
@@ -482,7 +482,8 @@ impl Lost {
 /// - an inline object becomes its text: a field its result, an equation its linear text, a
 ///   text box the text inside it, a picture, shape, note mark, bookmark or comment anchor none;
 /// - a paragraph or character style `doc` lacks, a list `doc` lacks, a section break, and
-///   tracked changes `doc` does not hold are dropped (text such a change deleted goes);
+///   every tracked mark are dropped (text a tracked change deleted goes); a paragraph that held
+///   only objects leaves no empty paragraph;
 /// - media and text box stories stay behind.
 ///
 /// What is left only refers to what `doc` already has. [`Lost`] records each kind taken out,
@@ -500,11 +501,22 @@ pub fn live_text(doc: &Document, frag: Fragment) -> (Fragment, Lost) {
             }
         }
     }
-    for b in &mut blocks {
-        if let Block::Para(p) = b {
-            keep_shared(doc, &parts, p, &mut lost);
-        }
-    }
+    // A paragraph that held only objects (a picture alone) and is empty once they are text
+    // leaves nothing behind, not an empty paragraph.
+    let only_objects = |b: &Block| b.as_para().is_some_and(|p| !p.text.is_empty() && p.text.chars().all(|c| c == wordcraft_doc::para::OBJ));
+    blocks = blocks
+        .into_iter()
+        .filter_map(|mut b| {
+            let was_objects = only_objects(&b);
+            if let Block::Para(p) = &mut b {
+                keep_shared(doc, &parts, p, &mut lost);
+                if was_objects && p.text.is_empty() {
+                    return None;
+                }
+            }
+            Some(b)
+        })
+        .collect();
     let text_left = blocks.iter().any(|b| b.as_para().is_some_and(|p| !p.text.is_empty()));
     lost.nothing_left = lost.content() && !text_left;
     (Fragment { blocks, parts: Default::default(), media: Default::default() }, lost)
@@ -598,10 +610,9 @@ fn object_text(o: &wordcraft_doc::InlineObject, parts: &std::collections::BTreeM
 fn keep_shared(doc: &Document, parts: &std::collections::BTreeMap<u32, wordcraft_doc::Part>, p: &mut Paragraph, lost: &mut Lost) {
     use wordcraft_doc::para::OBJ;
     let mut changed = false;
-    // Tracked changes the document holds stay; others would add a revision. Text deleted by
-    // one of those is gone.
-    let rev_ok = |r: Option<u32>| r.is_none_or(|i| usize::try_from(i).is_ok_and(|i| i < doc.revisions.len()));
-    let gone: Vec<std::ops::Range<usize>> = p.run_ranges().filter(|(_, c)| c.del.is_some() && !rev_ok(c.del)).map(|(r, _)| r).collect();
+    // Tracked changes are off while live: no tracked mark comes in, even one naming a revision
+    // the document holds (it would be another author's), and text a tracked change deleted goes.
+    let gone: Vec<std::ops::Range<usize>> = p.run_ranges().filter(|(_, c)| c.del.is_some()).map(|(r, _)| r).collect();
     for r in gone.into_iter().rev() {
         if p.delete(r.start, r.end).is_ok() {
             changed = true;
@@ -635,23 +646,23 @@ fn keep_shared(doc: &Document, parts: &std::collections::BTreeMap<u32, wordcraft
     if taken(p.section.is_some(), lost) {
         p.section = None;
     }
-    if taken(!rev_ok(p.props.num_change.as_ref().map(|c| c.rev)), lost) {
+    if taken(p.props.num_change.is_some(), lost) {
         p.props.num_change = None;
     }
-    if taken(!rev_ok(p.props.fmt_change.as_ref().map(|c| c.rev)), lost) {
+    if taken(p.props.fmt_change.is_some(), lost) {
         p.props.fmt_change = None;
     }
     for props in p.runs.iter_mut().map(|r| &mut r.props).chain(std::iter::once(&mut p.mark)) {
         if taken(!style_ok(&props.style), lost) {
             props.style = None;
         }
-        if taken(!rev_ok(props.ins), lost) {
+        if taken(props.ins.is_some(), lost) {
             props.ins = None;
         }
-        if taken(!rev_ok(props.del), lost) {
+        if taken(props.del.is_some(), lost) {
             props.del = None;
         }
-        if taken(!rev_ok(props.fmt_change.as_ref().map(|c| c.rev)), lost) {
+        if taken(props.fmt_change.is_some(), lost) {
             props.fmt_change = None;
         }
     }

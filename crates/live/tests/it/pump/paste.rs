@@ -4,6 +4,9 @@ use wordcraft_doc::edit::Fragment;
 use wordcraft_doc::{Block, Document, InlineObject, Paragraph, StoryRef};
 use wordcraft_live::{PASTED_AS_TEXT, PASTED_WITHOUT_FORMATTING, paste_notice};
 
+/// craft-live's notice for an Undo that would remove another editor's text.
+const UNDO_TAKES_OTHERS: &str = "Someone else has typed in what this Undo would remove, so it wasn't undone.";
+
 use super::*;
 
 /// A one-pixel PNG, for a picture to copy.
@@ -437,28 +440,156 @@ fn bob_typing_while_alice_pastes_converges() {
     assert_converged(&a, &b, "after typing racing a paste");
 }
 
-/// Alice undoes a paste after Bob typed inside it: Bob's typing inside the pasted text of a
-/// paragraph that was there before stays, and both editors converge (review I4). Bob's typing
-/// inside a paragraph the paste made goes with that paragraph: craft-collab's undo takes back the
-/// block it inserted, with whatever is in it (see the LP1 report, fix round 1).
+/// Alice undoes a paste after Bob typed inside its text, in a paragraph that was there before:
+/// the undo takes back only Alice's characters, so Bob's typing stays (review I4).
 #[test]
-fn undo_of_a_paste_bob_typed_into_keeps_his_typing() {
+fn undo_of_a_paste_keeps_bobs_typing_in_an_old_paragraph() {
     let (relay, mut a, mut b) = two(&["One", "Two"]);
     a.end_of(0);
     assert!(a.run("edit.paste", json!({"text": " pasted\nnew paragraph\nend", "privateClipboard": false})));
     settle(&relay, &mut [&mut a, &mut b]);
     assert_eq!(texts(&b.s.doc), ["One pasted", "new paragraph", "end", "Two"]);
-    // Inside Alice's " pasted", in the paragraph that was there before.
     b.caret(0, 6);
     assert!(b.run("text.insert", json!({"text": "BOB"})));
-    // In a paragraph the paste made.
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(a.run("edit.undo", json!({})));
+    assert!(a.le.take_notices().is_empty(), "the undo ran");
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["OneBOB", "Two"], "Bob's typing stays; Alice's paste went");
+    assert_converged(&a, &b, "after undoing a paste Bob typed into");
+}
+
+/// Undo never removes another person's text: Bob typed in a paragraph Alice's paste made, which
+/// her Undo would remove whole, so it is refused with a message and nothing changes; the step
+/// stays, and once Bob's typing is gone again the Undo works (review round 2, item 1).
+#[test]
+fn undo_of_a_paste_bob_typed_in_is_refused() {
+    let (relay, mut a, mut b) = two(&["One", "Two"]);
+    a.end_of(0);
+    assert!(a.run("edit.paste", json!({"text": " pasted\nnew paragraph\nend", "privateClipboard": false})));
+    settle(&relay, &mut [&mut a, &mut b]);
     b.caret(1, 3);
     assert!(b.run("text.insert", json!({"text": "NEW"})));
     settle(&relay, &mut [&mut a, &mut b]);
-    assert!(a.run("edit.undo", json!({})));
+    let want = ["One pasted", "newNEW paragraph", "end", "Two"];
+    let _ = a.run("edit.undo", json!({}));
+    assert_eq!(a.le.take_notices(), [UNDO_TAKES_OTHERS]);
     settle(&relay, &mut [&mut a, &mut b]);
-    assert_eq!(texts(&b.s.doc), ["OneBOB", "Two"], "Bob's typing in the old paragraph stays; Alice's paste went");
-    assert_converged(&a, &b, "after undoing a paste Bob typed into");
+    assert_eq!(texts(&a.s.doc), want, "nothing was undone");
+    assert_eq!(texts(&b.s.doc), want, "Bob keeps his typing");
+    assert_converged(&a, &b, "after a refused undo");
+    // Bob takes his typing back: Alice's Undo, still there, now runs.
+    select(&mut b, (1, 3), (1, 6));
+    assert!(b.run("text.delete", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(a.run("edit.undo", json!({})));
+    assert!(a.le.take_notices().is_empty());
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["One", "Two"]);
+    assert_converged(&a, &b, "after the undo ran");
+}
+
+/// The same for Enter: Bob typed in the paragraph Alice's Enter made, so undoing the Enter is
+/// refused and Bob's text stays (review round 2, item 1).
+#[test]
+fn undo_of_enter_is_refused_when_bob_typed_in_the_new_paragraph() {
+    let (relay, mut a, mut b) = two(&["Hello world"]);
+    a.caret(0, 5);
+    assert!(a.run("text.newParagraph", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Hello", " world"]);
+    b.end_of(1);
+    assert!(b.run("text.insert", json!({"text": " BOB"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    let _ = a.run("edit.undo", json!({}));
+    assert_eq!(a.le.take_notices(), [UNDO_TAKES_OTHERS]);
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Hello", " world BOB"]);
+    assert_converged(&a, &b, "after a refused undo of Enter");
+}
+
+/// The file's bytes: a paragraph, a 2x2 table, a paragraph.
+fn file_with_a_table() -> Vec<u8> {
+    let mut s = Session::new(Document::from_text("Before"));
+    s.sel = Selection::caret(Pos::body(0, 6));
+    s.run("insert.table", &json!({"rows": 2, "cols": 2})).unwrap();
+    save_bytes("plan.docx", &s.doc).unwrap()
+}
+
+/// While live, a cut that would change a table (the whole table, a cell range, or a selection
+/// across one) is refused with a message and changes nothing; Copy still works (review M2).
+#[test]
+fn a_cut_of_a_table_is_refused() {
+    let bytes = file_with_a_table();
+    let relay = relay(None);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(tables(&a.s.doc), 1);
+    let at = a.s.doc.body.iter().position(|b| b.as_table().is_some()).unwrap();
+    let before = a.s.doc.clone();
+    let last = a.s.doc.body.len() - 1;
+    // Across the table.
+    select(&mut a, (0, 2), (last, 0));
+    let err = a.le.run(&mut a.s, "edit.cut", &json!({})).unwrap_err().to_string();
+    assert!(err.contains("Tables can't be changed while others are editing. Copy still works."), "{err}");
+    assert!(before.same_content(&a.s.doc), "nothing cut");
+    // The whole table.
+    a.s.sel = Selection::caret(Pos { story: StoryRef::Body, path: wordcraft_doc::Path(vec![at as u32, 0, 0, 0]), off: 0 });
+    assert!(a.run("table.selectTable", json!({})));
+    let err = a.le.run(&mut a.s, "edit.cut", &json!({})).unwrap_err().to_string();
+    assert!(err.contains("Tables can't be changed"), "{err}");
+    assert!(before.same_content(&a.s.doc), "nothing cut");
+    // Copy still works.
+    assert!(a.run("edit.copy", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(tables(&b.s.doc), 1, "Bob keeps the table");
+    assert_converged(&a, &b, "after a refused cut of a table");
+}
+
+/// Tracked changes are off while live, so a paste brings no tracked marks, even ones naming a
+/// revision the document holds; text a tracked change deleted does not come (review M3).
+#[test]
+fn a_paste_brings_no_tracked_changes() {
+    let mut s = Session::new(Document::from_text("Hello"));
+    s.doc.settings.track_changes = true;
+    s.sel = Selection::caret(Pos::body(0, 5));
+    s.run("text.insert", &json!({"text": " tracked"})).unwrap();
+    s.doc.settings.track_changes = false;
+    assert!(!s.doc.revisions.is_empty(), "the file holds a revision");
+    let bytes = save_bytes("plan.docx", &s.doc).unwrap();
+    let relay = relay(None);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    let ins = wordcraft_doc::CharProps { ins: Some(0), ..Default::default() };
+    let del = wordcraft_doc::CharProps { del: Some(0), ..Default::default() };
+    let mut p = Paragraph::with_text("Kept", ins);
+    let _ = p.insert_text(p.text.len(), "Gone", &del);
+    a.s.clipboard = Some(fragment(vec![p]));
+    a.end_of(0);
+    assert!(a.run("edit.paste", json!({})));
+    assert_eq!(a.le.take_notices(), [PASTED_WITHOUT_FORMATTING]);
+    settle(&relay, &mut [&mut a, &mut b]);
+    let para = b.s.doc.body[0].as_para().unwrap().clone();
+    assert!(para.text.ends_with("Kept"), "{:?}", para.text);
+    assert!(!para.text.contains("Gone"), "deleted text does not come");
+    let at = para.text.len() - 4;
+    assert!(para.run_ranges().filter(|(r, _)| r.start >= at).all(|(_, c)| c.ins.is_none() && c.del.is_none()), "no tracked mark came");
+    assert_converged(&a, &b, "after a paste with tracked marks");
+}
+
+/// A paragraph that held only a picture leaves no empty paragraph behind (review N3).
+#[test]
+fn a_picture_only_paragraph_leaves_no_empty_paragraph() {
+    let (relay, mut a, mut b) = two(&["Hello", "World"]);
+    let html = format!("<p>Before</p><p><img src=\"data:image/png;base64,{PIXEL}\"></p><p>After</p>");
+    a.end_of(1);
+    assert!(a.run("edit.paste", json!({"text": "Before\n\nAfter", "html": html})));
+    assert_eq!(a.le.take_notices(), ["Pasted as text: pictures can't be shared while others are editing."]);
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Hello", "WorldBefore", "After"]);
+    assert_converged(&a, &b, "after pasting around a picture");
 }
 
 /// A paste over a selection across paragraphs: one delete and insert, shared as one edit.
