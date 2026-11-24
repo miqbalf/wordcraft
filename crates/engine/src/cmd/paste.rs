@@ -153,9 +153,12 @@ fn paste_special(s: &mut Session, v: &Value) -> CmdResult {
         "html" => adopt(s, import_html(&src)),
         _ => adopt(s, wordcraft_formats::rtf::import(src.as_bytes()).map_err(|e| CmdError::Failed(format!("bad RTF: {e}")))?),
     };
-    insert(s, frag)?;
+    let as_text = insert_pasted(s, frag)?;
     let mut r = sel_result(s)?;
     r["pastedAs"] = json!(fmt);
+    if as_text {
+        r["asText"] = json!(true);
+    }
     Ok(r)
 }
 
@@ -352,6 +355,15 @@ pub fn merge_formatting(s: &Session, frag: &mut Fragment) {
     }
 }
 
+/// A paste: [`insert`], with the fragment first kept to what live editing shares
+/// ([`live_text`]) while editing live ([`Session::editing_live`]). Returns whether that took
+/// anything out, so the paste came in as text.
+pub fn insert_pasted(s: &mut Session, frag: Fragment) -> Result<bool, CmdError> {
+    let (frag, as_text) = if s.editing_live() { live_text(&s.doc, frag) } else { (frag, false) };
+    insert(s, frag)?;
+    Ok(as_text)
+}
+
 /// Replace the selection with `frag`, marking it as an insertion under Track Changes.
 pub fn insert(s: &mut Session, mut frag: Fragment) -> Result<(), CmdError> {
     super::controls::prepare_edit(s)?;
@@ -396,6 +408,102 @@ pub fn insert(s: &mut Session, mut frag: Fragment) -> Result<(), CmdError> {
     Ok(())
 }
 
+/// What of a pasted fragment live co-editing can share, and whether anything was taken out.
+///
+/// Live editing shares the body's paragraphs: their text, character formatting and paragraph
+/// formatting. A paste must not bring what lives outside the body or is not shared, so here:
+/// a table becomes its paragraphs; a picture, shape, field, note or comment mark, bookmark and
+/// any other inline object becomes its text (a field its result, most none); a paragraph or
+/// character style `doc` lacks, a list `doc` lacks, and tracked changes `doc` does not hold are
+/// dropped (text such a change deleted goes); text boxes and media stay behind. What is left only refers to
+/// what `doc` already has.
+pub fn live_text(doc: &Document, frag: Fragment) -> (Fragment, bool) {
+    let mut lost = false;
+    let mut blocks = Vec::with_capacity(frag.blocks.len());
+    for b in frag.blocks {
+        flatten_tables(b, 0, &mut blocks, &mut lost);
+    }
+    for b in &mut blocks {
+        if let Block::Para(p) = b {
+            keep_shared(doc, p, &mut lost);
+        }
+    }
+    (Fragment { blocks, parts: Default::default(), media: Default::default() }, lost)
+}
+
+/// `b` as paragraphs: a table's own, in reading order (bounded depth; deeper ones are dropped).
+fn flatten_tables(b: Block, depth: usize, out: &mut Vec<Block>, lost: &mut bool) {
+    match b {
+        Block::Para(_) => out.push(b),
+        Block::Table(t) => {
+            *lost = true;
+            if depth > MAX_DEPTH {
+                return;
+            }
+            for row in t.rows {
+                for cell in row.cells {
+                    for cb in cell.blocks {
+                        flatten_tables(Arc::unwrap_or_clone(cb), depth + 1, out, lost);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// [`live_text`] for one paragraph.
+fn keep_shared(doc: &Document, p: &mut Paragraph, lost: &mut bool) {
+    use wordcraft_doc::para::OBJ;
+    let before = p.clone();
+    // Tracked changes the document holds stay; others would add a revision. Text deleted by
+    // one of those is gone.
+    let rev_ok = |r: Option<u32>| r.is_none_or(|i| usize::try_from(i).is_ok_and(|i| i < doc.revisions.len()));
+    let gone: Vec<std::ops::Range<usize>> = p.run_ranges().filter(|(_, c)| c.del.is_some() && !rev_ok(c.del)).map(|(r, _)| r).collect();
+    for r in gone.into_iter().rev() {
+        let _ = p.delete(r.start, r.end);
+    }
+    // Objects become their text, in the formatting they had.
+    let objects: Vec<(usize, String)> = p.objects_with_offsets().map(|(off, o)| (off, o.plain_text().to_owned())).collect();
+    for (off, text) in objects.into_iter().rev() {
+        let props = p.props_of_char(off).clone();
+        if p.delete(off, off + OBJ.len_utf8()).is_ok() {
+            let _ = p.insert_text(off, &text, &props);
+        }
+    }
+    let style_ok = |id: &Option<String>| id.as_deref().is_none_or(|id| doc.styles.get(id).is_some());
+    if !style_ok(&p.props.style) {
+        p.props.style = None;
+    }
+    if p.props.numbering.as_ref().is_some_and(|n| n.num != 0 && doc.numbering.num(n.num).is_none()) {
+        p.props.numbering = None;
+    }
+    if !rev_ok(p.props.num_change.as_ref().map(|c| c.rev)) {
+        p.props.num_change = None;
+    }
+    if !rev_ok(p.props.fmt_change.as_ref().map(|c| c.rev)) {
+        p.props.fmt_change = None;
+    }
+    for props in p.runs.iter_mut().map(|r| &mut r.props).chain(std::iter::once(&mut p.mark)) {
+        if !style_ok(&props.style) {
+            props.style = None;
+        }
+        if !rev_ok(props.ins) {
+            props.ins = None;
+        }
+        if !rev_ok(props.del) {
+            props.del = None;
+        }
+        if !rev_ok(props.fmt_change.as_ref().map(|c| c.rev)) {
+            props.fmt_change = None;
+        }
+    }
+    if *p != before {
+        *lost = true;
+        p.normalize();
+        p.touch();
+    }
+}
+
 /// Every paragraph in a block, tables included (bounded depth).
 pub(crate) fn each_para(b: &mut Block, depth: usize, f: &mut dyn FnMut(&mut Paragraph)) {
     if depth > MAX_DEPTH {
@@ -433,7 +541,9 @@ pub(crate) fn unlink_sections(blocks: &mut [Block]) {
 /// Turn an imported document into a fragment of the session's document: bring over the media,
 /// lists and styles it refers to (renumbered so they can't collide with ours).
 fn adopt(s: &mut Session, src: Document) -> Fragment {
-    let mut frag = s.doc.adopt(src);
+    // While editing live the document's styles, lists and media must not change: adopt into a
+    // copy, and `insert` keeps to what the document has (`live_text`).
+    let mut frag = if s.editing_live() { s.doc.clone().adopt(src) } else { s.doc.adopt(src) };
     // Pasted pictures fit our text width, like Insert › Pictures (layout keeps their size).
     let max_w = crate::io::text_width(&s.doc);
     for b in &mut frag.blocks {

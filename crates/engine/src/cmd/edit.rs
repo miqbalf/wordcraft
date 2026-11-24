@@ -304,19 +304,32 @@ fn insert_spike(s: &mut Session, _: &Value) -> CmdResult {
 /// else another program's HTML or RTF (#687). The system clipboard's text has none, so it pastes
 /// as Keep Text Only does.
 fn paste(s: &mut Session, v: &Value) -> CmdResult {
-    match super::paste::paste_content(s, v)? {
-        super::paste::Pasted::Fragment(frag) => super::paste::insert(s, frag)?,
-        super::paste::Pasted::Text(text) => super::paste::insert_text(s, &text)?,
+    let as_text = match super::paste::paste_content(s, v)? {
+        super::paste::Pasted::Fragment(frag) => super::paste::insert_pasted(s, frag)?,
+        super::paste::Pasted::Text(text) => {
+            super::paste::insert_text(s, &text)?;
+            false
+        }
+    };
+    pasted_result(s, as_text)
+}
+
+/// A paste's result: the selection, and `asText` when live editing kept only the text of what
+/// it brought ([`super::paste::live_text`]).
+fn pasted_result(s: &Session, as_text: bool) -> CmdResult {
+    let mut r = sel_result(s)?;
+    if as_text {
+        r["asText"] = json!(true);
     }
-    sel_result(s)
+    Ok(r)
 }
 
 /// Merge Formatting: the pasted text takes the destination's formatting, keeping its emphasis.
 fn paste_merge(s: &mut Session, v: &Value) -> CmdResult {
     let mut frag = super::paste::paste_fragment(s, v)?;
     super::paste::merge_formatting(s, &mut frag);
-    super::paste::insert(s, frag)?;
-    sel_result(s)
+    let as_text = super::paste::insert_pasted(s, frag)?;
+    pasted_result(s, as_text)
 }
 
 /// Most items the Clipboard pane keeps.
