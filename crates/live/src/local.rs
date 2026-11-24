@@ -286,7 +286,7 @@ impl LiveMap {
 
     /// Split block `p` at char `k` by moving it: take it out of the order (its text stays, as
     /// the old block) and add its head under a fresh id and its tail as `tail`. Returns the head's
-    /// id; `None` when `p` could not be taken out, and nothing was done.
+    /// id; `None` when `p` is not in the order or `k` is past its text, and nothing was done.
     fn split_as_move(&mut self, ops: &mut Ops, p: u64, k: usize, tail: u64, taken: &HashSet<u64>) -> Option<u64> {
         let src = ops.live.block(p)?;
         let at = ops.at(p)?;
@@ -307,13 +307,8 @@ impl LiveMap {
         // the paragraph gone with nothing in its place (its caret would have nowhere to go).
         ops.insert(at + 1, &h);
         ops.insert(at + 2, &t);
+        // A step the replica refuses goes to `failed`, and the caller reloads from the room.
         ops.remove(p);
-        if ops.at(p).is_some() {
-            // The paragraph is in the order twice: take the parts out again.
-            ops.remove(head);
-            ops.remove(tail);
-            return None;
-        }
         let parts = vec![Part { start: 0, to: head, to_text: h.text }, Part { start: k, to: tail, to_text: t.text }];
         self.moved.insert(p, Moved { from_text: src.text, from_runs: src.runs, from_attrs: src.attrs, parts });
         Some(head)

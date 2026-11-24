@@ -280,6 +280,65 @@ fn apply_remote_keeps_caret_in_the_head_of_a_split() {
     assert_eq!((p.text.as_str(), &p.text[..at.off]), ("Alpha", "Alp"), "the same character of the head");
 }
 
+/// A split of the caret's paragraph that does not hold this window's own typing yet (the peer
+/// split it before the typing reached it): the caret goes where that typing was, in the part it
+/// belongs to, and past it once the peer passes it on. `typed` is the window's text, `parts`
+/// the split without the typing, `caret` the char after it, `want` the part and the text
+/// before the caret, then the same after the forward.
+fn caret_through_a_split_without_its_typing(
+    typed: &str,
+    caret: usize,
+    parts: [&str; 2],
+    forwarded: [&str; 2],
+    want: (&str, &str),
+    after: (&str, &str),
+) {
+    let mut s = Session::new(Document::from_text(&format!("{typed}\nEnd\n")));
+    share(&mut s);
+    let first = s.doc.para_paths(StoryRef::Body)[0].clone();
+    let off = typed.char_indices().nth(caret).map_or(typed.len(), |(i, _)| i);
+    s.sel = Selection::caret(Pos::new(StoryRef::Body, first, off));
+    let put = |s: &mut Session, texts: [&str; 2]| {
+        s.apply_remote(|d| {
+            if let Ok(body) = d.story_mut(StoryRef::Body) {
+                if body.len() == 2 {
+                    body.remove(0);
+                } else {
+                    body.remove(0);
+                    body.remove(0);
+                }
+                for (i, t) in texts.into_iter().enumerate() {
+                    let mut p = Paragraph::with_text(t, Default::default());
+                    p.pid = 400 + i as u64;
+                    body.insert(i, Arc::new(Block::Para(p)));
+                }
+            }
+        })
+        .unwrap();
+    };
+    let at = |s: &Session| {
+        let at = s.sel.focus.clone();
+        let p = s.doc.para_at(&at).unwrap();
+        (p.text.clone(), p.text[..at.off].to_string())
+    };
+    put(&mut s, parts);
+    assert_eq!(at(&s), (want.0.to_string(), want.1.to_string()), "where the typing was");
+    put(&mut s, forwarded);
+    assert_eq!(at(&s), (after.0.to_string(), after.1.to_string()), "past the typing, once it is passed on");
+}
+
+#[test]
+fn apply_remote_keeps_caret_after_typing_in_the_tail_a_split_lacks() {
+    // "Alpha beXta": X typed in the tail; the split at 5 came without it.
+    caret_through_a_split_without_its_typing("Alpha beXta", 9, ["Alpha", " beta"], ["Alpha", " beXta"], (" beta", " be"), (" beXta", " beX"));
+}
+
+#[test]
+fn apply_remote_keeps_caret_after_typing_in_the_head_a_split_lacks() {
+    // "AlXpha beta": X typed in the head.
+    caret_through_a_split_without_its_typing("AlXpha beta", 3, ["Alpha", " beta"], ["AlXpha", " beta"], ("Alpha", "Al"), ("AlXpha", "AlX"));
+}
+
 /// The same split, with the caret in the part that moved to the new paragraph: it stays on its
 /// character there.
 #[test]

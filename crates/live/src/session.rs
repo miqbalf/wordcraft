@@ -279,10 +279,18 @@ impl<H: Hub> LiveEditing<H> {
     /// Where the window's body differs from the shared copy's, in words; `None` when it does
     /// not, or when it cannot be told now (not live, or another document is active).
     pub fn drift(&self, session: &Session) -> Option<String> {
-        if session.document_id() != self.document || !matches!(self.core.status(), LiveStatus::Live { .. } | LiveStatus::ReadOnly) {
+        if !self.can_compare(session) {
             return None;
         }
         self.map.drift(&session.doc, self.core.live().doc()?)
+    }
+
+    /// Whether the window and the shared copy can be compared now: this link's document is the
+    /// active one, the link is live, and the shared copy is there.
+    fn can_compare(&self, session: &Session) -> bool {
+        session.document_id() == self.document
+            && matches!(self.core.status(), LiveStatus::Live { .. } | LiveStatus::ReadOnly)
+            && self.core.live().doc().is_some()
     }
 
     /// The safety net under the mapping, run every [`VERIFY_EVERY`] pumps, at a pause of
@@ -299,6 +307,11 @@ impl<H: Hub> LiveEditing<H> {
         self.flush(session);
         let now = (session.rev(), self.core.newest_seq());
         if self.clean_at == Some(now) {
+            return false;
+        }
+        // Only a check that could compare counts as clean (not while another document is
+        // active, or the link is not live).
+        if !self.can_compare(session) {
             return false;
         }
         let Some(why) = self.drift(session) else {

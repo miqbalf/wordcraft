@@ -1234,6 +1234,32 @@ fn typing_at_the_end_follows_two_splits() {
     assert_eq!(texts(&a.s.doc), ["T7 test report", "This is a ", "", "small test document for the share proof. TAILONE TAILTWO"]);
 }
 
+/// An editor typing in the middle of a paragraph that another editor splits, getting the split
+/// before its typing is passed on into the new paragraph: its next keystroke lands right after
+/// its typing, in the head and in the tail.
+#[test]
+fn typing_mid_paragraph_follows_a_split() {
+    for (at, what) in [(3, "head"), (20, "tail")] {
+        let relay = relay(None);
+        let bytes = file(&["T7 test report", "This is a small test document for the share proof."]);
+        let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+        let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+        settle(&relay, &mut [&mut a, &mut b]);
+        a.caret(1, 10);
+        assert!(a.run("text.newParagraph", json!({})));
+        b.caret(1, at);
+        assert!(b.run("text.insert", json!({"text": "X"})));
+        // Bob gets the split before Alice has his X.
+        b.pump();
+        settle(&relay, &mut [&mut a, &mut b]);
+        assert!(b.run("text.insert", json!({"text": "Y"})));
+        settle(&relay, &mut [&mut a, &mut b]);
+        assert_same(&a, &b, what);
+        let t = texts(&a.s.doc);
+        assert!(t.iter().any(|p| p.contains("XY")), "typing in the {what}: {t:?}");
+    }
+}
+
 /// A split that reaches the other editor one message at a time (as a browser can get it):
 /// that editor's caret, at the end of the split paragraph, stays at the end of the tail.
 #[test]

@@ -118,6 +118,13 @@ impl Session {
         if self.observer.is_none() {
             self.observer = Some(observer);
         }
+        // A caret waiting for its own text (see `apply_remote`) stops waiting once it is moved
+        // out of that paragraph.
+        if let Some((pid, _)) = &self.live_awaits
+            && self.doc.para_at(&self.sel.focus).is_none_or(|p| p.pid != *pid)
+        {
+            self.live_awaits = None;
+        }
         match result {
             Ok(r) => r,
             Err(p) => std::panic::resume_unwind(p),

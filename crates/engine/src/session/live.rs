@@ -52,6 +52,15 @@ fn follow(old: &str, new: &str, at: usize) -> usize {
     }
 }
 
+/// The one stretch where `old` and `new` differ: their common prefix's length, and where the
+/// common suffix starts in each.
+fn stretch(old: &[char], new: &[char]) -> (usize, usize, usize) {
+    let pre = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let room = old.len().min(new.len()) - pre;
+    let suffix = old.iter().rev().zip(new.iter().rev()).take(room).take_while(|(a, b)| a == b).count();
+    (pre, old.len() - suffix, new.len() - suffix)
+}
+
 /// How alike two texts are: the length of their common prefix plus their common suffix.
 fn likeness(a: &str, b: &str) -> usize {
     let prefix = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
@@ -69,39 +78,61 @@ impl Anchor {
         Anchor { story: pos.story, pid, index, chars, text, pos: pos.clone() }
     }
 
-    /// The same character in the paragraphs from index `index` on whose texts, joined, start
-    /// like the old paragraph's text up to it: the head and the tail of the paragraph split
-    /// under it. `None` when they do not.
+    /// The same character in the paragraphs from index `index` on that are the parts of the
+    /// paragraph split under it (the head and the tail): joined, they are the old text with at
+    /// most one stretch changed, and at least half of them is the same. `None` when no such
+    /// paragraphs follow.
     ///
-    /// When those paragraphs end before the character (this window typed there after the peer
-    /// split the paragraph, and the peer has not passed that text on yet), the end of the last
-    /// of them, with that text and the id of that paragraph: the caret waits there for it.
+    /// The stretch is usually this window's own typing that the peer split the paragraph
+    /// without (the peer passes it on into the part later). A caret inside or right after it
+    /// goes to where it was, in the part it will come back to, with that text and that part's
+    /// id: the caret waits there and goes past the text when it arrives (`apply_remote`).
     fn in_split(&self, doc: &Document, paths: &[super::Path], index: usize) -> Option<(Pos, Option<(u64, String)>)> {
-        let mut old = self.text.chars();
-        let mut before = 0;
-        let mut last: Option<(&super::Path, usize, u64)> = None;
-        for path in paths.get(index..)? {
-            let para = doc.para(self.story, path);
-            let text = para.map_or("", |p| p.text.as_str());
-            let n = text.chars().count();
-            // The paragraph's text first: when it runs out, no char of the old text is used up.
-            let same = text.chars().zip(old.by_ref()).take_while(|(a, b)| a == b).count();
-            if self.chars <= before + same {
-                let off = text.char_indices().nth(self.chars - before).map_or(text.len(), |(i, _)| i);
-                return Some((Pos::new(self.story, path.clone(), off), None));
+        let old: Vec<char> = self.text.chars().collect();
+        // The next few paragraphs from `index` (a split makes two; a part moved on, three).
+        let parts: Vec<(&super::Path, Vec<char>, u64)> = paths
+            .get(index..)?
+            .iter()
+            .take(3)
+            .map_while(|path| doc.para(self.story, path).map(|p| (path, p.text.chars().collect(), p.pid)))
+            .collect();
+        // As many of them as make the joined text most like the old one: most of it the same,
+        // with one stretch changed.
+        let (k, pre, old_end, new_end) = (1..=parts.len())
+            .filter_map(|k| {
+                let joined: Vec<char> = parts[..k].iter().flat_map(|p| p.1.iter().copied()).collect();
+                let (pre, old_end, new_end) = stretch(&old, &joined);
+                let kept = pre + (old.len() - old_end);
+                (kept > 0 && 2 * kept >= joined.len()).then_some((k, pre, old_end, new_end, (old_end - pre) + (new_end - pre)))
+            })
+            .min_by_key(|c| (c.4, c.0))
+            .map(|(k, pre, old_end, new_end, _)| (k, pre, old_end, new_end))?;
+        let c = self.chars;
+        // This window's own text the parts lack, up to the caret.
+        let awaited = (new_end == pre && c > pre && c <= old_end).then(|| old[pre..c].iter().collect::<String>());
+        let at = if c <= pre {
+            c
+        } else if c >= old_end {
+            c - old_end + new_end
+        } else {
+            pre
+        };
+        // The part holding char `at`: at a boundary the earlier part, except for a caret waiting
+        // for its text, which comes back into the later one (an insert at a split point goes to
+        // the tail).
+        let mut start = 0;
+        for (n, (path, text, pid)) in parts[..k].iter().enumerate() {
+            let end = start + text.len();
+            let last = n + 1 == k;
+            if at < end || (at == end && (awaited.is_none() || last)) {
+                let line: String = text.iter().collect();
+                let off = line.char_indices().nth(at - start).map_or(line.len(), |(i, _)| i);
+                let pos = Pos::new(self.story, (*path).clone(), off);
+                return Some((pos, awaited.map(|t| (*pid, t))));
             }
-            if same < n {
-                if same > 0 {
-                    return None;
-                }
-                break;
-            }
-            before += n;
-            last = Some((path, text.len(), para.map_or(0, |p| p.pid)));
+            start = end;
         }
-        let (path, end, pid) = last.filter(|_| before > 0)?;
-        let awaited: String = self.text.chars().skip(before).take(self.chars - before).collect();
-        Some((Pos::new(self.story, path.clone(), end), Some((pid, awaited))))
+        None
     }
 
     /// The same place in `doc`: the same character of the paragraph with the same shared id
@@ -169,6 +200,8 @@ impl Session {
     /// one, a command pays one branch for it.
     pub fn set_observer(&mut self, o: Option<Box<dyn EditObserver>>) {
         self.observer = o;
+        // A caret waiting for its text belongs to the link that is going.
+        self.live_awaits = None;
         self.bind_live();
     }
 
