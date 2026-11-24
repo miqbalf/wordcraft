@@ -114,6 +114,8 @@ impl Session {
             layout: _,
             // The word being typed, like `column`: valid only while `sel` is where typing left it.
             typing: _,
+            // Proofing results and ignores, keyed by paragraph revision: not an edit.
+            proof_overlays: _,
             originals: _,
             md_source: _,
             md_file: _,

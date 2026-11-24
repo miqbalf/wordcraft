@@ -27,6 +27,8 @@ pub(crate) struct Key {
     pub(crate) sref: u64,
     /// The word being typed in this paragraph, left without a spelling squiggle.
     pub(crate) typing: Option<(usize, usize)>,
+    /// The hash of the paragraph's proofing overlay ([`crate::LayoutOptions::proof_overlays`]), 0 without one.
+    pub(crate) overlay: u64,
 }
 
 /// Memoised paragraph layouts.
@@ -102,6 +104,8 @@ pub(crate) fn env_hash(doc: &Document, opts: &LayoutOptions) -> u64 {
     opts.numeral.hash(&mut h);
     opts.field_codes.hash(&mut h);
     opts.proof.hash(&mut h);
+    // Rules and words ignored apply to every paragraph.
+    opts.proof_overlays.as_ref().map_or(0, |o| o.rules_key()).hash(&mut h);
     wordcraft_proof::dictionary_generation().hash(&mut h);
     hyphenation_key(doc).hash(&mut h);
     outline.hash(&mut h);

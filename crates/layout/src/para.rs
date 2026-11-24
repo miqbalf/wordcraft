@@ -25,6 +25,7 @@ mod lines;
 mod model;
 mod paragraph;
 mod proof;
+mod proof_overlay;
 mod tabs;
 
 pub use bidi::{bidi_levels, visual_order};
@@ -44,6 +45,7 @@ pub use paragraph::layout_para;
 #[cfg(test)]
 pub(crate) use paragraph::word_widths;
 pub use proof::{ProofRun, is_list_item, paragraph_issues, proof_runs, proof_text};
+pub use proof_overlay::{IgnoredIssue, ProofIssue, ProofOverlay, ProofOverlays, RemoteIssue, builtin_rule, merged_issues};
 
 /// A laid-out paragraph.
 #[derive(Clone, Debug)]
@@ -351,6 +353,8 @@ mod label_spacing_tests {
             table: None,
             proofing: None,
             typing_word: None,
+            overlay: None,
+            overlays: None,
             field_codes: false,
             grid: Grid::default(),
             exclusions: &[],

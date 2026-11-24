@@ -230,6 +230,9 @@ pub struct LayoutOptions {
     pub proof: ProofOptions,
     /// The word being typed, which gets no spelling squiggle until the caret leaves it (#1552).
     pub typing_word: Option<TypingWord>,
+    /// Proofing results from outside the built-in checker and the viewer's ignores, by paragraph
+    /// revision ([`para::ProofOverlays`]); merged with the built-in issues ([`para::merged_issues`]).
+    pub proof_overlays: Option<Arc<para::ProofOverlays>>,
     /// Document file name for FILENAME fields ([`FieldCtx::filename`]).
     pub filename: Option<Arc<str>>,
     /// Document full path for FILENAME \p fields ([`FieldCtx::filepath`]).

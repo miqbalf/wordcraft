@@ -218,6 +218,9 @@ pub struct Session {
     pub editing_lang: Option<String>,
     /// Editing inside an equation: which one and the caret in it.
     pub math: Option<MathEdit>,
+    /// Proofing results from a remote checker and this viewer's ignores, by paragraph revision:
+    /// merged with the built-in issues in the squiggles and the `review.*` proofing commands.
+    pub proof_overlays: Option<Arc<wordcraft_layout::para::ProofOverlays>>,
     /// Equations are typed in LaTeX rather than the linear format.
     pub math_latex: bool,
     /// Text typed into equations is normal (non-math) text.

@@ -87,6 +87,8 @@ struct ParaEnvInput<'a> {
     eq_number: u32,
     typing_word: Option<(usize, usize)>,
     fitted: &'a [(usize, f32)],
+    /// The paragraph's revision, which finds its proofing overlay.
+    rev: u64,
 }
 
 /// A header or footer (`story`) laid out for page `number` of a section (`sect`, `mirror`): its
@@ -220,6 +222,8 @@ impl Ctx<'_> {
             table: None,
             proofing: None,
             typing_word: None,
+            overlay: None,
+            overlays: None,
             numeral: self.opts.numeral,
             exclusions: &[],
             eq_number: 0,
@@ -269,7 +273,7 @@ impl Ctx<'_> {
         let typing = key.typing;
         let pl = Arc::new(para::layout_para(
             p,
-            &self.para_env(ParaEnvInput { width, label, table, exclusions, eq_number, typing_word: typing, fitted: &fitted }),
+            &self.para_env(ParaEnvInput { width, label, table, exclusions, eq_number, typing_word: typing, fitted: &fitted, rev: p.rev }),
         ));
         self.cache.paras.insert(key, pl.clone());
         pl
@@ -302,7 +306,7 @@ impl Ctx<'_> {
         self.cache.misses += 1;
         let pl = Arc::new(para::layout_para(
             p,
-            &self.para_env(ParaEnvInput { width, label, table: None, exclusions: &[], eq_number, typing_word: None, fitted: &[] }),
+            &self.para_env(ParaEnvInput { width, label, table: None, exclusions: &[], eq_number, typing_word: None, fitted: &[], rev: p.rev }),
         ));
         self.cache.paras.insert(key, pl.clone());
         Some(pl)
@@ -330,7 +334,7 @@ impl Ctx<'_> {
         let typing = key.typing;
         let m = measure(&para::layout_para(
             p,
-            &self.para_env(ParaEnvInput { width, label, table, exclusions: &[], eq_number, typing_word: typing, fitted: &fitted }),
+            &self.para_env(ParaEnvInput { width, label, table, exclusions: &[], eq_number, typing_word: typing, fitted: &fitted, rev: p.rev }),
         ));
         self.cache.measures.insert(key, m);
         m
@@ -415,6 +419,7 @@ impl Ctx<'_> {
             hide_deleted: self.hide_deleted,
             sref: if self.fields.styleref.is_some() && styleref::has_styleref(p) { self.fields.styleref_key(p) } else { 0 },
             typing: self.opts.typing_word.filter(|t| t.rev == p.rev).map(|t| (t.start, t.end)),
+            overlay: self.opts.proof_overlays.as_ref().and_then(|o| o.get(p.rev)).map_or(0, |(h, _)| h),
         };
         (key, eq_number)
     }
@@ -435,7 +440,8 @@ impl Ctx<'_> {
     }
 
     fn para_env<'b>(&'b self, input: ParaEnvInput<'b>) -> para::ParaEnv<'b> {
-        let ParaEnvInput { width, label, table, exclusions, eq_number, typing_word, fitted } = input;
+        let ParaEnvInput { width, label, table, exclusions, eq_number, typing_word, fitted, rev } = input;
+        let overlays = self.opts.proof_overlays.as_deref();
         para::ParaEnv {
             doc: self.doc,
             width,
@@ -447,6 +453,8 @@ impl Ctx<'_> {
             table,
             proofing: self.opts.proofing.then_some(self.opts.proof),
             typing_word,
+            overlay: overlays.and_then(|o| o.get(rev)).map(|(_, o)| o),
+            overlays,
             numeral: self.opts.numeral,
             exclusions,
             eq_number,

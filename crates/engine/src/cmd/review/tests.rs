@@ -1122,3 +1122,61 @@ mod spelling_navigation_tests {
         }
     }
 }
+
+/// A session showing `text`, with the remote `issues` (byte range, kind, rule, suggestions)
+/// laid over its first paragraph, as a remote checker's results would be.
+fn with_remote(text: &str, issues: &[(usize, usize, wordcraft_proof::IssueKind, &str, &[&str])]) -> Session {
+    use wordcraft_layout::para::{ProofOverlay, ProofOverlays, RemoteIssue};
+    let mut s = Session::new(Document::new());
+    s.run("document.setText", &json!({"text": text})).unwrap();
+    let rev = s.doc.para(wordcraft_doc::StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().rev;
+    let remote = issues
+        .iter()
+        .map(|&(start, end, kind, rule, sugg)| RemoteIssue {
+            issue: wordcraft_proof::Issue {
+                start,
+                end,
+                kind,
+                message: format!("remote {rule}"),
+                suggestions: sugg.iter().map(|x| x.to_string()).collect(),
+                lang: Default::default(),
+            },
+            rule: rule.into(),
+        })
+        .collect();
+    let by_rev = std::collections::HashMap::from([(rev, std::sync::Arc::new(ProofOverlay { remote, ..Default::default() }))]);
+    s.proof_overlays = Some(std::sync::Arc::new(ProofOverlays::new(by_rev, Default::default(), Default::default())));
+    s
+}
+
+#[test]
+fn review_issues_lists_a_remote_issue_with_source_and_rule() {
+    let text = "The cat sat on the mat today.";
+    let mat = text.find("mat").unwrap();
+    let mut s = with_remote(text, &[(mat, mat + 3, wordcraft_proof::IssueKind::Grammar, "REMOTE_RULE", &["rug"])]);
+    let issues = s.run("review.issues", &json!({})).unwrap();
+    let list = issues.as_array().unwrap();
+    let remote: Vec<_> = list.iter().filter(|i| i["source"] == "remote").collect();
+    assert_eq!(remote.len(), 1, "{issues}");
+    assert_eq!(remote[0]["rule"], "REMOTE_RULE");
+    assert_eq!(remote[0]["text"], "mat");
+    assert_eq!(remote[0]["kind"], "grammar");
+    assert_eq!(remote[0]["suggestions"], json!(["rug"]));
+    assert!(
+        list.iter().all(|i| i["source"] == "remote" || (i["source"] == "builtin" && i["rule"].as_str().is_some_and(|r| r.starts_with("builtin:")))),
+        "{issues}"
+    );
+}
+
+#[test]
+fn suggestions_for_a_remote_spelling_issue_are_its_own_not_the_dictionary_s() {
+    let text = "We saw the wrold today.";
+    let w = text.find("wrold").unwrap();
+    // On the range the built-in check marks too: the remote issue is the one shown.
+    let mut s = with_remote(text, &[(w, w + 5, wordcraft_proof::IssueKind::Spelling, "REMOTE_SPELL", &["MINE"])]);
+    let r = s.run("review.suggestions", &json!({"pos": {"story": "body", "path": [0], "off": w + 2}})).unwrap();
+    assert_eq!(r["source"], "remote", "{r}");
+    assert_eq!(r["suggestions"], json!(["MINE"]), "{r}");
+    let issues = s.run("review.issues", &json!({})).unwrap();
+    assert_eq!(issues.as_array().unwrap().iter().filter(|i| i["text"] == "wrold").count(), 1, "shown once: {issues}");
+}
