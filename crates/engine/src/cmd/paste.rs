@@ -88,7 +88,8 @@ fn source(s: &Session, v: &Value, fmt: &str) -> Option<String> {
 
 /// Formats the clipboard can be pasted as, best first.
 pub fn available(s: &Session, v: &Value) -> Vec<&'static str> {
-    FORMATS.iter().map(|(id, _)| *id).filter(|id| source(s, v, id).is_some()).collect()
+    // While live a picture can't be shared, so the dialog doesn't offer it.
+    FORMATS.iter().map(|(id, _)| *id).filter(|id| !(*id == "picture" && s.editing_live())).filter(|id| source(s, v, id).is_some()).collect()
 }
 
 fn formats_json(ids: &[&str]) -> Value {
@@ -144,6 +145,12 @@ fn paste_special(s: &mut Session, v: &Value) -> CmdResult {
             r["pastedAs"] = json!(fmt);
             return Ok(r);
         }
+        // A picture is not shared while live: nothing is pasted, and the result says why.
+        "picture" if s.editing_live() => {
+            let mut r = pasted_result(s, Lost { pictures: true, nothing_left: true, ..Lost::default() })?;
+            r["pastedAs"] = json!(fmt);
+            return Ok(r);
+        }
         "picture" => {
             let mut r = super::insert::picture(s, &json!({"data": src}))?;
             r["pastedAs"] = json!(fmt);
@@ -153,12 +160,9 @@ fn paste_special(s: &mut Session, v: &Value) -> CmdResult {
         "html" => adopt(s, import_html(&src)),
         _ => adopt(s, wordcraft_formats::rtf::import(src.as_bytes()).map_err(|e| CmdError::Failed(format!("bad RTF: {e}")))?),
     };
-    let as_text = insert_pasted(s, frag)?;
-    let mut r = sel_result(s)?;
+    let lost = insert_pasted(s, frag)?;
+    let mut r = pasted_result(s, lost)?;
     r["pastedAs"] = json!(fmt);
-    if as_text {
-        r["asText"] = json!(true);
-    }
     Ok(r)
 }
 
@@ -356,12 +360,31 @@ pub fn merge_formatting(s: &Session, frag: &mut Fragment) {
 }
 
 /// A paste: [`insert`], with the fragment first kept to what live editing shares
-/// ([`live_text`]) while editing live ([`Session::editing_live`]). Returns whether that took
-/// anything out, so the paste came in as text.
-pub fn insert_pasted(s: &mut Session, frag: Fragment) -> Result<bool, CmdError> {
-    let (frag, as_text) = if s.editing_live() { live_text(&s.doc, frag) } else { (frag, false) };
-    insert(s, frag)?;
-    Ok(as_text)
+/// ([`live_text`]) while editing live ([`Session::editing_live`]). Returns what that took out;
+/// when nothing is left ([`Lost::nothing_left`]) nothing is inserted and the selection stays.
+pub fn insert_pasted(s: &mut Session, frag: Fragment) -> Result<Lost, CmdError> {
+    if !s.editing_live() {
+        insert(s, frag)?;
+        return Ok(Lost::default());
+    }
+    let (frag, lost) = live_text(&s.doc, frag);
+    if !lost.nothing_left {
+        insert(s, frag)?;
+    }
+    Ok(lost)
+}
+
+/// A paste's result: the selection, and while live what [`live_text`] took out (`lost`) and
+/// `pasted: false` when nothing was left to paste.
+pub fn pasted_result(s: &Session, lost: Lost) -> CmdResult {
+    let mut r = sel_result(s)?;
+    if lost.any() {
+        r["lost"] = lost.to_json();
+    }
+    if lost.nothing_left {
+        r["pasted"] = json!(false);
+    }
+    Ok(r)
 }
 
 /// Replace the selection with `frag`, marking it as an insertion under Track Changes.
@@ -408,97 +431,231 @@ pub fn insert(s: &mut Session, mut frag: Fragment) -> Result<(), CmdError> {
     Ok(())
 }
 
-/// What of a pasted fragment live co-editing can share, and whether anything was taken out.
+/// What a live paste took out ([`live_text`]), by what a notice can name. Bookmarks, comment
+/// anchors and permission marks are not counted: nothing visible goes with them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Lost {
+    /// Pictures, charts, shapes, text boxes (their text is kept) and groups.
+    pub pictures: bool,
+    /// Tables (their text is kept, a row to a line).
+    pub tables: bool,
+    /// Fields and equations (their result or text is kept).
+    pub fields: bool,
+    /// Footnote and endnote marks.
+    pub notes: bool,
+    /// Formatting only: a paragraph or character style or a list the document lacks, a section
+    /// break, a tracked change the document does not hold, a content control, a phonetic guide.
+    pub formatting: bool,
+    /// Something visible was taken out and no text is left: nothing is pasted.
+    pub nothing_left: bool,
+}
+
+impl Lost {
+    /// Whether anything was taken out that the user may miss.
+    pub fn any(&self) -> bool {
+        self.pictures || self.tables || self.fields || self.notes || self.formatting
+    }
+
+    /// Whether content (not only formatting) was taken out.
+    pub fn content(&self) -> bool {
+        self.pictures || self.tables || self.fields || self.notes
+    }
+
+    /// For a command's result: `{"pictures": bool, …}`.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "pictures": self.pictures,
+            "tables": self.tables,
+            "fields": self.fields,
+            "notes": self.notes,
+            "formatting": self.formatting,
+        })
+    }
+}
+
+/// What of a pasted fragment live co-editing can share, and what was taken out.
 ///
 /// Live editing shares the body's paragraphs: their text, character formatting and paragraph
 /// formatting. A paste must not bring what lives outside the body or is not shared, so here:
-/// a table becomes its paragraphs; a picture, shape, field, note or comment mark, bookmark and
-/// any other inline object becomes its text (a field its result, most none); a paragraph or
-/// character style `doc` lacks, a list `doc` lacks, and tracked changes `doc` does not hold are
-/// dropped (text such a change deleted goes); text boxes and media stay behind. What is left only refers to
-/// what `doc` already has.
-pub fn live_text(doc: &Document, frag: Fragment) -> (Fragment, bool) {
-    let mut lost = false;
-    let mut blocks = Vec::with_capacity(frag.blocks.len());
-    for b in frag.blocks {
-        flatten_tables(b, 0, &mut blocks, &mut lost);
+/// - a table becomes one paragraph a row, its cells' text joined by tabs and a cell's own
+///   paragraphs by line breaks (a nested table the same way, inside its cell);
+/// - an inline object becomes its text: a field its result, an equation its linear text, a
+///   text box the text inside it, a picture, shape, note mark, bookmark or comment anchor none;
+/// - a paragraph or character style `doc` lacks, a list `doc` lacks, a section break, and
+///   tracked changes `doc` does not hold are dropped (text such a change deleted goes);
+/// - media and text box stories stay behind.
+///
+/// What is left only refers to what `doc` already has. [`Lost`] records each kind taken out,
+/// as it is taken out.
+pub fn live_text(doc: &Document, frag: Fragment) -> (Fragment, Lost) {
+    let mut lost = Lost::default();
+    let Fragment { blocks: source, parts, .. } = frag;
+    let mut blocks = Vec::with_capacity(source.len());
+    for b in source {
+        match b {
+            Block::Para(_) => blocks.push(b),
+            Block::Table(t) => {
+                lost.tables = true;
+                blocks.extend(table_rows(t, 0).into_iter().map(Block::Para));
+            }
+        }
     }
     for b in &mut blocks {
         if let Block::Para(p) = b {
-            keep_shared(doc, p, &mut lost);
+            keep_shared(doc, &parts, p, &mut lost);
         }
     }
+    let text_left = blocks.iter().any(|b| b.as_para().is_some_and(|p| !p.text.is_empty()));
+    lost.nothing_left = lost.content() && !text_left;
     (Fragment { blocks, parts: Default::default(), media: Default::default() }, lost)
 }
 
-/// `b` as paragraphs: a table's own, in reading order (bounded depth; deeper ones are dropped).
-fn flatten_tables(b: Block, depth: usize, out: &mut Vec<Block>, lost: &mut bool) {
-    match b {
-        Block::Para(_) => out.push(b),
-        Block::Table(t) => {
-            *lost = true;
-            if depth > MAX_DEPTH {
-                return;
-            }
-            for row in t.rows {
-                for cell in row.cells {
-                    for cb in cell.blocks {
-                        flatten_tables(Arc::unwrap_or_clone(cb), depth + 1, out, lost);
+/// A table's rows as paragraphs (see [`live_text`]). Each row takes the formatting of its first
+/// cell paragraph. Past [`MAX_DEPTH`] nested tables are dropped.
+fn table_rows(t: wordcraft_doc::Table, depth: usize) -> Vec<Paragraph> {
+    if depth > MAX_DEPTH {
+        return Vec::new();
+    }
+    t.rows
+        .into_iter()
+        .map(|row| {
+            let mut line: Option<Paragraph> = None;
+            for (i, cell) in row.cells.into_iter().enumerate() {
+                if i > 0 {
+                    append_text(&mut line, "\t");
+                }
+                let paras = cell.blocks.into_iter().flat_map(|cb| match Arc::unwrap_or_clone(cb) {
+                    Block::Para(p) => vec![p],
+                    Block::Table(inner) => table_rows(inner, depth + 1),
+                });
+                for (j, p) in paras.enumerate() {
+                    if j > 0 {
+                        append_text(&mut line, &wordcraft_doc::para::LINE_BREAK.to_string());
+                    }
+                    match &mut line {
+                        Some(l) => l.append(Paragraph { section: None, ..p }),
+                        None => line = Some(p),
                     }
                 }
             }
+            line.unwrap_or_default()
+        })
+        .collect()
+}
+
+/// Add `text` (a tab or a line break between cells) at the end of `line` (a new paragraph if
+/// there is none), in plain formatting: a bold cell's bold does not run on into the separator.
+fn append_text(line: &mut Option<Paragraph>, text: &str) {
+    let l = line.get_or_insert_default();
+    let end = l.text.len();
+    let _ = l.insert_text(end, text, &Default::default());
+}
+
+/// The text of a text box story: its paragraphs' text, joined by line breaks.
+fn story_text(parts: &std::collections::BTreeMap<u32, wordcraft_doc::Part>, id: u32) -> String {
+    let mut lines = Vec::new();
+    if let Some(part) = parts.get(&id) {
+        for b in part.blocks.iter() {
+            let mut b = (**b).clone();
+            each_para(&mut b, 0, &mut |p| lines.push(p.plain_text()));
+        }
+    }
+    lines.join(&wordcraft_doc::para::LINE_BREAK.to_string())
+}
+
+/// What an inline object becomes when pasted live: its text, and what kind of loss it is.
+fn object_text(o: &wordcraft_doc::InlineObject, parts: &std::collections::BTreeMap<u32, wordcraft_doc::Part>, lost: &mut Lost) -> String {
+    use wordcraft_doc::InlineObject as O;
+    match o {
+        O::Image { .. } | O::Graphic { .. } | O::Shape { .. } | O::Group { .. } => {
+            lost.pictures = true;
+            o.text_boxes()
+                .into_iter()
+                .map(|id| story_text(parts, id))
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(&wordcraft_doc::para::LINE_BREAK.to_string())
+        }
+        O::Field { .. } | O::FieldStart { .. } | O::FieldEnd | O::Equation { .. } => {
+            lost.fields = true;
+            o.plain_text().to_owned()
+        }
+        O::NoteRef { .. } => {
+            lost.notes = true;
+            String::new()
+        }
+        O::BookmarkStart { .. } | O::BookmarkEnd { .. } | O::CommentStart { .. } | O::CommentEnd { .. } | O::PermStart { .. } | O::PermEnd { .. } => {
+            String::new()
+        }
+        _ => {
+            lost.formatting = true;
+            o.plain_text().to_owned()
         }
     }
 }
 
 /// [`live_text`] for one paragraph.
-fn keep_shared(doc: &Document, p: &mut Paragraph, lost: &mut bool) {
+fn keep_shared(doc: &Document, parts: &std::collections::BTreeMap<u32, wordcraft_doc::Part>, p: &mut Paragraph, lost: &mut Lost) {
     use wordcraft_doc::para::OBJ;
-    let before = p.clone();
+    let mut changed = false;
     // Tracked changes the document holds stay; others would add a revision. Text deleted by
     // one of those is gone.
     let rev_ok = |r: Option<u32>| r.is_none_or(|i| usize::try_from(i).is_ok_and(|i| i < doc.revisions.len()));
     let gone: Vec<std::ops::Range<usize>> = p.run_ranges().filter(|(_, c)| c.del.is_some() && !rev_ok(c.del)).map(|(r, _)| r).collect();
     for r in gone.into_iter().rev() {
-        let _ = p.delete(r.start, r.end);
+        if p.delete(r.start, r.end).is_ok() {
+            changed = true;
+            lost.formatting = true;
+        }
     }
     // Objects become their text, in the formatting they had.
-    let objects: Vec<(usize, String)> = p.objects_with_offsets().map(|(off, o)| (off, o.plain_text().to_owned())).collect();
+    let objects: Vec<(usize, String)> = p.objects_with_offsets().map(|(off, o)| (off, object_text(o, parts, lost))).collect();
     for (off, text) in objects.into_iter().rev() {
         let props = p.props_of_char(off).clone();
         if p.delete(off, off + OBJ.len_utf8()).is_ok() {
+            changed = true;
             let _ = p.insert_text(off, &text, &props);
         }
     }
     let style_ok = |id: &Option<String>| id.as_deref().is_none_or(|id| doc.styles.get(id).is_some());
-    if !style_ok(&p.props.style) {
+    let mut taken = |cond: bool, lost: &mut Lost| {
+        if cond {
+            changed = true;
+            lost.formatting = true;
+        }
+        cond
+    };
+    if taken(!style_ok(&p.props.style), lost) {
         p.props.style = None;
     }
-    if p.props.numbering.as_ref().is_some_and(|n| n.num != 0 && doc.numbering.num(n.num).is_none()) {
+    if taken(p.props.numbering.as_ref().is_some_and(|n| n.num != 0 && doc.numbering.num(n.num).is_none()), lost) {
         p.props.numbering = None;
     }
-    if !rev_ok(p.props.num_change.as_ref().map(|c| c.rev)) {
+    // A section break would bring its own page setup, which is locked while live.
+    if taken(p.section.is_some(), lost) {
+        p.section = None;
+    }
+    if taken(!rev_ok(p.props.num_change.as_ref().map(|c| c.rev)), lost) {
         p.props.num_change = None;
     }
-    if !rev_ok(p.props.fmt_change.as_ref().map(|c| c.rev)) {
+    if taken(!rev_ok(p.props.fmt_change.as_ref().map(|c| c.rev)), lost) {
         p.props.fmt_change = None;
     }
     for props in p.runs.iter_mut().map(|r| &mut r.props).chain(std::iter::once(&mut p.mark)) {
-        if !style_ok(&props.style) {
+        if taken(!style_ok(&props.style), lost) {
             props.style = None;
         }
-        if !rev_ok(props.ins) {
+        if taken(!rev_ok(props.ins), lost) {
             props.ins = None;
         }
-        if !rev_ok(props.del) {
+        if taken(!rev_ok(props.del), lost) {
             props.del = None;
         }
-        if !rev_ok(props.fmt_change.as_ref().map(|c| c.rev)) {
+        if taken(!rev_ok(props.fmt_change.as_ref().map(|c| c.rev)), lost) {
             props.fmt_change = None;
         }
     }
-    if *p != before {
-        *lost = true;
+    if changed {
         p.normalize();
         p.touch();
     }
