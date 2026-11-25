@@ -14286,3 +14286,146 @@ fn ignored_rule_does_not_survive_a_document_replace() {
     s.set_document(wordcraft_doc::Document::from_text(text));
     assert!(builtin_grammar(&mut s).iter().any(|f| f.2 == rule), "the new document does not inherit the ignore");
 }
+
+const IGNORE_TEXT: &str = "The cat sat on the mat today.";
+
+/// A session holding [`IGNORE_TEXT`] with remote grammar issues on "mat" (`R_X`) and "cat" (`R_Y`).
+fn remote_session() -> Session {
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": IGNORE_TEXT}));
+    s.proof_remote.set_enabled(true);
+    let r = proof_request(&mut s, 0.0);
+    s.proof_receive(&r.id, Ok(proof_reply(&r, &[("mat", "R_X"), ("cat", "R_Y")])), 20_000.0);
+    s
+}
+
+/// The start of the issue that covers `word`, as a position `review.*` takes.
+fn issue_start(s: &mut Session, word: &str) -> serde_json::Value {
+    let issues = run(s, "review.issues", json!({}));
+    issues.as_array().unwrap().iter().find(|i| i["text"] == word).map(|i| i["start"].clone()).unwrap_or_else(|| panic!("no issue on {word}: {issues}"))
+}
+
+fn settle_polls(s: &mut Session, from: f64) {
+    for t in 0..40 {
+        assert!(s.proof_poll(from + f64::from(t) * 250.0).send.is_empty(), "nothing needs a request");
+    }
+}
+
+#[test]
+fn ignore_issue_hides_only_this_occurrence_and_survives_a_rev_change_with_the_same_text() {
+    let mut s = remote_session();
+    assert_eq!(remote_rules(&mut s), vec!["R_Y", "R_X"]);
+    let at = issue_start(&mut s, "mat");
+    let answer = run(&mut s, "review.ignoreIssue", json!({"pos": at}));
+    assert_eq!(answer, json!({"ignored": "R_X"}));
+    assert_eq!(remote_rules(&mut s), vec!["R_Y"], "only the ignored issue is gone");
+    // The same text under a new paragraph revision: type something and take it back.
+    let before = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().rev;
+    run(&mut s, "text.insert", json!({"text": "!"}));
+    run(&mut s, "text.backspace", json!({}));
+    assert_eq!(text(&s), IGNORE_TEXT);
+    assert_ne!(s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().rev, before, "a new revision");
+    settle_polls(&mut s, 30_000.0);
+    assert_eq!(remote_rules(&mut s), vec!["R_Y"], "still ignored for the same text");
+}
+
+#[test]
+fn ignore_issue_comes_back_when_the_paragraph_text_changes() {
+    let mut s = remote_session();
+    let at = issue_start(&mut s, "mat");
+    run(&mut s, "review.ignoreIssue", json!({"pos": at}));
+    run(&mut s, "text.insert", json!({"text": " Fine."}));
+    let r = proof_request(&mut s, 30_000.0);
+    s.proof_receive(&r.id, Ok(proof_reply(&r, &[("mat", "R_X"), ("cat", "R_Y")])), 60_000.0);
+    assert_eq!(remote_rules(&mut s), vec!["R_Y", "R_X"], "other text, so the issue is shown again");
+}
+
+#[test]
+fn ignore_rule_hides_every_issue_of_that_rule_in_this_document_only() {
+    let mut s = remote_session();
+    let a = s.document_id();
+    let at = issue_start(&mut s, "mat");
+    assert_eq!(run(&mut s, "review.ignoreRule", json!({"pos": at})), json!({"ignoredRule": "R_X"}));
+    assert_eq!(remote_rules(&mut s), vec!["R_Y"]);
+    assert_eq!(run(&mut s, "review.ignoreRule", json!({"rule": "R_Y"})), json!({"ignoredRule": "R_Y"}), "a rule can be named");
+    assert!(remote_rules(&mut s).is_empty());
+
+    run(&mut s, "file.new", json!({}));
+    run(&mut s, "text.insert", json!({"text": IGNORE_TEXT}));
+    assert_ne!(s.document_id(), a);
+    settle_polls(&mut s, 70_000.0);
+    assert_eq!(remote_rules(&mut s), vec!["R_Y", "R_X"], "the second document keeps both");
+}
+
+#[test]
+fn builtin_grammar_can_be_ignored_and_rule_ignored() {
+    if no_language_data("builtin_grammar_can_be_ignored_and_rule_ignored") {
+        return;
+    }
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "this is is a test. we went home."}));
+    let found = builtin_grammar(&mut s);
+    assert!(found.len() >= 2, "{found:?}");
+    let pos = |off: usize| serde_json::to_value(wordcraft_doc::Pos::body(0, off)).unwrap_or_default();
+    let (a, _, rule) = found[0].clone();
+    let answer = run(&mut s, "review.ignoreIssue", json!({"pos": pos(a)}));
+    assert_eq!(answer["ignored"], rule.as_str());
+    let after = builtin_grammar(&mut s);
+    assert!(!after.contains(&found[0]) && after.len() == found.len() - 1, "{after:?}");
+    let (b, _, rule2) = after[0].clone();
+    assert_eq!(run(&mut s, "review.ignoreRule", json!({"pos": pos(b)})), json!({"ignoredRule": rule2}));
+    assert!(builtin_grammar(&mut s).iter().all(|f| f.2 != rule2), "every issue of the rule is gone");
+}
+
+#[test]
+fn ignore_all_also_hides_remote_spelling_of_that_word() {
+    use crate::proof_remote::{ProofReply, RemoteKind, RemoteMatch};
+    let word = "zqkwmat";
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": format!("The {word} sat down.")}));
+    s.proof_remote.set_enabled(true);
+    let r = proof_request(&mut s, 0.0);
+    let m = RemoteMatch { offset: 4, length: word.len(), kind: RemoteKind::Spelling, message: "m".into(), replacements: vec![], rule: "MORFOLOGIK".into() };
+    s.proof_receive(&r.id, Ok(ProofReply { matches: vec![m], ..Default::default() }), 20_000.0);
+    assert_eq!(remote_rules(&mut s), vec!["MORFOLOGIK"], "the remote spelling issue is shown");
+    run(&mut s, "review.ignoreAll", json!({"word": word}));
+    assert!(remote_rules(&mut s).is_empty(), "Ignore All hides the remote issue on the same word");
+}
+
+#[test]
+fn ignores_are_pure_and_allowed_while_live() {
+    let mut s = s();
+    for id in ["review.ignoreIssue", "review.ignoreRule", "review.ignoreAll"] {
+        let spec = s.registry.get(id).unwrap_or_else(|| panic!("{id} is registered"));
+        assert!(!spec.mutates, "{id} is pure: the document, undo and live are untouched");
+    }
+    let err = s.run("review.ignoreIssue", &json!({})).unwrap_err();
+    assert!(err.to_string().contains("no issue here"), "{err}");
+    assert!(s.run("review.ignoreRule", &json!({})).is_err(), "no rule and no issue");
+}
+
+#[test]
+fn undo_back_to_an_ignored_text_has_its_ignore_at_once() {
+    if no_language_data("undo_back_to_an_ignored_text_has_its_ignore_at_once") {
+        return;
+    }
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "this is is a test. we went home."}));
+    let found = builtin_grammar(&mut s);
+    let at = serde_json::to_value(wordcraft_doc::Pos::body(0, found[0].0)).unwrap();
+    run(&mut s, "review.ignoreIssue", json!({"pos": at}));
+    let hidden = builtin_grammar(&mut s);
+    assert_eq!(hidden.len(), found.len() - 1);
+    // New text, and an ignore there: the overlays now describe that revision only.
+    run(&mut s, "caret.docStart", json!({}));
+    run(&mut s, "text.insert", json!({"text": "Then "}));
+    let other = builtin_grammar(&mut s);
+    assert!(!other.is_empty(), "an issue in the new text to ignore");
+    let at = serde_json::to_value(wordcraft_doc::Pos::body(0, other[0].0)).unwrap();
+    run(&mut s, "review.ignoreIssue", json!({"pos": at}));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(text(&s), "this is is a test. we went home.");
+    assert_eq!(builtin_grammar(&mut s), hidden, "back at the ignored text, with its ignore, without a poll");
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(builtin_grammar(&mut s), other[1..].to_vec(), "and forward again, the second ignore is back");
+}
