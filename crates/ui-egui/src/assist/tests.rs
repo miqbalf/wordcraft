@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use serde_json::json;
 use wordcraft_engine::Session;
-use wordcraft_engine::proof_remote::{BUSY_BACKOFF_MS, IDLE_MS, ProofReply, RemoteKind, RemoteMatch};
+use wordcraft_engine::proof_remote::{BUSY_BACKOFF_MS, DOWN_BACKOFF_MS, IDLE_MS, ProofReply, RemoteKind, RemoteMatch};
 
 use super::*;
 use crate::Services;
@@ -20,6 +20,20 @@ fn fake() -> (AssistHost, Sent) {
         send: Box::new(move |out| {
             log.borrow_mut().push(out.clone());
             Ok(())
+        }),
+        inbox: AssistInbox::default(),
+    };
+    (host, sent)
+}
+
+/// A page whose `send` fails.
+fn broken() -> (AssistHost, Sent) {
+    let sent: Sent = Rc::default();
+    let log = sent.clone();
+    let host = AssistHost {
+        send: Box::new(move |out| {
+            log.borrow_mut().push(out.clone());
+            Err("no parent".to_string())
         }),
         inbox: AssistInbox::default(),
     };
@@ -159,4 +173,123 @@ fn a_late_ai_answer_for_a_cancelled_request_is_dropped() {
     tell(&mut app, AssistIn::AiResult { id: third.clone(), text: "late".into() });
     frame(&mut app, 300.0);
     assert_eq!(app.assist_take_answer(&third), Some(Err("too_large".to_string())));
+}
+
+/// I2: proof on, then off. The remote issues go, nothing more is sent, and the result that was
+/// still on its way is dropped.
+#[test]
+fn proof_turned_off_after_on_stops_sends_and_drops_a_late_result() {
+    let (host, sent) = fake();
+    let mut app = app_with(Some(host), "The cat sat on the mat today.");
+    tell(&mut app, AssistIn::Enabled { proof: true, ai: false });
+    frame(&mut app, 0.0);
+    frame(&mut app, IDLE_MS);
+    let (id, text) = checks(&sent).remove(0);
+    tell(&mut app, AssistIn::Enabled { proof: false, ai: false });
+    frame(&mut app, IDLE_MS + 50.0);
+    tell(&mut app, AssistIn::ProofResult { id, reply: on_word(&text, "mat") });
+    frame(&mut app, IDLE_MS + 100.0);
+    assert!(remote_rules(&mut app).is_empty(), "a late result after off is dropped");
+    app.run("text.insert", json!({"text": " More words here."})).expect("insert");
+    for t in 1..30 {
+        frame(&mut app, IDLE_MS + 100.0 + f64::from(t) * 3_000.0);
+    }
+    assert_eq!(checks(&sent).len(), 1, "no more sends once it is off");
+    // Turned on again, it checks again.
+    tell(&mut app, AssistIn::Enabled { proof: true, ai: false });
+    frame(&mut app, 200_000.0);
+    frame(&mut app, 200_000.0 + IDLE_MS);
+    assert_eq!(checks(&sent).len(), 2);
+}
+
+#[test]
+fn applied_remote_issues_go_when_proof_is_turned_off() {
+    let (host, sent) = fake();
+    let mut app = app_with(Some(host), "The cat sat on the mat today.");
+    tell(&mut app, AssistIn::Enabled { proof: true, ai: false });
+    frame(&mut app, 0.0);
+    frame(&mut app, IDLE_MS);
+    let (id, text) = checks(&sent).remove(0);
+    tell(&mut app, AssistIn::ProofResult { id, reply: on_word(&text, "mat") });
+    frame(&mut app, IDLE_MS + 100.0);
+    assert_eq!(remote_rules(&mut app), vec!["R_ONE"]);
+    tell(&mut app, AssistIn::Enabled { proof: false, ai: false });
+    frame(&mut app, IDLE_MS + 200.0);
+    assert!(remote_rules(&mut app).is_empty());
+}
+
+/// I2: the page turning AI off drops the request that waits and its answer.
+#[test]
+fn ai_turned_off_clears_the_waiting_request_and_its_answer() {
+    let (host, _sent) = fake();
+    let mut app = app_with(Some(host), "x");
+    tell(&mut app, AssistIn::Enabled { proof: false, ai: true });
+    frame(&mut app, 0.0);
+    let waiting = app.assist_ask(AiTask::Improve, "auto".into(), "Teh cat.".into()).expect("ask");
+    tell(&mut app, AssistIn::Enabled { proof: false, ai: false });
+    tell(&mut app, AssistIn::AiResult { id: waiting.clone(), text: "The cat.".into() });
+    frame(&mut app, 100.0);
+    assert!(!app.assist_ai_on());
+    assert_eq!(app.assist_take_answer(&waiting), None, "the answer after off is dropped");
+    // An answer that came before off is cleared by it too.
+    tell(&mut app, AssistIn::Enabled { proof: false, ai: true });
+    frame(&mut app, 200.0);
+    let second = app.assist_ask(AiTask::Summarize, "auto".into(), "Long.".into()).expect("ask");
+    tell(&mut app, AssistIn::AiResult { id: second.clone(), text: "- a".into() });
+    frame(&mut app, 300.0);
+    tell(&mut app, AssistIn::Enabled { proof: false, ai: false });
+    frame(&mut app, 400.0);
+    assert_eq!(app.assist_take_answer(&second), None);
+}
+
+/// I2: a failed proof send is a failure of that request: the engine backs off and sends again
+/// after the wait, and nothing is stuck in flight.
+#[test]
+fn a_failed_proof_send_backs_off_and_is_not_stuck() {
+    let (host, sent) = broken();
+    let mut app = app_with(Some(host), "The cat sat on the mat today.");
+    tell(&mut app, AssistIn::Enabled { proof: true, ai: false });
+    frame(&mut app, 0.0);
+    frame(&mut app, IDLE_MS);
+    assert_eq!(checks(&sent).len(), 1);
+    frame(&mut app, IDLE_MS + DOWN_BACKOFF_MS - 5_000.0);
+    assert_eq!(checks(&sent).len(), 1, "waits out the backoff");
+    frame(&mut app, IDLE_MS + DOWN_BACKOFF_MS + 5_000.0);
+    assert_eq!(checks(&sent).len(), 2, "sent again after it");
+}
+
+/// I2: a failed AI send surfaces as an error and leaves nothing waiting, not even the request
+/// that waited before it.
+#[test]
+fn a_failed_ai_send_is_an_error_and_leaves_nothing_waiting() {
+    let (host, _sent) = broken();
+    let mut app = app_with(Some(host), "x");
+    tell(&mut app, AssistIn::Enabled { proof: false, ai: true });
+    frame(&mut app, 0.0);
+    assert_eq!(app.assist_ask(AiTask::Improve, "auto".into(), "Hi.".into()), Err("no parent".to_string()));
+    assert_eq!(app.assist_take_answer("ai-1"), None);
+    // An older request is replaced even when the newer one never left.
+    let (host, _) = fake();
+    let mut app = app_with(Some(host), "x");
+    tell(&mut app, AssistIn::Enabled { proof: false, ai: true });
+    frame(&mut app, 0.0);
+    let old = app.assist_ask(AiTask::Improve, "auto".into(), "Hi.".into()).expect("old");
+    app.services.assist = Some(broken().0);
+    tell(&mut app, AssistIn::AiResult { id: old.clone(), text: "x".into() });
+    assert!(app.assist_ask(AiTask::Improve, "auto".into(), "Hi again.".into()).is_err());
+    frame(&mut app, 100.0);
+    assert_eq!(app.assist_take_answer(&old), None, "the replaced request's answer is dropped");
+}
+
+/// M2: ids carry a per-page-load prefix, so a reloaded app never takes the old page's answer,
+/// and still fit the contract's id pattern.
+#[test]
+fn ai_ids_fit_the_contract_and_do_not_restart_at_one() {
+    let (host, _sent) = fake();
+    let mut app = app_with(Some(host), "x");
+    tell(&mut app, AssistIn::Enabled { proof: false, ai: true });
+    frame(&mut app, 0.0);
+    let id = app.assist_ask(AiTask::Improve, "auto".into(), "Hi.".into()).expect("ask");
+    assert!(!id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'), "{id}");
+    assert_ne!(id, "ai-1", "a reloaded page must not reuse the first id");
 }

@@ -15,6 +15,17 @@ const MAX_RULE_CHARS: usize = 200;
 const MAX_SPANS: usize = 2000;
 const MAX_ERROR_CHARS: usize = 64;
 
+/// Whether `kind` (a message's `type`) is one the app reads; the listener checks it before it
+/// serialises anything.
+pub fn wants(_kind: &str) -> bool {
+    true
+}
+
+/// Whether messages can be posted to `origin`: not an opaque one.
+pub fn usable_origin(_origin: &str) -> bool {
+    true
+}
+
 /// One message from the page, or `None` when it is not a usable assist message: another type or
 /// prefix, a field of the wrong type, or an id outside `[A-Za-z0-9_-]{1,64}`.
 pub fn parse(json: &str) -> Option<AssistIn> {

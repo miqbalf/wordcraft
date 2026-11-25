@@ -57,8 +57,12 @@ fn parses_each_incoming_type_and_refuses_bad_ids_and_wrong_types() {
     assert_eq!(p(json!({"type": "wordcraft:ai-result", "id": "a", "text": 5})), None);
     assert_eq!(p(json!({"type": "wordcraft:assist", "proof": "yes", "ai": false})), None);
     assert_eq!(p(json!({"type": "wordcraft:assist", "proof": true})), None);
-    assert_eq!(p(json!({"type": "wordcraft:proof-result", "id": "a", "matches": {}, "indonesian": []})), None);
-    assert_eq!(p(json!({"type": "wordcraft:proof-result", "id": "a", "matches": [], "indonesian": 3})), None);
+    // M5: a proof-result with a good id and a bad body fails that request at once, so it does
+    // not wait out the reply timeout and the 60 s backoff.
+    let failed = Some(AssistIn::ProofFailed { id: "a".into(), error: "unavailable".into() });
+    assert_eq!(p(json!({"type": "wordcraft:proof-result", "id": "a", "matches": {}, "indonesian": []})), failed);
+    assert_eq!(p(json!({"type": "wordcraft:proof-result", "id": "a", "matches": [], "indonesian": 3})), failed);
+    assert_eq!(p(json!({"type": "wordcraft:proof-result", "id": "bad id", "matches": {}, "indonesian": []})), None, "no usable id: nobody to fail");
     assert_eq!(p(json!({"type": "wordcraft:proof-failed", "id": "a", "error": 4})), None);
     assert_eq!(p(json!({"type": "wordcraft:open", "id": "a"})), None);
     assert_eq!(p(json!({"type": "pdfcraft:ai-result", "id": "a", "text": "t"})), None);
@@ -114,8 +118,9 @@ fn the_offset_unit_is_the_contracts_code_points_unless_the_message_names_one() {
     assert_eq!(reply(msg(json!(null))).unit, OffsetUnit::CodePoints);
     assert_eq!(reply(msg(json!("codepoints"))).unit, OffsetUnit::CodePoints);
     assert_eq!(reply(msg(json!("utf16"))).unit, OffsetUnit::Utf16);
-    assert_eq!(p(msg(json!("utf8"))), None, "an unknown unit is refused, not guessed");
-    assert_eq!(p(msg(json!(16))), None);
+    let failed = Some(AssistIn::ProofFailed { id: "a".into(), error: "unavailable".into() });
+    assert_eq!(p(msg(json!("utf8"))), failed, "an unknown unit is refused, not guessed");
+    assert_eq!(p(msg(json!(16))), failed);
 }
 
 #[test]
@@ -164,4 +169,45 @@ fn an_emoji_reply_lands_on_the_right_word_in_each_unit() {
         let hit: Vec<&str> = issues.as_array().into_iter().flatten().filter(|i| i["source"] == "remote").filter_map(|i| i["text"].as_str()).collect();
         assert_eq!(hit, vec!["Teh"], "unit {unit}");
     }
+}
+
+/// I1: the AI answer is bounded like the longest request the page accepts (summarize, 200 KB).
+#[test]
+fn ai_result_text_is_capped_at_the_pages_summarize_limit() {
+    let at = |n: usize| p(json!({"type": "wordcraft:ai-result", "id": "a", "text": "x".repeat(n)}));
+    assert!(matches!(at(204_800), Some(AssistIn::AiResult { .. })));
+    assert_eq!(at(204_801), None);
+    // The cap counts UTF-8 bytes, not characters.
+    assert_eq!(p(json!({"type": "wordcraft:ai-result", "id": "a", "text": "é".repeat(102_401)})), None);
+}
+
+/// M4: a host error code is one the app knows; anything else is "unavailable".
+#[test]
+fn host_error_codes_are_an_allow_list() {
+    for code in ["busy", "unavailable", "too_large", "disabled", "bad_request"] {
+        assert_eq!(p(json!({"type": "wordcraft:ai-failed", "id": "a", "error": code})), Some(AssistIn::AiFailed { id: "a".into(), error: code.into() }));
+    }
+    assert_eq!(p(json!({"type": "wordcraft:ai-failed", "id": "a", "error": "<b>boom</b>"})), Some(AssistIn::AiFailed { id: "a".into(), error: "unavailable".into() }));
+    assert_eq!(p(json!({"type": "wordcraft:proof-failed", "id": "a", "error": "weird"})), Some(AssistIn::ProofFailed { id: "a".into(), error: "unavailable".into() }));
+}
+
+/// M1: only the assist types are read from the page's messages at all.
+#[test]
+fn only_assist_types_are_wanted() {
+    for t in ["wordcraft:assist", "wordcraft:proof-result", "wordcraft:proof-failed", "wordcraft:ai-result", "wordcraft:ai-failed"] {
+        assert!(wants(t), "{t}");
+    }
+    for t in ["wordcraft:open", "wordcraft:host", "wordcraft:saved", "wordcraft:", "live", "pdfcraft:ai-result", ""] {
+        assert!(!wants(t), "{t}");
+    }
+}
+
+/// M3: an opaque origin ("null", a sandboxed frame) cannot be posted to, so the feature is off
+/// there rather than failing every send.
+#[test]
+fn an_opaque_origin_is_not_usable() {
+    assert!(usable_origin("https://cloud.example.org"));
+    assert!(usable_origin("http://localhost:8080"));
+    assert!(!usable_origin("null"));
+    assert!(!usable_origin(""));
 }
