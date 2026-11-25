@@ -14442,3 +14442,62 @@ fn undo_back_to_an_ignored_text_has_its_ignore_at_once() {
     run(&mut s, "edit.redo", json!({}));
     assert_eq!(builtin_grammar(&mut s), other[1..].to_vec(), "and forward again, the second ignore is back");
 }
+
+#[test]
+fn an_ignore_survives_an_edit_and_revert_with_remote_checks_off() {
+    if no_language_data("an_ignore_survives_an_edit_and_revert_with_remote_checks_off") {
+        return;
+    }
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "this is is a test. we went home."}));
+    let found = builtin_grammar(&mut s);
+    let at = serde_json::to_value(wordcraft_doc::Pos::body(0, found[0].0)).unwrap();
+    run(&mut s, "review.ignoreIssue", json!({"pos": at}));
+    let hidden = builtin_grammar(&mut s);
+    assert_eq!(hidden.len(), found.len() - 1);
+    let before = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().rev;
+    run(&mut s, "text.insert", json!({"text": "x"}));
+    run(&mut s, "text.backspace", json!({}));
+    assert_eq!(text(&s), "this is is a test. we went home.");
+    assert_ne!(s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().rev, before, "a new revision, the same text");
+    assert_eq!(builtin_grammar(&mut s), hidden, "still ignored, with no remote source and no poll");
+}
+
+#[test]
+fn add_to_dictionary_also_hides_remote_spelling_of_that_word_at_once() {
+    use crate::proof_remote::{ProofReply, RemoteKind, RemoteMatch};
+    let word = "zqkwdict";
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": format!("The {word} sat down.")}));
+    s.proof_remote.set_enabled(true);
+    let r = proof_request(&mut s, 0.0);
+    let m = RemoteMatch { offset: 4, length: word.len(), kind: RemoteKind::Spelling, message: "m".into(), replacements: vec![], rule: "MORFOLOGIK".into() };
+    s.proof_receive(&r.id, Ok(ProofReply { matches: vec![m], ..Default::default() }), 20_000.0);
+    assert_eq!(remote_rules(&mut s), vec!["MORFOLOGIK"], "the remote spelling issue is shown");
+    run(&mut s, "review.addToDictionary", json!({"word": word}));
+    assert!(remote_rules(&mut s).is_empty(), "Add to Dictionary hides it without waiting for a poll");
+}
+
+#[test]
+fn ignore_issue_keeps_the_same_rule_at_another_offset_in_the_paragraph() {
+    use crate::proof_remote::{ProofReply, RemoteKind, RemoteMatch};
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": IGNORE_TEXT}));
+    s.proof_remote.set_enabled(true);
+    let r = proof_request(&mut s, 0.0);
+    let m = |word: &str| RemoteMatch {
+        offset: r.text.find(word).unwrap_or(0),
+        length: word.len(),
+        kind: RemoteKind::Grammar,
+        message: "remote".into(),
+        replacements: vec![],
+        rule: "R_X".into(),
+    };
+    s.proof_receive(&r.id, Ok(ProofReply { matches: vec![m("cat"), m("mat")], ..Default::default() }), 20_000.0);
+    assert_eq!(remote_rules(&mut s), vec!["R_X", "R_X"]);
+    let at = issue_start(&mut s, "mat");
+    run(&mut s, "review.ignoreIssue", json!({"pos": at}));
+    let issues = run(&mut s, "review.issues", json!({}));
+    let left: Vec<_> = issues.as_array().unwrap().iter().filter(|i| i["source"] == "remote").map(|i| i["text"].as_str().unwrap().to_string()).collect();
+    assert_eq!(left, vec!["cat"], "the same rule at another offset stays visible");
+}
