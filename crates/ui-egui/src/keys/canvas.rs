@@ -419,6 +419,9 @@ fn equation_event(app: &mut WordApp, ctx: &egui::Context, e: &egui::Event, b: &m
                 }
                 return true;
             }
+            // Shift+Delete (the other Cut key) with the browser's cut event in this batch: the
+            // event runs the cut, as in body text, so the key mustn't delete in the equation too.
+            egui::Event::Key { key, pressed: true, modifiers, .. } if clipboard_event_follows(ctx, *key, *modifiers) => return true,
             egui::Event::Key { key, pressed: true, modifiers, .. } if equation_key(app, *key, *modifiers) => return true,
             // Anything else between the deletion and its replacement (a pre-edit, a key
             // release, focus, a pointer event) means the next equation typing command is a
