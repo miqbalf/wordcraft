@@ -244,7 +244,30 @@ pub(crate) fn copy_result(s: &mut Session) -> Value {
     r
 }
 
+/// Why a cut is refused while editing live: tables are not shared edits, so a cut that would
+/// change one (the whole table, some cells, or a selection running across one) is refused.
+pub const LIVE_TABLE_CUT: &str = "Tables can't be changed while others are editing. Copy still works.";
+
+/// Whether cutting the selection would change a table: the whole table or a cell range is
+/// selected, or the selection runs from one body block to another across a table. A selection
+/// inside one cell is not: typing there is shared.
+fn cut_changes_a_table(s: &Session) -> bool {
+    if super::table::selected_table(s).is_some() || s.cell_range().is_some() {
+        return true;
+    }
+    let (a, f) = (&s.sel.anchor, &s.sel.focus);
+    if a.story != wordcraft_doc::StoryRef::Body || f.story != wordcraft_doc::StoryRef::Body {
+        return false;
+    }
+    let (Some(&x), Some(&y)) = (a.path.0.first(), f.path.0.first()) else { return false };
+    let (lo, hi) = (x.min(y) as usize, x.max(y) as usize);
+    lo != hi && s.doc.body.get(lo..=hi).is_some_and(|blocks| blocks.iter().any(|b| b.as_table().is_some()))
+}
+
 fn cut(s: &mut Session, _: &Value) -> CmdResult {
+    if s.editing_live() && cut_changes_a_table(s) {
+        return Err(CmdError::Failed(LIVE_TABLE_CUT.into()));
+    }
     let whole = super::table::selected_table(s);
     let r = copy_with(s, whole.as_ref())?;
     // A whole table selected: Cut removes the table, as Delete Table does (#1744). With Track
@@ -304,19 +327,22 @@ fn insert_spike(s: &mut Session, _: &Value) -> CmdResult {
 /// else another program's HTML or RTF (#687). The system clipboard's text has none, so it pastes
 /// as Keep Text Only does.
 fn paste(s: &mut Session, v: &Value) -> CmdResult {
-    match super::paste::paste_content(s, v)? {
-        super::paste::Pasted::Fragment(frag) => super::paste::insert(s, frag)?,
-        super::paste::Pasted::Text(text) => super::paste::insert_text(s, &text)?,
-    }
-    sel_result(s)
+    let lost = match super::paste::paste_content(s, v)? {
+        super::paste::Pasted::Fragment(frag) => super::paste::insert_pasted(s, frag)?,
+        super::paste::Pasted::Text(text) => {
+            super::paste::insert_text(s, &text)?;
+            super::paste::Lost::default()
+        }
+    };
+    super::paste::pasted_result(s, lost)
 }
 
 /// Merge Formatting: the pasted text takes the destination's formatting, keeping its emphasis.
 fn paste_merge(s: &mut Session, v: &Value) -> CmdResult {
     let mut frag = super::paste::paste_fragment(s, v)?;
     super::paste::merge_formatting(s, &mut frag);
-    super::paste::insert(s, frag)?;
-    sel_result(s)
+    let lost = super::paste::insert_pasted(s, frag)?;
+    super::paste::pasted_result(s, lost)
 }
 
 /// Most items the Clipboard pane keeps.

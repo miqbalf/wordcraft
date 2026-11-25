@@ -1840,3 +1840,137 @@ fn share_says_when_the_page_did_not_get_the_request() {
         assert!(shown.contains("no same-origin parent"), "{entry}: {shown:?}");
     }
 }
+
+/// A web app: the browser follows Mod+C, Mod+X and Mod+V with its own copy, cut or paste event.
+fn web_app(text: &str) -> WordApp {
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+    a.canvas.paste_event_follows_chord = true;
+    a.run("text.insert", json!({"text": text})).unwrap();
+    a
+}
+
+/// One frame at input time `t`, returning the texts it put on the clipboard.
+fn web_frame(ctx: &egui::Context, a: &mut WordApp, t: f64, modifiers: Modifiers, events: Vec<egui::Event>) -> Vec<String> {
+    a.ctx = Some(ctx.clone());
+    let events = std::iter::once(egui::Event::ModifiersChanged(modifiers)).chain(events).collect();
+    let mut out = ctx.run_ui(egui::RawInput { events, time: Some(t), ..Default::default() }, |ui| canvas_events(a, ui.ctx()));
+    let commands = std::mem::take(&mut out.platform_output.commands);
+    out.drop_without_applying_deltas();
+    commands
+        .iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn caret_at_end(a: &mut WordApp) {
+    let end = a.session.doc.plain_text(wordcraft_doc::StoryRef::Body).len();
+    a.session.sel = wordcraft_engine::Selection::caret(wordcraft_doc::Pos::body(0, end));
+}
+
+/// A browser (eframe web) sends Mod+V as its key press and then a paste event with the
+/// clipboard's text. With something copied in the app, that is one paste, not two: the key
+/// mustn't paste the app's own copy as well (LP1 keyboard e2e). Both when the clipboard holds
+/// that copy (it keeps its formatting) and when another program's text replaced it.
+#[test]
+fn a_browser_mod_v_with_a_copy_in_the_app_pastes_once() {
+    for (event_text, want, bold) in [("source", "source target source", true), ("outside", "source target outside", false)] {
+        let mut a = web_app("source target ");
+        a.run("select.text", json!({"text": "source"})).unwrap();
+        a.run("format.bold", json!({})).unwrap();
+        a.run("edit.copy", json!({})).unwrap();
+        caret_at_end(&mut a);
+        let ctx = egui::Context::default();
+        web_frame(&ctx, &mut a, 0.0, Modifiers::COMMAND, vec![key_event(Key::V, true, Modifiers::COMMAND), egui::Event::Paste(event_text.into())]);
+        web_frame(&ctx, &mut a, 0.05, Modifiers::COMMAND, vec![key_event(Key::V, false, Modifiers::COMMAND)]);
+        web_frame(&ctx, &mut a, 3.0, Modifiers::NONE, vec![]);
+        assert_eq!(a.session.doc.plain_text(wordcraft_doc::StoryRef::Body), want, "{event_text}");
+        // The pasted word: bold when it was the app's own copy (as the ribbon's Paste keeps it).
+        let end = want.len();
+        a.session.sel =
+            wordcraft_engine::Selection { anchor: wordcraft_doc::Pos::body(0, end - event_text.len()), focus: wordcraft_doc::Pos::body(0, end) };
+        let state = a.session.run("format.state", &json!({})).unwrap();
+        assert_eq!(state.get("bold").and_then(serde_json::Value::as_bool) == Some(true), bold, "{event_text}: {state}");
+    }
+}
+
+/// The app's own copy that the browser's paste event can't carry (a picture alone puts no text
+/// on the clipboard, so no paste event comes): Mod+V still pastes it once, after a short wait,
+/// or at once when the next key comes.
+#[test]
+fn a_browser_mod_v_with_no_paste_event_pastes_the_apps_copy_once() {
+    let mut a = web_app("source target ");
+    a.run("select.text", json!({"text": "source"})).unwrap();
+    a.run("edit.copy", json!({})).unwrap();
+    caret_at_end(&mut a);
+    let ctx = egui::Context::default();
+    web_frame(&ctx, &mut a, 0.0, Modifiers::COMMAND, vec![key_event(Key::V, true, Modifiers::COMMAND)]);
+    web_frame(&ctx, &mut a, 0.05, Modifiers::COMMAND, vec![key_event(Key::V, false, Modifiers::COMMAND)]);
+    web_frame(&ctx, &mut a, 3.0, Modifiers::NONE, vec![]);
+    web_frame(&ctx, &mut a, 6.0, Modifiers::NONE, vec![]);
+    assert_eq!(a.session.doc.plain_text(wordcraft_doc::StoryRef::Body), "source target source");
+    // The next key doesn't wait: the paste lands before the typing.
+    web_frame(&ctx, &mut a, 7.0, Modifiers::COMMAND, vec![key_event(Key::V, true, Modifiers::COMMAND)]);
+    web_frame(&ctx, &mut a, 7.05, Modifiers::NONE, vec![key_event(Key::V, false, Modifiers::NONE), egui::Event::Text("!".into())]);
+    web_frame(&ctx, &mut a, 9.0, Modifiers::NONE, vec![]);
+    assert_eq!(a.session.doc.plain_text(wordcraft_doc::StoryRef::Body), "source target sourcesource!");
+}
+
+/// Mod+C and Mod+X in a browser (and Shift+Delete, the other Cut key): the key and the
+/// browser's copy or cut event are one copy, one cut: the clipboard is written once.
+#[test]
+fn a_browser_mod_c_and_mod_x_run_once() {
+    for (key, m, event, left) in [
+        (Key::C, Modifiers::COMMAND, egui::Event::Copy, "source target"),
+        (Key::X, Modifiers::COMMAND, egui::Event::Cut, " target"),
+        (Key::Delete, Modifiers::SHIFT, egui::Event::Cut, " target"),
+    ] {
+        let mut a = web_app("source target");
+        a.run("select.text", json!({"text": "source"})).unwrap();
+        let ctx = egui::Context::default();
+        let mut put = web_frame(&ctx, &mut a, 0.0, m, vec![key_event(key, true, m), event.clone()]);
+        put.extend(web_frame(&ctx, &mut a, 0.05, m, vec![key_event(key, false, m)]));
+        put.extend(web_frame(&ctx, &mut a, 3.0, Modifiers::NONE, vec![]));
+        assert_eq!(put, ["source"], "{key:?}: written once");
+        assert_eq!(a.session.doc.plain_text(wordcraft_doc::StoryRef::Body), left, "{key:?}");
+    }
+}
+
+/// The desktop sends no paste event after Mod+V's key (egui-winit pastes from the key): the key
+/// still pastes there, at once.
+#[test]
+fn a_desktop_mod_v_key_still_pastes_at_once() {
+    let mut a = web_app("source target ");
+    a.canvas.paste_event_follows_chord = false;
+    a.run("select.text", json!({"text": "source"})).unwrap();
+    a.run("edit.copy", json!({})).unwrap();
+    caret_at_end(&mut a);
+    let ctx = egui::Context::default();
+    web_frame(&ctx, &mut a, 0.0, Modifiers::COMMAND, vec![key_event(Key::V, true, Modifiers::COMMAND)]);
+    assert_eq!(a.session.doc.plain_text(wordcraft_doc::StoryRef::Body), "source target source");
+}
+
+/// Shift+Delete in an open equation, in a browser that follows it with a cut event: one
+/// command runs, the cut, as in body text; the equation does not also lose a character
+/// (review round 3, M2). With no cut event (the desktop shape), the key still deletes.
+#[test]
+fn a_browser_shift_delete_in_an_equation_runs_once() {
+    let linear = |a: &mut WordApp| a.run("equation.get", json!({})).unwrap().get("linear").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    for (events_with_cut, want) in [(true, "abc"), (false, "bc")] {
+        let mut a = web_app("x ");
+        a.run("insert.equation", json!({"linear": "abc"})).unwrap();
+        a.run("equation.move", json!({"dir": "home"})).unwrap();
+        let ctx = egui::Context::default();
+        let m = Modifiers::SHIFT;
+        let mut events = vec![key_event(Key::Delete, true, m)];
+        if events_with_cut {
+            events.push(egui::Event::Cut);
+        }
+        web_frame(&ctx, &mut a, 0.0, m, events);
+        web_frame(&ctx, &mut a, 0.05, m, vec![key_event(Key::Delete, false, m)]);
+        assert!(a.session.math.is_some(), "still in the equation");
+        assert_eq!(linear(&mut a), want, "cut event: {events_with_cut}");
+    }
+}

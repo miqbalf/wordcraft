@@ -2,13 +2,18 @@
 
 /// The editing commands whose effect live editing shares: typing and deleting text, splitting
 /// and joining paragraphs, character formatting, paragraph styles and paragraph formatting,
-/// moving paragraphs, and Undo and Redo (which the live layer owns while live).
+/// moving paragraphs, cut and paste, and Undo and Redo (which the live layer owns while live).
+///
+/// A paste keeps to what the body shares on its own: while live, the engine pastes pictures,
+/// tables, fields, notes, comments, lists and styles the document lacks as their text
+/// (`wordcraft_engine::cmd::paste::live_text`), and the window says so
+/// ([`crate::PASTED_AS_TEXT`]). A cut is a copy and a delete.
 ///
 /// Left out, because what they change is not shared in phase 1: inline objects (pictures,
 /// shapes, fields, equations, bookmarks, note and comment marks), media, numbering definitions
 /// (bullets and numbering), notes, comments, tracked changes, headers and footers, character
-/// styles (they may add a style definition), paste and cut (they may carry objects), and any
-/// table edit.
+/// styles (they may add a style definition), the Clipboard pane's pastes, Paste Formatting, and
+/// any table edit.
 pub const SHAREABLE: &[&str] = &[
     // Text.
     "text.insert",
@@ -94,6 +99,12 @@ pub const SHAREABLE: &[&str] = &[
     "para.outlineLevel",
     "para.moveUp",
     "para.moveDown",
+    // Clipboard. Copy changes nothing, so it needs no entry.
+    "edit.cut",
+    "edit.paste",
+    "edit.pasteText",
+    "edit.pasteMerge",
+    "edit.pasteSpecial",
     // History, owned by the live layer while live.
     "edit.undo",
     "edit.redo",

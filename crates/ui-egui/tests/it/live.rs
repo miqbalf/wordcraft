@@ -192,7 +192,8 @@ fn non_shareable_command_is_disabled_while_live() {
     let app = h.state();
     assert!(wordcraft_ui_egui::widgets::enabled(app, "format.bold"), "a shared edit stays enabled");
     assert!(!wordcraft_ui_egui::widgets::enabled(app, "insert.bookmark"), "a bookmark can't be shared: greyed out");
-    assert!(!wordcraft_ui_egui::widgets::enabled(app, "edit.paste"), "nor can a paste");
+    assert!(wordcraft_ui_egui::widgets::enabled(app, "edit.paste"), "a paste is shared (as text where it must be)");
+    assert!(wordcraft_ui_egui::widgets::enabled(app, "edit.copy"), "so is copying");
     assert!(!wordcraft_ui_egui::widgets::enabled(app, "file.save"), "the document service saves, not this window");
     let bold = h.get_by_role_and_label(Role::Button, "Bold");
     assert!(!bold.accesskit_node().is_disabled(), "the ribbon's Bold button is enabled");
@@ -919,4 +920,64 @@ fn unshared_typing_is_offered_as_a_copy_until_saved() {
     let doc = wordcraft_engine::io::open_bytes(name, bytes).unwrap();
     assert!(doc.body.iter().filter_map(|b| b.as_para()).any(|p| p.text.contains("Offline")), "the copy holds the typing");
     assert!(!bob.text().contains("Offline"), "the room never got it");
+}
+
+/// What the window put on the system clipboard this frame.
+fn copied(h: &Harness<'static, WordApp>) -> Vec<String> {
+    h.output()
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Select from `a` to `b` (body paragraph, byte offset) in Alice's window.
+fn select(h: &mut Harness<'static, WordApp>, a: (usize, usize), b: (usize, usize)) {
+    h.state_mut().session.sel = wordcraft_engine::Selection { anchor: wordcraft_doc::Pos::body(a.0, a.1), focus: wordcraft_doc::Pos::body(b.0, b.1) };
+    h.step();
+}
+
+/// LP1: copy, cut and paste while editing live, from the keyboard (the browser's copy, cut and
+/// paste events) and from the menu.
+#[test]
+fn copy_cut_and_paste_work_while_live() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (mut h, _hub) = alice(&relay, Access::Edit, true);
+    settle(&relay, &mut h, &mut bob);
+    h.state_mut().canvas.focused = true;
+    // Copy with Ctrl/Cmd+C.
+    select(&mut h, (0, 0), (0, 5));
+    h.event(egui::Event::Copy);
+    h.step();
+    assert_eq!(copied(&h), ["Hello"], "the key copied the selection");
+    // And from the menu.
+    select(&mut h, (0, 6), (0, 11));
+    h.state_mut().run("edit.copy", json!({})).unwrap();
+    h.step();
+    assert!(copied(&h).contains(&"world".to_owned()), "the menu copied it: {:?}", copied(&h));
+    // Paste with Ctrl/Cmd+V at the end of the second paragraph.
+    select(&mut h, (1, 6), (1, 6));
+    h.event(egui::Event::Paste(" pasted".into()));
+    h.step();
+    settle(&relay, &mut h, &mut bob);
+    assert_eq!(bob.text(), "Hello world\nSecond pasted", "the paste reached Bob");
+    // Cut with Ctrl/Cmd+X.
+    select(&mut h, (0, 5), (0, 11));
+    h.event(egui::Event::Cut);
+    h.step();
+    assert!(copied(&h).contains(&" world".to_owned()), "the cut text is on the clipboard: {:?}", copied(&h));
+    settle(&relay, &mut h, &mut bob);
+    assert_eq!(bob.text(), "Hello\nSecond pasted", "the cut reached Bob");
+    assert_eq!(alice_text(&mut h), bob.text());
+    // The ribbon's Paste, with the system clipboard's text.
+    select(&mut h, (0, 5), (0, 5));
+    h.state_mut().run("edit.paste", json!({"text": " again"})).unwrap();
+    settle(&relay, &mut h, &mut bob);
+    assert_eq!(bob.text(), "Hello again\nSecond pasted");
+    assert_eq!(alice_text(&mut h), bob.text());
 }

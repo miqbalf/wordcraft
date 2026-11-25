@@ -216,6 +216,15 @@ impl Session {
         self.bind_live();
     }
 
+    /// Whether a live co-editing layer watches the edits of this document now (its hooks are
+    /// bound to the active document; the observer itself is taken out while a command runs, so
+    /// it is the binding that tells). Live editing shares only the body, so commands that can
+    /// bring in content from elsewhere (Paste) keep what they bring to what the body can hold
+    /// on its own: see [`crate::cmd::paste::live_text`].
+    pub fn editing_live(&self) -> bool {
+        self.live_here()
+    }
+
     /// Whether the live undo hook owns Undo and Redo now.
     pub(crate) fn live_undo_active(&self) -> bool {
         self.live_undo.is_some() && self.live_here()

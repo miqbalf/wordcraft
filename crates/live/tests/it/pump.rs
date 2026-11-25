@@ -16,6 +16,8 @@ use wordcraft_live::{
 
 use super::{Rng, plain, random_off, texts};
 
+mod paste;
+
 const ROOM: &str = "doc:inst:42";
 
 /// One connection as the fake relay sees it.

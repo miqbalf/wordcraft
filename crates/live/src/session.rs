@@ -54,6 +54,53 @@ use wordcraft_engine::{CmdError, EditObserver, Registry, Session};
 
 use crate::{LiveMap, LocalEdit, MapError, Refusal, assign_seed_pids, is_shareable, seed_blocks, share_pids};
 
+/// The notice after a paste that brought pictures and tables, which live editing does not
+/// share: their text came in ([`crate::SHAREABLE`]). See [`paste_notice`] for every case.
+pub const PASTED_AS_TEXT: &str = "Pasted as text: pictures and tables can't be shared while others are editing.";
+
+/// The notice after a paste that lost only formatting live editing does not share (a style or
+/// list the document lacks, a section break).
+pub const PASTED_WITHOUT_FORMATTING: &str = "Pasted without some formatting: it can't be shared while others are editing.";
+
+/// `items` as an English list: `a`, `a and b`, `a, b and c`.
+fn english_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The notice for a paste's result, from what the engine's live filter took out (its `lost`
+/// and `pasted` keys, `wordcraft_engine::cmd::paste::Lost`); `None` when nothing the user
+/// would miss was taken out (only bookmarks or comment anchors, or nothing).
+pub fn paste_notice(result: &Value) -> Option<String> {
+    let lost = result.get("lost");
+    let has = |k: &str| lost.and_then(|l| l.get(k)).and_then(Value::as_bool) == Some(true);
+    let kinds: Vec<&str> = [("pictures", "pictures"), ("tables", "tables"), ("fields", "fields"), ("notes", "notes")]
+        .into_iter()
+        .filter(|(k, _)| has(k))
+        .map(|(_, word)| word)
+        .collect();
+    if result.get("pasted").and_then(Value::as_bool) == Some(false) {
+        let list = english_list(&kinds);
+        let mut chars = list.chars();
+        let list = chars.next().map(|c| c.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default();
+        return Some(format!("{list} can't be shared while others are editing, so nothing was pasted."));
+    }
+    if kinds.is_empty() {
+        return has("formatting").then(|| PASTED_WITHOUT_FORMATTING.to_owned());
+    }
+    let mut items = kinds;
+    if has("formatting") {
+        items.push("some formatting");
+    }
+    Some(format!("Pasted as text: {} can't be shared while others are editing.", english_list(&items)))
+}
+
+/// The notice when a paste still could not be shared: nothing of it was applied.
+pub const PASTE_REFUSED: &str = "This paste can't be shared while others are editing, so nothing was pasted.";
+
 /// Another editor in the document, its caret `(paragraph id, char offset)`.
 pub type Peer = craft_live::Peer<(u64, usize)>;
 
@@ -105,6 +152,8 @@ struct App<'a> {
     pending: &'a mut Option<LocalEdit>,
     /// Replica states holding local edits the room does not have ([`LiveEditing::take_unmerged`]).
     unmerged: &'a mut Vec<Vec<u8>>,
+    /// Set when a batch was refused (and put back).
+    refused: &'a mut bool,
 }
 
 impl LiveApp<Word> for App<'_> {
@@ -117,7 +166,10 @@ impl LiveApp<Word> for App<'_> {
                 *self.pending = Some(edit);
                 Ok(updates)
             }
-            Err(e) if e.refused().is_some() => Err(LocalError::Refused(refusal_text(&e).to_owned())),
+            Err(e) if e.refused().is_some() => {
+                *self.refused = true;
+                Err(LocalError::Refused(refusal_text(&e).to_owned()))
+            }
             Err(e) => Err(LocalError::Failed(e.to_string())),
         }
     }
@@ -214,6 +266,8 @@ pub struct LiveEditing<H: Hub> {
     core: craft_live::LiveEditing<H, Word>,
     map: LiveMap,
     pending: Option<LocalEdit>,
+    /// Whether a local batch was refused since [`LiveEditing::run`] last cleared it.
+    refused: bool,
     registry: Arc<Registry>,
     /// The session's document this link edits ([`Session::document_id`]).
     document: u64,
@@ -263,6 +317,7 @@ impl<H: Hub> LiveEditing<H> {
             core,
             map,
             pending: None,
+            refused: false,
             registry: session.registry.clone(),
             document: session.document_id(),
             since_verify: 0,
@@ -280,7 +335,13 @@ impl<H: Hub> LiveEditing<H> {
     /// One frame: share the local edits, take in the other editors' edits, carets and saves,
     /// and say who else is here.
     pub fn pump(&mut self, session: &mut Session) -> Vec<Peer> {
-        let peers = self.core.pump(&mut App { session, map: &mut self.map, pending: &mut self.pending, unmerged: &mut self.unmerged });
+        let peers = self.core.pump(&mut App {
+            session,
+            map: &mut self.map,
+            pending: &mut self.pending,
+            unmerged: &mut self.unmerged,
+            refused: &mut self.refused,
+        });
         self.keep_when_full();
         self.since_verify = self.since_verify.saturating_add(1);
         let now = (session.rev(), self.core.newest_seq());
@@ -341,7 +402,9 @@ impl<H: Hub> LiveEditing<H> {
         self.repairs = self.repairs.saturating_add(1);
         log::warn!("live: the window's document drifted from the shared copy ({why}); it is rebuilt from the shared copy");
         let Some(doc) = self.core.live().doc() else { return true };
-        if let Err(e) = (App { session, map: &mut self.map, pending: &mut self.pending, unmerged: &mut self.unmerged }).resync(doc) {
+        if let Err(e) =
+            (App { session, map: &mut self.map, pending: &mut self.pending, unmerged: &mut self.unmerged, refused: &mut self.refused }).resync(doc)
+        {
             log::warn!("live: the rebuild from the shared copy did not land: {e}");
         }
         true
@@ -360,22 +423,37 @@ impl<H: Hub> LiveEditing<H> {
     }
 
     /// Run a command on the session, refused when live editing does not allow it now, and
-    /// share its edit right away.
+    /// share its edit right away. A paste that lost what live editing does not share says so
+    /// ([`paste_notice`]) once it is shared, or when nothing was left to paste.
     pub fn run(&mut self, session: &mut Session, id: &str, params: &Value) -> Result<Value, CmdError> {
         if !self.allows(id) {
             let why = self.refusal_for(id);
             self.core.push_notice(why.clone());
             return Err(CmdError::Disabled(why));
         }
+        self.refused = false;
         let result = session.run(id, params);
         self.flush(session);
+        // A refused edit was put back, with its own notice.
+        if !self.refused
+            && let Ok(v) = &result
+            && let Some(notice) = paste_notice(v)
+        {
+            self.core.push_notice(notice);
+        }
         result
     }
 
     /// Share the edits the session made since the last flush, and run the Undo and Redo it
     /// asked for. Refused edits are put back, with a notice.
     pub fn flush(&mut self, session: &mut Session) {
-        self.core.flush(&mut App { session, map: &mut self.map, pending: &mut self.pending, unmerged: &mut self.unmerged });
+        self.core.flush(&mut App {
+            session,
+            map: &mut self.map,
+            pending: &mut self.pending,
+            unmerged: &mut self.unmerged,
+            refused: &mut self.refused,
+        });
         self.keep_when_full();
     }
 
@@ -584,6 +662,22 @@ impl<H: Hub> LiveEditing<H> {
 fn refusal_text(e: &MapError) -> &'static str {
     match e {
         MapError::NoSpace { .. } => CONNECTING,
+        // A paste is kept to what is shared before it runs; one still refused is refused whole,
+        // and says what stopped it: the selection it replaces, or where the caret is.
+        MapError::NotShareable { command, reason } if command.starts_with("edit.paste") => match reason {
+            Refusal::InlineObject => {
+                "The selection has a picture or other object, which can't be removed while others are editing, so nothing was pasted."
+            }
+            Refusal::OutsideBody("parts") => {
+                "Headers, footers, notes and text boxes can't be changed while others are editing, so nothing was pasted."
+            }
+            Refusal::OutsideBody("comments") => "Comments are off during live editing, so nothing was pasted.",
+            Refusal::OutsideBody("revisions") => "Tracked changes are off during live editing, so nothing was pasted.",
+            Refusal::OutsideBody(_) => PASTE_REFUSED,
+        },
+        MapError::NotShareable { command, reason: Refusal::InlineObject } if command == "edit.cut" => {
+            "Pictures and other objects can't be cut while others are editing."
+        }
         MapError::NotShareable { command, reason: Refusal::InlineObject } => {
             if is_image(command) {
                 "Images can't be added while others are editing."
@@ -620,8 +714,9 @@ fn command_text(id: &str) -> &'static str {
         "Bullets and numbering are locked during live editing."
     } else if id.starts_with("review.") || has(&["comment"]) {
         "Comments and tracked changes are off during live editing."
-    } else if id == "edit.paste" || id == "edit.cut" || id.starts_with("edit.paste") {
-        "Paste and cut are off during live editing."
+    } else if id.starts_with("edit.paste") {
+        // Paste and Keep Text Only are shared; the Clipboard pane and Paste Formatting are not.
+        "This paste option is off during live editing. Use Paste or Keep Text Only."
     } else {
         "This command isn't available while others are editing."
     }

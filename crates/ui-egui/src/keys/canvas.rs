@@ -419,6 +419,9 @@ fn equation_event(app: &mut WordApp, ctx: &egui::Context, e: &egui::Event, b: &m
                 }
                 return true;
             }
+            // Shift+Delete (the other Cut key) with the browser's cut event in this batch: the
+            // event runs the cut, as in body text, so the key mustn't delete in the equation too.
+            egui::Event::Key { key, pressed: true, modifiers, .. } if clipboard_event_follows(ctx, *key, *modifiers) => return true,
             egui::Event::Key { key, pressed: true, modifiers, .. } if equation_key(app, *key, *modifiers) => return true,
             // Anything else between the deletion and its replacement (a pre-edit, a key
             // release, focus, a pointer event) means the next equation typing command is a
@@ -465,6 +468,14 @@ fn ime_commit(app: &mut WordApp, text: String) {
 
 /// A key press the canvas handles (shortcut, ink, objects, clipboard keys).
 fn key_press(app: &mut WordApp, ctx: &egui::Context, key: Key, modifiers: Modifiers) {
+    // A browser follows Mod+C, Mod+X and Mod+V (and Shift+Delete, Shift+Insert, Mod+Insert)
+    // with its own copy, cut or paste event in the same input batch, and that event runs the
+    // command. Running the key too pasted twice. With no such event (an app-internal copy the
+    // browser can't carry, a picture alone) the key still runs. The desktop sends no key for
+    // these, so nothing changes there.
+    if clipboard_event_follows(ctx, key, modifiers) {
+        return;
+    }
     if key == Key::Escape && app.session.painter.is_some() {
         app.session.painter = None;
         return;
@@ -525,6 +536,32 @@ fn key_press(app: &mut WordApp, ctx: &egui::Context, key: Key, modifiers: Modifi
         return;
     }
     app.canvas.swallow_text = dispatch(app, key, modifiers) && modifiers.alt;
+}
+
+/// Whether this batch holds the browser's copy, cut or paste event for the clipboard key
+/// `key` with `m` (the same rule as DeckCraft's `clipboard_events`).
+fn clipboard_event_follows(ctx: &egui::Context, key: Key, m: Modifiers) -> bool {
+    let plain_mod = m.command && !m.shift && !m.alt;
+    let (copy, cut, paste) = match key {
+        Key::C => (plain_mod, false, false),
+        Key::X => (false, plain_mod, false),
+        Key::V => (false, false, plain_mod),
+        Key::Copy => (true, false, false),
+        Key::Cut => (false, true, false),
+        Key::Paste => (false, false, true),
+        Key::Insert if plain_mod => (true, false, false),
+        Key::Insert if m.shift && !m.command && !m.alt => (false, false, true),
+        Key::Delete if m.shift && !m.command && !m.alt => (false, true, false),
+        _ => return false,
+    };
+    ctx.input(|i| {
+        i.events.iter().any(|e| match e {
+            egui::Event::Copy => copy,
+            egui::Event::Cut => cut,
+            egui::Event::Paste(_) => paste,
+            _ => false,
+        })
+    })
 }
 
 /// Everything else: typed text, IME, clipboard and key presses.
