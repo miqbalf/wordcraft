@@ -60,7 +60,13 @@ fn on_word(req: &ProofRequest, word: &str, kind: RemoteKind, rule: &str) -> Remo
 }
 
 fn ok(matches: Vec<RemoteMatch>) -> Result<ProofReply, ProofFailure> {
-    Ok(ProofReply { matches, indonesian: Vec::new() })
+    Ok(ProofReply { matches, ..Default::default() })
+}
+
+/// The UTF-16 offset of `word` in `text`.
+fn u16_at(text: &str, word: &str) -> usize {
+    let at = text.find(word).unwrap_or_else(|| panic!("{word:?} not in {text:?}"));
+    text[..at].encode_utf16().count()
 }
 
 /// The one request a poll sends.
@@ -292,7 +298,7 @@ fn untrusted_matches_outside_the_text_or_empty_are_dropped() {
         m(2, usize::MAX, RemoteKind::Spelling, "OVERFLOW2"),
         RemoteMatch { message: "x".repeat(10_000), replacements: vec!["y".repeat(10_000); 50], ..on_word(&r, "wrold", RemoteKind::Spelling, "BIG") },
     ];
-    let reply = Ok(ProofReply { matches, indonesian: vec![(usize::MAX, 5), (0, 0), (3, usize::MAX)] });
+    let reply = Ok(ProofReply { matches, indonesian: vec![(usize::MAX, 5), (0, 0), (3, usize::MAX)], ..Default::default() });
     rp.receive(&r.id, reply, IDLE_MS);
     let o = rp.overlays(0).expect("overlays");
     let (_, o) = o.get(rev(&d, 0)).expect("overlay");
@@ -363,7 +369,7 @@ fn indonesian_spans_become_quiet_spelling_for_their_paragraph() {
     let saya = cp(&r.text, "Saya");
     let across = (cp(&r.text, "there."), saya + 4 - cp(&r.text, "there."));
     let empty = (cp(&r.text, "Teh"), 0);
-    rp.receive(&r.id, Ok(ProofReply { matches: Vec::new(), indonesian: vec![kami, across, empty] }), IDLE_MS);
+    rp.receive(&r.id, Ok(ProofReply { matches: Vec::new(), indonesian: vec![kami, across, empty], ..Default::default() }), IDLE_MS);
     let o = rp.overlays(0).expect("overlays");
     let quiet = |k: usize| o.get(rev(&d, k)).map(|(_, o)| o.quiet_spelling.clone()).unwrap_or_default();
     let p0 = &para(&d, 0).text;
@@ -447,6 +453,18 @@ fn disabled_reply_stops_all_requests() {
     let r = first(&mut rp, &d);
     rp.receive(&r.id, Err(ProofFailure::Disabled), IDLE_MS);
     assert!(!rp.enabled());
+    // Underlines from before the service was turned off go with it.
+    let mut was_on = on();
+    let mut two = doc(&["Teh cat sat.", "Fine text."]);
+    let r = first(&mut was_on, &two);
+    was_on.receive(&r.id, ok(vec![on_word(&r, "Teh", RemoteKind::Spelling, "S")]), IDLE_MS);
+    assert!(!remote(&was_on, &two, 0).is_empty());
+    edit(&mut two, 1, "Fine text, edited.");
+    let (at, r) = first_send(&mut was_on, &two, 2, IDLE_MS + 5000.0, IDLE_MS + 20_000.0).expect("the edit is sent");
+    let g = was_on.generation();
+    was_on.receive(&r.id, Err(ProofFailure::Disabled), at);
+    assert!(was_on.generation() > g);
+    assert!(remote(&was_on, &two, 0).is_empty(), "no remote underline once the service is off");
     edit(&mut d, 0, "Another text.");
     let p = rp.poll(&d, 2, 1_000_000.0);
     assert!(p.send.is_empty());
@@ -501,9 +519,9 @@ fn ignores_reach_the_overlays_and_rules_stay_with_their_document() {
     let r = first(&mut rp, &d);
     rp.receive(&r.id, ok(vec![on_word(&r, "Teh", RemoteKind::Spelling, "S")]), IDLE_MS);
     let g = rp.generation();
-    rp.ignore_occurrence(para(&d, 0), 0, 3, "S");
+    rp.ignore_occurrence(0, para(&d, 0), 0, 3, "S");
     rp.ignore_rule(0, "R1");
-    rp.ignore_word("Teh");
+    rp.ignore_word(0, "Teh");
     assert!(rp.generation() > g);
     let o = rp.overlays(0).expect("overlays");
     assert!(o.get(rev(&d, 0)).is_some_and(|(_, o)| o.ignored.iter().any(|i| (i.start, i.end, i.rule.as_str()) == (0, 3, "S"))));
@@ -511,4 +529,124 @@ fn ignores_reach_the_overlays_and_rules_stay_with_their_document() {
     assert!(o.words().contains("Teh"));
     let other = rp.overlays(7);
     assert!(other.is_none_or(|o| o.ignored_rules().is_empty() && !o.words().contains("Teh")), "another document's are its own");
+}
+
+#[test]
+fn utf16_and_code_point_offsets_land_on_the_same_bytes() {
+    let d = doc(&["😀 Teh 👍🏽 cat wrold."]);
+    let text = para(&d, 0).text.clone();
+    let mut got = Vec::new();
+    for unit in [OffsetUnit::CodePoints, OffsetUnit::Utf16] {
+        let mut rp = on();
+        let r = first(&mut rp, &d);
+        let at = |w: &str| if unit == OffsetUnit::Utf16 { u16_at(&r.text, w) } else { cp(&r.text, w) };
+        let len = |w: &str| if unit == OffsetUnit::Utf16 { w.encode_utf16().count() } else { w.chars().count() };
+        let matches = vec![
+            m(at("Teh"), len("Teh"), RemoteKind::Spelling, "A"),
+            m(at("wrold"), len("wrold"), RemoteKind::Spelling, "B"),
+            // Covers "👍🏽 " whole in either unit.
+            m(at("👍🏽"), len("👍🏽 "), RemoteKind::Grammar, "C"),
+        ];
+        rp.receive(&r.id, Ok(ProofReply { matches, indonesian: vec![(at("cat"), len("cat"))], unit }), IDLE_MS);
+        let o = rp.overlays(0).expect("overlays");
+        let (_, o) = o.get(rev(&d, 0)).expect("overlay");
+        let mut found: Vec<(usize, usize)> = o.remote.iter().map(|r| (r.issue.start, r.issue.end)).collect();
+        found.sort_unstable();
+        let words: Vec<&str> = found.iter().map(|&(a, b)| &text[a..b]).collect();
+        assert_eq!(words, vec!["Teh", "👍🏽 ", "wrold"], "{unit:?}");
+        assert_eq!(o.quiet_spelling.iter().map(|q| &text[q.clone()]).collect::<Vec<_>>(), vec!["cat"], "{unit:?}");
+        got.push(found);
+    }
+    assert_eq!(got[0], got[1]);
+}
+
+#[test]
+fn a_utf16_offset_inside_a_surrogate_pair_or_past_the_end_is_dropped() {
+    let d = doc(&["😀 Teh."]);
+    let mut rp = on();
+    let r = first(&mut rp, &d);
+    let n = r.text.encode_utf16().count();
+    let matches = vec![
+        m(1, 3, RemoteKind::Spelling, "MID_PAIR_START"),
+        m(0, 1, RemoteKind::Spelling, "MID_PAIR_END"),
+        m(n, 1, RemoteKind::Spelling, "PAST_END"),
+        m(n - 1, usize::MAX, RemoteKind::Spelling, "OVERFLOW"),
+        m(u16_at(&r.text, "Teh"), 3, RemoteKind::Spelling, "OK"),
+    ];
+    let reply = Ok(ProofReply { matches, indonesian: vec![(1, 2), (n, 4)], unit: OffsetUnit::Utf16 });
+    rp.receive(&r.id, reply, IDLE_MS);
+    let o = rp.overlays(0).expect("overlays");
+    let (_, o) = o.get(rev(&d, 0)).expect("overlay");
+    assert_eq!(o.remote.iter().map(|r| r.rule.as_str()).collect::<Vec<_>>(), vec!["OK"]);
+    assert!(o.quiet_spelling.is_empty(), "{:?}", o.quiet_spelling);
+}
+
+#[test]
+fn combining_marks_are_code_points_in_both_units() {
+    let d = doc(&["Cafe\u{301} au lait wrold."]);
+    let text = para(&d, 0).text.clone();
+    for unit in [OffsetUnit::CodePoints, OffsetUnit::Utf16] {
+        let mut rp = on();
+        let r = first(&mut rp, &d);
+        let (at, len) = if unit == OffsetUnit::Utf16 { (u16_at(&r.text, "wrold"), 5) } else { (cp(&r.text, "wrold"), 5) };
+        let accent = if unit == OffsetUnit::Utf16 { u16_at(&r.text, "Cafe") } else { cp(&r.text, "Cafe") };
+        let matches = vec![m(at, len, RemoteKind::Spelling, "W"), m(accent, 5, RemoteKind::Grammar, "ACCENT")];
+        rp.receive(&r.id, Ok(ProofReply { matches, indonesian: Vec::new(), unit }), IDLE_MS);
+        let o = rp.overlays(0).expect("overlays");
+        let (_, o) = o.get(rev(&d, 0)).expect("overlay");
+        let mut found: Vec<(usize, usize)> = o.remote.iter().map(|r| (r.issue.start, r.issue.end)).collect();
+        found.sort_unstable();
+        let words: Vec<&str> = found.iter().map(|&(a, b)| &text[a..b]).collect();
+        assert_eq!(words, vec!["Cafe\u{301}", "wrold"], "{unit:?}");
+    }
+}
+
+#[test]
+fn a_document_switch_keeps_each_document_s_results() {
+    let mut rp = on();
+    let a = doc(&["Teh cat sat."]);
+    let r = first(&mut rp, &a);
+    rp.receive(&r.id, ok(vec![on_word(&r, "Teh", RemoteKind::Spelling, "S")]), IDLE_MS);
+    assert!(rp.set_document(2));
+    let b = doc(&["Another document."]);
+    let mut t = 10_000.0;
+    drain(&mut rp, &b, 1, &mut t);
+    assert!(rp.set_document(0));
+    // Back in A, before any poll: its underline is there at once.
+    assert_eq!(remote(&rp, &a, 0), vec![(0, 3, IssueKind::Spelling, "S".to_string())]);
+}
+
+#[test]
+fn a_too_large_batch_is_retried_one_paragraph_at_a_time() {
+    let mut rp = on();
+    let d = doc(&["First paragraph here.", "Second paragraph here."]);
+    let r = first(&mut rp, &d);
+    assert!(r.text.contains("First") && r.text.contains("Second"));
+    rp.receive(&r.id, Err(ProofFailure::TooLarge), IDLE_MS);
+    let mut t = IDLE_MS;
+    let mut sent = Vec::new();
+    while let Some((at, r)) = first_send(&mut rp, &d, 1, t, t + 200_000.0) {
+        let matches = if r.text.starts_with("Second") { vec![on_word(&r, "paragraph", RemoteKind::Grammar, "G")] } else { Vec::new() };
+        rp.receive(&r.id, ok(matches), at);
+        sent.push(r.text);
+        t = at;
+    }
+    assert_eq!(sent, vec!["First paragraph here.", "Second paragraph here."], "each on its own");
+    assert_eq!(remote(&rp, &d, 1).len(), 1, "the retried paragraph is checked");
+}
+
+#[test]
+fn ignored_occurrences_reach_paragraphs_never_checked() {
+    // The desktop app never polls: an ignore still reaches the paragraph through its text.
+    let rp = {
+        let mut rp = RemoteProof::default();
+        let d = doc(&["Teh cat sat."]);
+        rp.ignore_occurrence(5, para(&d, 0), 0, 3, "builtin:spelling");
+        rp
+    };
+    let d = doc(&["Unrelated.", "Teh cat sat."]);
+    let o = rp.overlays_in(5, &d).expect("overlays");
+    assert!(o.get(rev(&d, 1)).is_some_and(|(_, o)| o.ignored.len() == 1));
+    assert!(o.get(rev(&d, 0)).is_none());
+    assert!(rp.overlays_in(6, &d).is_none(), "not in another document");
 }

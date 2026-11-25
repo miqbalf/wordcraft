@@ -14,7 +14,7 @@
 //! poll again, [`RemoteProof::receive`] takes the answer.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
@@ -77,12 +77,23 @@ pub struct RemoteMatch {
     pub rule: String,
 }
 
-/// The host's answer: the matches, and the sentences (code-point offset and length) it routed
-/// to Indonesian.
+/// What a reply's offsets and lengths count in the request's text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OffsetUnit {
+    /// Unicode code points (the route's contract).
+    #[default]
+    CodePoints,
+    /// UTF-16 code units (Java and JavaScript string indices).
+    Utf16,
+}
+
+/// The host's answer: the matches, and the sentences (offset and length) it routed to
+/// Indonesian, both counted in `unit`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProofReply {
     pub matches: Vec<RemoteMatch>,
     pub indonesian: Vec<(usize, usize)>,
+    pub unit: OffsetUnit,
 }
 
 /// Why a request failed.
@@ -232,7 +243,20 @@ struct InFlight {
     sent_at: f64,
     slices: Vec<Slice>,
     chars: usize,
+    /// The UTF-16 offset of each character outside the Basic Multilingual Plane, in order: what
+    /// turns a UTF-16 offset into a code point.
+    astral: Vec<usize>,
     sweep: bool,
+}
+
+/// What is kept for a document while another is followed, so switching back shows its results
+/// at once and its sweep cap goes on where it stopped.
+#[derive(Debug, Default)]
+struct Followed {
+    scanned: Option<u64>,
+    paras: Vec<Para>,
+    placed: HashMap<u64, Placed>,
+    sweep_batches: u32,
 }
 
 /// The viewer's ignores in one document (decision 5).
@@ -257,6 +281,10 @@ pub struct RemoteProof {
     /// Results placed on live paragraph revisions (only those with something to show).
     placed: HashMap<u64, Placed>,
     in_flight: Option<InFlight>,
+    /// The other documents followed before, by id.
+    parked: HashMap<u64, Followed>,
+    /// Texts a batch was too large with: they are sent on their own.
+    solo: HashSet<u64>,
     last_change: f64,
     last_sent: Option<f64>,
     backoff_until: f64,
@@ -264,6 +292,8 @@ pub struct RemoteProof {
     next_id: u64,
     /// Results by text hash, with the tick they were last used at.
     cache: HashMap<u64, (u64, Arc<Checked>)>,
+    /// The cache's hashes by the tick they were last used at, oldest first.
+    order: BTreeMap<u64, u64>,
     tick: u64,
     ignores: HashMap<u64, Ignores>,
     /// The user dictionary's words, read when its generation changes.
@@ -275,9 +305,16 @@ pub struct RemoteProof {
 
 impl RemoteProof {
     /// Turns remote checks on (the host has a proof route) or off.
+    /// Turning it off drops the remote results shown (they come back from the cache when it
+    /// is turned on again); the ignores stay.
     pub fn set_enabled(&mut self, on: bool) {
-        if !on {
+        if !on && self.enabled {
             self.in_flight = None;
+            self.scanned = None;
+            self.paras.clear();
+            self.placed.clear();
+            self.parked.clear();
+            self.generation += 1;
         }
         if on && !self.enabled {
             self.scanned = None;
@@ -290,18 +327,41 @@ impl RemoteProof {
     }
 
     /// Follows document `document` from now on: whether that is another document than before.
-    /// The paragraphs are scanned again on the next poll; cached results stay.
+    /// The document left is parked with its results; one followed before comes back with its
+    /// own, and with any result that came for it meanwhile.
     pub fn set_document(&mut self, document: u64) -> bool {
         if document == self.document {
             return false;
         }
+        let left = Followed {
+            scanned: self.scanned.take(),
+            paras: std::mem::take(&mut self.paras),
+            placed: std::mem::take(&mut self.placed),
+            sweep_batches: self.sweep_batches,
+        };
+        self.parked.insert(self.document, left);
+        let back = self.parked.remove(&document).unwrap_or_default();
         self.document = document;
-        self.scanned = None;
-        self.paras.clear();
-        self.placed.clear();
-        self.sweep_batches = 0;
+        self.scanned = back.scanned;
+        self.paras = back.paras;
+        self.placed = back.placed;
+        self.sweep_batches = back.sweep_batches;
+        let waiting: HashSet<u64> =
+            self.paras.iter().filter(|p| p.pending.is_some()).filter_map(|p| p.hash).filter(|h| self.cache.contains_key(h)).collect();
+        if !waiting.is_empty() {
+            self.apply_cached(waiting);
+        }
         self.generation += 1;
         true
+    }
+
+    /// Drops what is kept for document `document`, closed or replaced: its parked results and
+    /// its ignores. The document followed is kept.
+    pub fn forget(&mut self, document: u64) {
+        if document != self.document {
+            self.parked.remove(&document);
+            self.ignores.remove(&document);
+        }
     }
 
     /// What to send at `now_ms` for document `doc` at revision `doc_rev`.
@@ -339,6 +399,9 @@ impl RemoteProof {
         let Some(f) = self.in_flight.take() else { return };
         match reply {
             Ok(reply) => {
+                for s in &f.slices {
+                    self.solo.remove(&s.hash);
+                }
                 let results = split_reply(&f, reply);
                 for (s, checked) in f.slices.iter().zip(results) {
                     self.cache_put(s.hash, Arc::new(checked));
@@ -352,6 +415,10 @@ impl RemoteProof {
                 match failure {
                     ProofFailure::Busy => self.backoff_until = now_ms + BUSY_BACKOFF_MS,
                     ProofFailure::Unavailable => self.backoff_until = now_ms + DOWN_BACKOFF_MS,
+                    ProofFailure::TooLarge if f.slices.len() > 1 => {
+                        // Sent again one by one; only a text too large on its own is given up.
+                        self.solo.extend(f.slices.iter().map(|s| s.hash));
+                    }
                     ProofFailure::TooLarge | ProofFailure::BadRequest => {
                         for s in &f.slices {
                             self.cache_put(s.hash, Arc::new(Checked::default()));
@@ -365,25 +432,64 @@ impl RemoteProof {
     }
 
     /// The overlays of document `document`: the remote results of its live paragraphs (when it
-    /// is the document followed), with its ignores and the user dictionary's words. `None` when
-    /// there is nothing at all.
+    /// is the document followed), the ignored occurrences of the paragraphs scanned, its ignored
+    /// rules, and its ignored words with the user dictionary's. `None` when there is nothing at
+    /// all.
     pub fn overlays(&self, document: u64) -> Option<Arc<ProofOverlays>> {
-        let ignores = self.ignores.get(&document);
-        let mut by_rev = HashMap::new();
-        if document == self.document {
+        let mut by_rev = self.placed_overlays(document);
+        if let Some(occurrences) = self.occurrences(document)
+            && document == self.document
+        {
             for p in &self.paras {
-                let placed = self.placed.get(&p.rev);
-                let ignored = ignores.and_then(|i| i.occurrences.get(&p.text_key)).cloned().unwrap_or_default();
-                let o = ProofOverlay {
-                    remote: placed.map(|x| x.remote.clone()).unwrap_or_default(),
-                    quiet_spelling: placed.map(|x| x.quiet.clone()).unwrap_or_default(),
-                    ignored,
-                };
-                if !(o.remote.is_empty() && o.quiet_spelling.is_empty() && o.ignored.is_empty()) {
-                    by_rev.insert(p.rev, Arc::new(o));
+                if let Some(list) = occurrences.get(&p.text_key) {
+                    by_rev.entry(p.rev).or_default().ignored = list.clone();
                 }
             }
         }
+        self.finish(document, by_rev)
+    }
+
+    /// [`RemoteProof::overlays`] with the ignored occurrences found in every paragraph of `doc`
+    /// (every story), checked or not: what a session without remote checks (the desktop app)
+    /// needs for Ignore on the built-in issues.
+    pub fn overlays_in(&self, document: u64, doc: &Document) -> Option<Arc<ProofOverlays>> {
+        let mut by_rev = self.placed_overlays(document);
+        if let Some(occurrences) = self.occurrences(document) {
+            for story in std::iter::once(StoryRef::Body).chain(doc.parts.keys().map(|k| StoryRef::Part(*k))) {
+                for path in doc.para_paths(story) {
+                    if let Some(p) = doc.para(story, &path)
+                        && let Some(list) = occurrences.get(&text_key(p))
+                    {
+                        by_rev.entry(p.rev).or_default().ignored = list.clone();
+                    }
+                }
+            }
+        }
+        self.finish(document, by_rev)
+    }
+
+    fn occurrences(&self, document: u64) -> Option<&HashMap<u64, Vec<IgnoredIssue>>> {
+        self.ignores.get(&document).map(|i| &i.occurrences).filter(|o| !o.is_empty())
+    }
+
+    /// The remote results placed on the paragraphs of `document`, if it is the one followed.
+    fn placed_overlays(&self, document: u64) -> HashMap<u64, ProofOverlay> {
+        if document != self.document {
+            return HashMap::new();
+        }
+        self.placed
+            .iter()
+            .map(|(rev, x)| (*rev, ProofOverlay { remote: x.remote.clone(), quiet_spelling: x.quiet.clone(), ignored: Vec::new() }))
+            .collect()
+    }
+
+    fn finish(&self, document: u64, by_rev: HashMap<u64, ProofOverlay>) -> Option<Arc<ProofOverlays>> {
+        let by_rev: HashMap<u64, Arc<ProofOverlay>> = by_rev
+            .into_iter()
+            .filter(|(_, o)| !(o.remote.is_empty() && o.quiet_spelling.is_empty() && o.ignored.is_empty()))
+            .map(|(rev, o)| (rev, Arc::new(o)))
+            .collect();
+        let ignores = self.ignores.get(&document);
         let rules = ignores.map(|i| i.rules.clone()).unwrap_or_default();
         let mut words = ignores.map(|i| i.words.clone()).unwrap_or_default();
         words.extend(self.dictionary.1.iter().cloned());
@@ -406,10 +512,10 @@ impl RemoteProof {
         changed
     }
 
-    /// Ignore the issue at bytes `start..end` with rule `rule` in paragraph `p`, and wherever
-    /// the same text comes back, in the document followed.
-    pub fn ignore_occurrence(&mut self, p: &Paragraph, start: usize, end: usize, rule: &str) {
-        let list = self.ignores.entry(self.document).or_default().occurrences.entry(text_key(p)).or_default();
+    /// Ignore the issue at bytes `start..end` with rule `rule` in paragraph `p` of document
+    /// `document`, and wherever the same text comes back there.
+    pub fn ignore_occurrence(&mut self, document: u64, p: &Paragraph, start: usize, end: usize, rule: &str) {
+        let list = self.ignores.entry(document).or_default().occurrences.entry(text_key(p)).or_default();
         let g = IgnoredIssue { start, end, rule: rule.to_string() };
         if !list.contains(&g) {
             list.push(g);
@@ -423,9 +529,9 @@ impl RemoteProof {
         self.generation += 1;
     }
 
-    /// Hide remote spelling issues on `word` in the document followed.
-    pub fn ignore_word(&mut self, word: &str) {
-        self.ignores.entry(self.document).or_default().words.insert(word.to_string());
+    /// Hide remote spelling issues on `word` in document `document`.
+    pub fn ignore_word(&mut self, document: u64, word: &str) {
+        self.ignores.entry(document).or_default().words.insert(word.to_string());
         self.generation += 1;
     }
 
@@ -455,6 +561,9 @@ impl RemoteProof {
             }
             changed = true;
             let para = describe(doc, p, !first);
+            if self.ignores.get(&self.document).is_some_and(|i| i.occurrences.contains_key(&para.text_key)) {
+                self.generation += 1;
+            }
             if let (Some(h), true) = (para.hash, para.pending.is_some()) {
                 new_hashes.push(h);
             }
@@ -498,18 +607,21 @@ impl RemoteProof {
 
     fn cache_get(&mut self, hash: u64) -> Option<Arc<Checked>> {
         self.tick += 1;
-        let tick = self.tick;
-        self.cache.get_mut(&hash).map(|(t, c)| {
-            *t = tick;
-            c.clone()
-        })
+        let (t, c) = self.cache.get_mut(&hash)?;
+        self.order.remove(t);
+        *t = self.tick;
+        self.order.insert(self.tick, hash);
+        Some(c.clone())
     }
 
     fn cache_put(&mut self, hash: u64, checked: Arc<Checked>) {
         self.tick += 1;
-        self.cache.insert(hash, (self.tick, checked));
+        if let Some((old, _)) = self.cache.insert(hash, (self.tick, checked)) {
+            self.order.remove(&old);
+        }
+        self.order.insert(self.tick, hash);
         while self.cache.len() > CACHE_ENTRIES {
-            let Some(oldest) = self.cache.iter().min_by_key(|(_, (t, _))| *t).map(|(h, _)| *h) else { break };
+            let Some((_, oldest)) = self.order.pop_first() else { break };
             self.cache.remove(&oldest);
         }
     }
@@ -539,6 +651,7 @@ impl RemoteProof {
         let mut slices: Vec<Slice> = Vec::new();
         let mut sweep = false;
         let mut too_large = HashSet::new();
+        let mut astral: Vec<usize> = Vec::new();
         for i in self.candidates() {
             let Some(p) = self.paras.get(i) else { continue };
             let (Some(hash), Some(pending)) = (p.hash, p.pending.as_deref()) else { continue };
@@ -550,6 +663,10 @@ impl RemoteProof {
             if language.as_ref().is_some_and(|l| *l != pending.language) || slices.iter().any(|s| s.hash == hash) {
                 continue;
             }
+            let alone = self.solo.contains(&hash);
+            if alone && !slices.is_empty() {
+                continue;
+            }
             let sep = if slices.is_empty() { 0 } else { SEPARATOR.len() };
             if chars + sep + n > MAX_BATCH_CHARS || text.len() + sep + pending.text.len() > MAX_BATCH_BYTES {
                 continue;
@@ -559,10 +676,18 @@ impl RemoteProof {
                 chars += sep;
             }
             slices.push(Slice { hash, start: chars, len: n });
+            for (k, c) in pending.text.chars().enumerate() {
+                if c.len_utf16() == 2 {
+                    astral.push(chars + k + astral.len());
+                }
+            }
             text.push_str(&pending.text);
             chars += n;
             sweep |= !p.edited;
             language.get_or_insert_with(|| pending.language.clone());
+            if alone {
+                break;
+            }
         }
         for h in &too_large {
             self.cache_put(*h, Arc::new(Checked::default()));
@@ -577,7 +702,7 @@ impl RemoteProof {
             self.sweep_batches += 1;
         }
         self.last_sent = Some(now_ms);
-        self.in_flight = Some(InFlight { id: id.clone(), sent_at: now_ms, slices, chars, sweep });
+        self.in_flight = Some(InFlight { id: id.clone(), sent_at: now_ms, slices, chars, astral, sweep });
         Some(ProofRequest { id, language, text })
     }
 
@@ -626,8 +751,10 @@ fn describe(doc: &Document, p: &Paragraph, edited: bool) -> Para {
 /// that do not fit the request are dropped; a match must lie wholly inside one slice.
 fn split_reply(f: &InFlight, reply: ProofReply) -> Vec<Checked> {
     let mut out: Vec<Checked> = f.slices.iter().map(|_| Checked::default()).collect();
+    let unit = reply.unit;
     for m in reply.matches.into_iter().take(MAX_MATCHES) {
-        let Some(end) = m.offset.checked_add(m.length).filter(|e| m.length > 0 && *e <= f.chars) else { continue };
+        let Some((offset, end)) = code_points(f, unit, m.offset, m.length) else { continue };
+        let m = RemoteMatch { offset, ..m };
         let Some(k) = f.slices.iter().position(|s| s.start <= m.offset && end <= s.start + s.len) else { continue };
         let (Some(s), Some(c)) = (f.slices.get(k), out.get_mut(k)) else { continue };
         c.found.push(Found {
@@ -640,7 +767,7 @@ fn split_reply(f: &InFlight, reply: ProofReply) -> Vec<Checked> {
         });
     }
     for (offset, length) in reply.indonesian.into_iter().take(MAX_SPANS) {
-        let Some(end) = offset.checked_add(length).filter(|e| length > 0 && *e <= f.chars) else { continue };
+        let Some((offset, end)) = code_points(f, unit, offset, length) else { continue };
         for (s, c) in f.slices.iter().zip(out.iter_mut()) {
             let (a, b) = (offset.max(s.start), end.min(s.start + s.len));
             if a < b {
@@ -649,6 +776,27 @@ fn split_reply(f: &InFlight, reply: ProofReply) -> Vec<Checked> {
         }
     }
     out
+}
+
+/// A reply's `offset` and `length` in `unit` as a code-point range of the request's text;
+/// `None` when it is empty, runs past the end or (in UTF-16) starts or ends inside a surrogate
+/// pair.
+fn code_points(f: &InFlight, unit: OffsetUnit, offset: usize, length: usize) -> Option<(usize, usize)> {
+    let end = offset.checked_add(length).filter(|_| length > 0)?;
+    let (a, b) = match unit {
+        OffsetUnit::CodePoints => (offset, end),
+        OffsetUnit::Utf16 => (utf16_to_code_point(f, offset)?, utf16_to_code_point(f, end)?),
+    };
+    (a < b && b <= f.chars).then_some((a, b))
+}
+
+/// The code point at UTF-16 offset `u` of the request's text; `None` inside a surrogate pair.
+fn utf16_to_code_point(f: &InFlight, u: usize) -> Option<usize> {
+    let before = f.astral.partition_point(|&s| s < u);
+    if before > 0 && f.astral.get(before - 1).is_some_and(|&s| s + 1 == u) {
+        return None;
+    }
+    u.checked_sub(before)
 }
 
 /// A result placed on a paragraph's bytes. A match over a character left out of the text sent

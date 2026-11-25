@@ -407,6 +407,7 @@ impl Session {
         swap(&mut self.go_back_step, go_back_step);
         // A picked Drawing Canvas member (#2637) belongs to the document left behind.
         self.member = None;
+        self.proof_remote.set_document(self.document_id);
         self.proof_refresh();
     }
 
@@ -564,6 +565,7 @@ impl Session {
             if !self.remove_parked(id) {
                 return Err(unknown(id));
             }
+            self.proof_remote.forget(id);
             return Ok(());
         }
         let at = self.order.iter().position(|d| *d == id);
@@ -585,6 +587,7 @@ impl Session {
                 self.forget_recovery_copy(&fresh);
             }
         }
+        self.proof_remote.forget(id);
         self.stop_reading_elsewhere();
         Ok(())
     }

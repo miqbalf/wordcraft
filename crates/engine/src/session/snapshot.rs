@@ -45,6 +45,10 @@ impl Session {
         self.touch();
         self.dirty = false;
         self.made_rev = self.rev;
+        // The replaced document's results and ignores go with it.
+        self.proof_remote.set_document(self.document_id);
+        self.proof_remote.forget(replaced);
+        self.proof_refresh();
         self.relayout();
     }
 

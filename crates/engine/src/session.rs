@@ -300,8 +300,9 @@ impl Session {
     }
 
     /// Rebuild [`Self::proof_overlays`] for the active document, after its remote results or
-    /// ignores changed.
+    /// ignores changed (W3's Ignore commands call it).
     pub(crate) fn proof_refresh(&mut self) {
-        self.proof_overlays = self.proof_remote.overlays(self.document_id);
+        self.proof_overlays = self.proof_remote.overlays_in(self.document_id, &self.doc);
+        self.proof_remote.take_change();
     }
 }
