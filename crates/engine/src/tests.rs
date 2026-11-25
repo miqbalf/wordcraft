@@ -14471,7 +14471,14 @@ fn add_to_dictionary_also_hides_remote_spelling_of_that_word_at_once() {
     run(&mut s, "text.insert", json!({"text": format!("The {word} sat down.")}));
     s.proof_remote.set_enabled(true);
     let r = proof_request(&mut s, 0.0);
-    let m = RemoteMatch { offset: 4, length: word.len(), kind: RemoteKind::Spelling, message: "m".into(), replacements: vec![], rule: "MORFOLOGIK".into() };
+    let m = RemoteMatch {
+        offset: 4,
+        length: word.len(),
+        kind: RemoteKind::Spelling,
+        message: "m".into(),
+        replacements: vec![],
+        rule: "MORFOLOGIK".into(),
+    };
     s.proof_receive(&r.id, Ok(ProofReply { matches: vec![m], ..Default::default() }), 20_000.0);
     assert_eq!(remote_rules(&mut s), vec!["MORFOLOGIK"], "the remote spelling issue is shown");
     run(&mut s, "review.addToDictionary", json!({"word": word}));
@@ -14498,6 +14505,7 @@ fn ignore_issue_keeps_the_same_rule_at_another_offset_in_the_paragraph() {
     let at = issue_start(&mut s, "mat");
     run(&mut s, "review.ignoreIssue", json!({"pos": at}));
     let issues = run(&mut s, "review.issues", json!({}));
-    let left: Vec<_> = issues.as_array().unwrap().iter().filter(|i| i["source"] == "remote").map(|i| i["text"].as_str().unwrap().to_string()).collect();
+    let left: Vec<_> =
+        issues.as_array().unwrap().iter().filter(|i| i["source"] == "remote").map(|i| i["text"].as_str().unwrap().to_string()).collect();
     assert_eq!(left, vec!["cat"], "the same rule at another offset stays visible");
 }
