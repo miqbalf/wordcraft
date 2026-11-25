@@ -1,5 +1,5 @@
 use super::state::DefaultApp;
-use super::{assist, FileDialogAnswer, FileDialogRequest, WordApp, async_saves, paste_picture, printing, system_clipboard};
+use super::{FileDialogAnswer, FileDialogRequest, WordApp, assist, async_saves, paste_picture, printing, system_clipboard};
 
 /// Platform services injected by the host (file dialogs, file I/O).
 #[derive(Default)]

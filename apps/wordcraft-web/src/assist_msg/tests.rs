@@ -28,7 +28,10 @@ fn one_match(extra: Value) -> Value {
 #[test]
 fn parses_each_incoming_type_and_refuses_bad_ids_and_wrong_types() {
     assert_eq!(p(json!({"type": "wordcraft:assist", "proof": true, "ai": false})), Some(AssistIn::Enabled { proof: true, ai: false }));
-    assert_eq!(p(json!({"type": "wordcraft:ai-result", "id": "ai-1", "text": "Hi"})), Some(AssistIn::AiResult { id: "ai-1".into(), text: "Hi".into() }));
+    assert_eq!(
+        p(json!({"type": "wordcraft:ai-result", "id": "ai-1", "text": "Hi"})),
+        Some(AssistIn::AiResult { id: "ai-1".into(), text: "Hi".into() })
+    );
     assert_eq!(
         p(json!({"type": "wordcraft:ai-failed", "id": "ai_1", "error": "busy"})),
         Some(AssistIn::AiFailed { id: "ai_1".into(), error: "busy".into() })
@@ -117,11 +120,19 @@ fn the_offset_unit_is_the_contracts_code_points_unless_the_message_names_one() {
 
 #[test]
 fn builds_proof_check_and_ai_with_the_contract_fields() {
-    let v: Value = serde_json::from_str(&build(&AssistOut::ProofCheck { id: "proof-1".into(), language: "auto".into(), text: "Teh \"cat\"\n\nsat 😀.".into() })).expect("json");
+    let v: Value =
+        serde_json::from_str(&build(&AssistOut::ProofCheck {
+            id: "proof-1".into(), language: "auto".into(), text: "Teh \"cat\"\n\nsat 😀.".into()
+        }))
+        .expect("json");
     assert_eq!(v, json!({"type": "wordcraft:proof-check", "id": "proof-1", "language": "auto", "text": "Teh \"cat\"\n\nsat 😀."}));
-    let v: Value = serde_json::from_str(&build(&AssistOut::Ai { id: "ai-2".into(), task: AiTask::Improve, language: "fr-FR".into(), text: "Bonjour".into() })).expect("json");
+    let v: Value =
+        serde_json::from_str(&build(&AssistOut::Ai { id: "ai-2".into(), task: AiTask::Improve, language: "fr-FR".into(), text: "Bonjour".into() }))
+            .expect("json");
     assert_eq!(v, json!({"type": "wordcraft:ai", "id": "ai-2", "task": "improve", "language": "fr-FR", "text": "Bonjour"}));
-    let v: Value = serde_json::from_str(&build(&AssistOut::Ai { id: "ai-3".into(), task: AiTask::Summarize, language: "auto".into(), text: "T".into() })).expect("json");
+    let v: Value =
+        serde_json::from_str(&build(&AssistOut::Ai { id: "ai-3".into(), task: AiTask::Summarize, language: "auto".into(), text: "T".into() }))
+            .expect("json");
     assert_eq!(v["task"], "summarize");
     assert_eq!(v.as_object().map(|o| o.len()), Some(5), "no other field");
 }
