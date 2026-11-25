@@ -1873,7 +1873,8 @@ fn a_browser_mod_v_with_a_copy_in_the_app_pastes_once() {
         assert_eq!(a.session.doc.plain_text(wordcraft_doc::StoryRef::Body), want, "{event_text}");
         // The pasted word: bold when it was the app's own copy (as the ribbon's Paste keeps it).
         let end = want.len();
-        a.session.sel = wordcraft_engine::Selection { anchor: wordcraft_doc::Pos::body(0, end - event_text.len()), focus: wordcraft_doc::Pos::body(0, end) };
+        a.session.sel =
+            wordcraft_engine::Selection { anchor: wordcraft_doc::Pos::body(0, end - event_text.len()), focus: wordcraft_doc::Pos::body(0, end) };
         let state = a.session.run("format.state", &json!({})).unwrap();
         assert_eq!(state.get("bold").and_then(serde_json::Value::as_bool) == Some(true), bold, "{event_text}: {state}");
     }
