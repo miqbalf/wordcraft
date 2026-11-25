@@ -281,8 +281,8 @@ mod tests {
         h
     }
 
-
-    /// A window on `text` where the remote checker flagged each `(word, kind, rule)`.    fn remote_app(text: &str, flags: &[(&str, wordcraft_engine::proof_remote::RemoteKind, &str)]) -> WordApp {
+    /// A window on `text` where the remote checker flagged each `(word, kind, rule)`.
+    fn remote_app(text: &str, flags: &[(&str, wordcraft_engine::proof_remote::RemoteKind, &str)]) -> WordApp {
         use wordcraft_engine::proof_remote::{ProofReply, RemoteMatch};
         let mut app = WordApp::new(Session::new(wordcraft_doc::Document::from_text(text)), crate::Services::default());
         app.session.proof_remote.set_enabled(true);
