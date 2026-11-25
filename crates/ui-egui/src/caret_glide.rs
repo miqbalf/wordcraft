@@ -127,6 +127,9 @@ pub struct CaretGlide {
     cause: u64,
     view: u64,
     frame_nr: u64,
+    /// The resting blink fades (desktop). Off, it switches on its edges, so a blink costs one
+    /// repaint per edge (the browser build: PERF2, idle repaints).
+    fade_blink: bool,
 }
 
 impl Default for CaretGlide {
@@ -151,7 +154,20 @@ impl CaretGlide {
             cause: 0,
             view: 0,
             frame_nr: 0,
+            fade_blink: !cfg!(target_arch = "wasm32"),
         }
+    }
+
+    /// This caret with the resting blink fading (`true`) or switching on its edges (`false`).
+    #[must_use]
+    pub fn with_blink_fades(mut self, on: bool) -> Self {
+        self.fade_blink = on;
+        self
+    }
+
+    /// Whether the resting blink fades.
+    pub fn blink_fades(&self) -> bool {
+        self.fade_blink
     }
 
     /// Advance to this frame; returns where and how strongly to draw the caret (content space).
@@ -231,7 +247,7 @@ impl CaretGlide {
             },
             // A gliding caret stays lit; a resting one blinks.
             None if self.glide.is_some() => 1.0,
-            None => blink(f.since_blink, self.secs),
+            None => blink(f.since_blink, if self.fade_blink { self.secs } else { 0.0 }),
         };
         self.draw(f.target, bar, opacity)
     }
@@ -389,7 +405,7 @@ pub fn look(app: &WordApp, ui: &Ui, request: LookRequest<'_>) -> Look {
     };
     let (mut look, gliding, secs) = ui.ctx().data_mut(|d| {
         let state = d.get_temp_mut_or_default::<CaretGlide>(state_id());
-        (state.frame(frame), state.is_gliding(), state.secs)
+        (state.frame(frame), state.is_gliding(), if state.fade_blink { state.secs } else { 0.0 })
     });
     // At rest the caller's own pixel-snapped bar is drawn, untouched.
     look.bar = if gliding { [look.bar[0] + off, look.bar[1] + off] } else { target };
