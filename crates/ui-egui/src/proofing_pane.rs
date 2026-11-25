@@ -221,9 +221,16 @@ fn body(app: &mut WordApp, ui: &mut Ui, form: &mut SpellingForm) {
         return;
     }
     ui.add_space(6.0);
-    if action_link(ui, "Ignore Once") {
+    if crate::canvas::shows_ignore(&form.issue) {
+        if action_link(ui, "Ignore") {
+            form.act(app, Some("review.ignoreIssue"));
+        } else if action_link(ui, "Ignore Rule") {
+            form.act(app, Some("review.ignoreRule"));
+        }
+    } else if action_link(ui, "Ignore Once") {
         form.act(app, None);
-    } else if spelling && action_link(ui, "Ignore All") {
+    }
+    if spelling && action_link(ui, "Ignore All") {
         form.act(app, Some("review.ignoreAll"));
     } else if spelling && action_link(ui, "Add to Dictionary") {
         form.act(app, Some("review.addToDictionary"));

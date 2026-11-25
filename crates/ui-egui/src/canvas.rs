@@ -18,7 +18,7 @@ mod balloons;
 mod column_ruler;
 mod context_menu;
 #[cfg(test)]
-pub(crate) use context_menu::issue_heading;
+pub(crate) use context_menu::{issue_heading, shows_ignore};
 mod cursor;
 mod geometry;
 mod input;

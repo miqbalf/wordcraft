@@ -27,7 +27,7 @@ pub use improve::{
     ACROSS_CELLS, BLANK_LINE, EMPTY_DOCUMENT, HAS_CHANGES, HAS_OBJECTS, IMPROVE_MAX_BYTES, NO_TEXT, PARAGRAPHS_CHANGED, SUMMARIZE_MAX_BYTES,
     TEXT_CHANGED, TOO_LONG,
 };
-use proofing::{all_issues, issue_at, next_issue, suggestions, thesaurus, word_count};
+use proofing::{all_issues, ignore_issue, ignore_rule, issue_at, next_issue, suggestions, thesaurus, word_count};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -122,11 +122,21 @@ pub fn specs() -> Vec<CommandSpec> {
             // For this session only, as in Word: not added to (or saved with) the dictionary.
             if !w.trim().is_empty() {
                 wordcraft_proof::ignore_word(w.trim());
+                // The same word's remote spelling issues too, in this document.
+                let document = s.document_id();
+                s.proof_remote.ignore_word(document, w.trim());
+                s.proof_refresh();
             }
             s.relayout();
             Ok(json!({"ignored": w}))
         })
         .pure(),
+        CommandSpec::new("review.ignoreIssue", "Ignore", "Review › Proofing", ignore_issue)
+            .params(r#"{"pos"?: Pos} → {"ignored": rule} (this issue, while the paragraph's text stays the same; this viewer only)"#)
+            .pure(),
+        CommandSpec::new("review.ignoreRule", "Ignore Rule", "Review › Proofing", ignore_rule)
+            .params(r#"{"pos"?: Pos, "rule"?: string} → {"ignoredRule": rule} (every issue of the rule in this document; this viewer only)"#)
+            .pure(),
         CommandSpec::new("review.applySuggestion", "Change", "Review › Proofing", |s, v| {
             let text = p::req_str(v, "text")?.to_string();
             let at = s.sel.focus.clone();
