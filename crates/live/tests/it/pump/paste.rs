@@ -6,6 +6,8 @@ use wordcraft_live::{PASTED_AS_TEXT, PASTED_WITHOUT_FORMATTING, paste_notice};
 
 /// craft-live's notice for an Undo that would remove another editor's text.
 const UNDO_TAKES_OTHERS: &str = "Someone else has typed in what this Undo would remove, so it wasn't undone.";
+/// craft-live's notice for a Redo that would remove another editor's text.
+const REDO_TAKES_OTHERS: &str = "Someone else has typed in what this Redo would remove, so it wasn't redone.";
 
 use super::*;
 
@@ -506,6 +508,31 @@ fn undo_of_enter_is_refused_when_bob_typed_in_the_new_paragraph() {
     settle(&relay, &mut [&mut a, &mut b]);
     assert_eq!(texts(&b.s.doc), ["Hello", " world BOB"]);
     assert_converged(&a, &b, "after a refused undo of Enter");
+}
+
+/// Redo never removes another editor's text either: Alice joins two paragraphs, undoes the join,
+/// Bob types in the paragraph the undo put back; redoing the join would take that paragraph,
+/// and Bob's typing, away again, so it is refused with a notice (review round 3).
+#[test]
+fn redo_of_a_join_is_refused_when_bob_typed_in_the_paragraph_it_removes() {
+    let (relay, mut a, mut b) = two(&["Hello", "world"]);
+    a.end_of(0);
+    assert!(a.run("text.delete", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Helloworld"]);
+    assert!(a.run("edit.undo", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Hello", "world"]);
+    b.end_of(1);
+    assert!(b.run("text.insert", json!({"text": " BOB"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    let _ = a.run("edit.redo", json!({}));
+    assert_eq!(a.le.take_notices(), [REDO_TAKES_OTHERS]);
+    settle(&relay, &mut [&mut a, &mut b]);
+    let want = ["Hello", "world BOB"];
+    assert_eq!(texts(&a.s.doc), want, "nothing was redone");
+    assert_eq!(texts(&b.s.doc), want, "Bob keeps his typing");
+    assert_converged(&a, &b, "after a refused redo");
 }
 
 /// The file's bytes: a paragraph, a 2x2 table, a paragraph.
