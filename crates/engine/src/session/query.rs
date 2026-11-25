@@ -101,6 +101,11 @@ impl Session {
     pub fn touch(&mut self) {
         self.rev = self.rev.wrapping_add(1);
         self.dirty = true;
+        // A new revision of text the viewer ignored an issue in (an edit and its revert, a paste
+        // of the same words) keeps the ignore, with or without a remote source polling.
+        if self.proof_remote.has_ignored_occurrences(self.document_id) {
+            self.proof_refresh();
+        }
     }
 
     /// Reading Highlight ranges for the current document (searched again after edits); empty when it's off.

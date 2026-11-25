@@ -107,6 +107,9 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             wordcraft_proof::add_word(w.trim());
             s.persist_user_dictionary(&[]);
+            // The word's remote spelling issues go at once, not at the next poll.
+            s.proof_remote.read_dictionary();
+            s.proof_refresh();
             s.relayout();
             Ok(json!({"added": w}))
         })

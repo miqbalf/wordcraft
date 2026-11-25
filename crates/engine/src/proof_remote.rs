@@ -468,6 +468,11 @@ impl RemoteProof {
         self.finish(document, by_rev)
     }
 
+    /// Whether document `document` has an issue ignored by its text ([`RemoteProof::ignore_occurrence`]).
+    pub(crate) fn has_ignored_occurrences(&self, document: u64) -> bool {
+        self.occurrences(document).is_some()
+    }
+
     fn occurrences(&self, document: u64) -> Option<&HashMap<u64, Vec<IgnoredIssue>>> {
         self.ignores.get(&document).map(|i| &i.occurrences).filter(|o| !o.is_empty())
     }
@@ -513,7 +518,8 @@ impl RemoteProof {
     }
 
     /// Ignore the issue at bytes `start..end` with rule `rule` in paragraph `p` of document
-    /// `document`, and wherever the same text comes back there.
+    /// `document`, and wherever the same text comes back there. The key is the paragraph's text
+    /// hash, so paragraphs with identical text share one ignore.
     pub fn ignore_occurrence(&mut self, document: u64, p: &Paragraph, start: usize, end: usize, rule: &str) {
         let list = self.ignores.entry(document).or_default().occurrences.entry(text_key(p)).or_default();
         let g = IgnoredIssue { start, end, rule: rule.to_string() };
@@ -535,7 +541,7 @@ impl RemoteProof {
         self.generation += 1;
     }
 
-    fn read_dictionary(&mut self) {
+    pub(crate) fn read_dictionary(&mut self) {
         let g = wordcraft_proof::dictionary_generation();
         if self.dictionary.0 != Some(g) {
             let words: BTreeSet<String> = wordcraft_proof::user_dictionary().into_iter().collect();
