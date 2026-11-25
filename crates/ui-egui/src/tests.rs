@@ -9404,9 +9404,13 @@ fn remote_app(text: &str, flags: &[(&str, wordcraft_engine::proof_remote::Remote
     app
 }
 
-/// The labelled controls in the open context menu, by exact label.
+/// Whether the open context menu has a button labelled exactly `label` (a menu item's label
+/// carries its shortcut after it, empty for a command without one, so "Ignore" is "Ignore ").
 fn menu_has(h: &egui_kittest::Harness<WordApp>, label: &str) -> bool {
-    h.query_all_by_label(label).count() > 0
+    h.query_all_by_label_contains(label).any(|n| {
+        let shown = format!("{n:?}");
+        shown.contains("role: Button") && (shown.contains(&format!("label: \"{label}\"")) || shown.contains(&format!("label: \"{label} \"")))
+    })
 }
 
 fn open_menu_on(mut app: WordApp, word: &str) -> egui_kittest::Harness<'static, WordApp> {
