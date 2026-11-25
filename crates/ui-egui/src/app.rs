@@ -152,6 +152,7 @@ impl WordApp {
             autosave: true,
             zotero: zotero::ZoteroLink::default(),
             live: None,
+            live_copies: Vec::new(),
             ctx: None,
             ime_origin: false,
             read_aloud_error: None,

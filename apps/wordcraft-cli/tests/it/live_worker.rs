@@ -96,6 +96,8 @@ impl Hub for TestHub {
         let c = &mut r.conns[self.at];
         if !c.connected || c.paused { Vec::new() } else { c.inbox.drain(..).collect() }
     }
+    /// This relay never hands a space out twice, so the space a rejoin names changes nothing.
+    fn set_space(&mut self, _: u32) {}
     fn set_token(&mut self, token: String) {
         let at = self.at;
         self.relay.borrow_mut().tokens.push((at, token));
@@ -135,7 +137,11 @@ impl Relay {
     }
 
     fn roster(&self) -> Vec<Presence> {
-        self.conns.iter().filter(|c| c.connected).map(|c| Presence { peer: c.pid.clone(), display: c.pid.clone() }).collect()
+        self.conns
+            .iter()
+            .filter(|c| c.connected)
+            .map(|c| Presence { peer: c.pid.clone(), display: c.pid.clone(), access: craft_collab::PeerAccess::Edit })
+            .collect()
     }
 
     fn join(&mut self, at: usize) {

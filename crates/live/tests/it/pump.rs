@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use wordcraft_doc::{Block, Document, Pos};
 use wordcraft_engine::io::save_bytes;
 use wordcraft_engine::{Selection, Session};
-use wordcraft_live::{Access, ENDED_KIND, LiveEditing, LiveStatus, NOTICE_KIND, SERVICE_UID, SaveEvent, document_from_state};
+use wordcraft_live::{
+    Access, ENDED_KIND, FULL_TEXT, LiveEditing, LiveStatus, NOTICE_KIND, SERVICE_UID, SaveEvent, UNMERGED_TEXT, document_from_state,
+};
 
 use super::{Rng, plain, random_off, texts};
 
@@ -31,6 +33,8 @@ struct Conn {
     inbox: VecDeque<ServerMsg>,
     /// Document submits this connection made, snapshots included.
     submits: usize,
+    /// The id space its replica keeps, named on every rejoin (`Hub::set_space`).
+    space: u32,
 }
 
 /// A relay in memory: numbers every submit, broadcasts it to the room (sender included, with
@@ -50,6 +54,8 @@ struct Relay {
     one_per_poll: bool,
     /// The relay restarted and lost the room's history: joins say so and replay nothing.
     lost_history: bool,
+    /// The largest edit the relay carries, told on each join (`Joined.text_cap`).
+    text_cap: Option<u64>,
 }
 
 type Shared = Rc<RefCell<Relay>>;
@@ -65,6 +71,7 @@ fn relay(rng: Option<u64>) -> Shared {
         rng: rng.map(Rng),
         one_per_poll: false,
         lost_history: false,
+        text_cap: None,
     }))
 }
 
@@ -87,6 +94,9 @@ impl Hub for TestHub {
     }
     fn connected(&self) -> bool {
         self.relay.borrow().conns[self.at].connected
+    }
+    fn set_space(&mut self, space: u32) {
+        self.relay.borrow_mut().conns[self.at].space = space;
     }
 }
 
@@ -116,6 +126,7 @@ impl Relay {
                 fail_sends: false,
                 inbox: VecDeque::new(),
                 submits: 0,
+                space: 0,
             });
             r.join(at);
             at
@@ -124,10 +135,16 @@ impl Relay {
     }
 
     fn roster(&self) -> Vec<Presence> {
-        self.conns.iter().filter(|c| c.connected).map(|c| Presence { peer: c.pid.clone(), display: c.display.clone() }).collect()
+        self.conns
+            .iter()
+            .filter(|c| c.connected)
+            .map(|c| Presence { peer: c.pid.clone(), display: c.display.clone(), access: craft_collab::PeerAccess::from_may_edit(c.may_edit) })
+            .collect()
     }
 
     fn join(&mut self, at: usize) {
+        // As the relay does: the counter is first raised past the space a rejoining replica keeps.
+        self.next_space = self.next_space.max(self.conns[at].space + 1);
         let space = self.next_space;
         self.next_space += 1;
         let replay: Vec<ServerMsg> =
@@ -142,7 +159,7 @@ impl Relay {
             locks: Vec::new(),
             replay_until: Some(until),
             fallback: false,
-            text_cap: None,
+            text_cap: self.text_cap,
             heartbeat: false,
             history_lost: self.lost_history,
         };
@@ -516,7 +533,7 @@ fn read_ticket_cannot_send() {
 }
 
 #[test]
-fn edits_are_refused_until_live() {
+fn edits_wait_for_the_first_join_but_not_for_a_rejoin() {
     let relay = relay(None);
     let bytes = file(&["Hello"]);
     let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
@@ -533,17 +550,17 @@ fn edits_are_refused_until_live() {
     settle(&relay, &mut [&mut a, &mut b]);
     assert!(a.le.editable());
 
-    // A dropped link pauses editing until the rejoin.
+    // A dropped link keeps taking typing (LP2): it waits in the replica for the rejoin.
     relay.borrow_mut().drop_link(0);
     a.pump();
     assert_eq!(a.le.status(), &LiveStatus::Reconnecting);
+    assert!(a.le.editable() && a.le.allows("text.insert"));
     a.end_of(0);
-    assert!(!a.run("text.insert", json!({"text": " offline"})));
-    let _ = a.s.run("text.insert", &json!({"text": " offline"}));
+    assert!(a.run("text.insert", json!({"text": " offline"})));
     a.pump();
-    assert_eq!(texts(&a.s.doc), ["Hello"]);
-    b.end_of(0);
-    assert!(b.run("text.insert", json!({"text": " world"})));
+    assert_eq!(texts(&a.s.doc), ["Hello offline"], "kept while reconnecting");
+    b.caret(0, 0);
+    assert!(b.run("text.insert", json!({"text": "Oh "})));
     relay.borrow_mut().restore_link(0);
     settle(&relay, &mut [&mut a, &mut b]);
     assert!(a.le.editable(), "live again: {:?}", a.le.status());
@@ -551,7 +568,66 @@ fn edits_are_refused_until_live() {
     assert!(a.run("text.insert", json!({"text": "!"})));
     settle(&relay, &mut [&mut a, &mut b]);
     assert_same(&a, &b, "after the rejoin");
-    assert_eq!(texts(&b.s.doc), ["Hello world!"]);
+    assert_eq!(texts(&b.s.doc), ["Oh Hello offline!"]);
+}
+
+/// LP2: N keystrokes typed one by one while the link is down, and while it rejoins (the
+/// socket is back, the relay's join answer not yet taken), all land on both editors, in
+/// order, while the other editor types elsewhere; both converge, show what their replicas
+/// hold, and the safety net never ran.
+#[test]
+fn keystrokes_typed_while_the_link_rejoins_reach_every_editor() {
+    let relay = relay(None);
+    let bytes = file(&["E2x8", "Other"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+
+    relay.borrow_mut().drop_link(0);
+    a.pump();
+    assert_eq!(a.le.status(), &LiveStatus::Reconnecting);
+    a.end_of(0);
+    for c in ["2", "0", "4", "6"] {
+        assert!(a.run("text.insert", json!({"text": c})), "keystroke {c} taken while down");
+        a.pump();
+    }
+    b.end_of(1);
+    assert!(b.run("text.insert", json!({"text": " side"})));
+    b.pump();
+    relay.borrow_mut().restore_link(0);
+    // Typed before the pump that takes the relay's join answer.
+    assert!(a.run("text.insert", json!({"text": "0"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(matches!(a.le.status(), LiveStatus::Live { .. }), "{:?}", a.le.status());
+    assert_eq!(texts(&a.s.doc), ["E2x820460", "Other side"]);
+    assert_same(&a, &b, "every keystroke reached the other editor");
+    for e in [&a, &b] {
+        assert_eq!(e.le.drift(&e.s), None, "the window shows what its replica holds");
+        assert_eq!(e.le.repairs(), 0, "the safety net never ran");
+    }
+    assert!(a.le.take_notices().iter().all(|n| !n.contains("paused")), "no keystroke was refused");
+}
+
+/// LP2: an Undo while the link is down is shared after the rejoin, like typing.
+#[test]
+fn undo_while_reconnecting_reaches_every_editor_after_the_rejoin() {
+    let relay = relay(None);
+    let bytes = file(&["Hello"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    relay.borrow_mut().drop_link(0);
+    a.pump();
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": " there"})));
+    assert!(a.run("text.insert", json!({"text": " you"})));
+    assert!(a.run("edit.undo", json!({})));
+    a.pump();
+    assert_eq!(texts(&a.s.doc), ["Hello there"]);
+    relay.borrow_mut().restore_link(0);
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_same(&a, &b, "after the rejoin");
+    assert_eq!(texts(&b.s.doc), ["Hello there"]);
 }
 
 #[test]
@@ -1417,4 +1493,152 @@ fn a_drifted_window_is_rebuilt_from_the_shared_copy() {
     settle(&relay, &mut [&mut a, &mut b]);
     assert_same(&a, &b, "rebuilt again");
     assert_eq!(texts(&a.s.doc)[1], "Two");
+}
+
+/// The saver (`eds[saver]`) checkpoints the room and announces the save, as the document
+/// service does, while every editor in `eds` pumps.
+fn save_round(relay: &Shared, eds: &mut [&mut Ed], saver: usize, etag: &str) {
+    let state = eds[saver].le.checkpoint().unwrap();
+    settle(relay, eds);
+    let events = eds[saver].le.take_save_events();
+    let Some(SaveEvent::Checkpointed { seq }) = events.first().cloned() else { panic!("checkpointed: {events:?}") };
+    let _ = document_from_state(&eds[saver].s.doc, &state).unwrap();
+    eds[saver].le.announce_saved(seq, etag).unwrap();
+    settle(relay, eds);
+}
+
+/// The text of a `.docx` copy's body.
+fn copy_texts(bytes: &[u8]) -> Vec<String> {
+    texts(&wordcraft_engine::io::open_bytes("copy.docx", bytes).unwrap())
+}
+
+/// LP2 fix 1, M7: in a room that has saved, an editor that joined from the saved checkpoint
+/// types while its link is down, the room saves again meanwhile, and the rejoin's catch-up
+/// starts with that new checkpoint snapshot: the typing survives it, reaches every editor, and
+/// nothing drifts.
+#[test]
+fn offline_typing_survives_a_rejoin_that_starts_with_the_rooms_snapshot() {
+    let relay = relay(None);
+    let bytes = file(&["One", "Two", "Three"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut saver = Ed::open(&relay, SERVICE_UID, Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut saver]);
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": " fish"})));
+    settle(&relay, &mut [&mut a, &mut saver]);
+    save_round(&relay, &mut [&mut a, &mut saver], 1, "etag-1");
+    settle(&relay, &mut [&mut a, &mut saver]);
+
+    // Carol joins the saved room: her catch-up starts with the checkpoint.
+    let mut c = Ed::open(&relay, "carol", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut saver, &mut c]);
+    assert_same(&a, &c, "the joiner took the saved room");
+
+    relay.borrow_mut().drop_link(2);
+    c.pump();
+    assert_eq!(c.le.status(), &LiveStatus::Reconnecting);
+    c.end_of(1);
+    for w in [" and", " chips"] {
+        assert!(c.run("text.insert", json!({"text": w})), "typing is taken while down");
+        c.pump();
+    }
+    // Meanwhile Alice edits and the room saves again: the log now starts with that snapshot.
+    a.end_of(2);
+    assert!(a.run("text.insert", json!({"text": " more"})));
+    settle(&relay, &mut [&mut a, &mut saver]);
+    save_round(&relay, &mut [&mut a, &mut saver], 1, "etag-2");
+    assert!(
+        matches!(relay.borrow().log.first(), Some(ServerMsg::Op { params, .. }) if is_snap(params)),
+        "the rejoin's replay starts with the checkpoint"
+    );
+
+    relay.borrow_mut().restore_link(2);
+    settle(&relay, &mut [&mut a, &mut saver, &mut c]);
+    assert!(matches!(c.le.status(), LiveStatus::Live { .. }), "{:?}", c.le.status());
+    assert_eq!(texts(&c.s.doc), ["One fish", "Two and chips", "Three more"]);
+    assert_same(&a, &c, "the offline typing reached the room");
+    assert_same(&saver, &c, "and the saver");
+    for e in [&a, &c] {
+        assert_eq!(e.le.drift(&e.s), None);
+        assert_eq!(e.le.repairs(), 0);
+    }
+    assert!(!c.le.has_unmerged(), "nothing had to be kept aside");
+}
+
+/// LP2 fix 1, I2: while the link is down, the buffer for the other editors is bounded (1 MiB):
+/// past it the next edit is refused with a clear notice, and a copy of everything typed is
+/// offered. Nothing typed is dropped: once the link is back it all reaches the room, and
+/// editing resumes.
+#[test]
+fn a_full_offline_buffer_refuses_offers_a_copy_and_drops_nothing() {
+    let relay = relay(None);
+    let bytes = file(&["Start"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    relay.borrow_mut().drop_link(0);
+    a.pump();
+    let chunk = "x".repeat(64 * 1024);
+    let mut taken = 0;
+    loop {
+        a.end_of(a.s.doc.body.len() - 1);
+        if !a.run("text.newParagraph", json!({})) {
+            break;
+        }
+        if !a.run("text.insert", json!({"text": format!("chunk{taken} {chunk}")})) {
+            break;
+        }
+        taken += 1;
+        a.pump();
+        assert!(taken < 64, "no bound while the link is down");
+    }
+    assert!((12..=17).contains(&taken), "the bound is about 1 MiB: {taken} chunks of 64 KiB");
+    assert!(!a.le.editable());
+    let notices = a.le.take_notices();
+    assert!(notices.iter().any(|n| n == FULL_TEXT), "{notices:?}");
+    let copies = a.le.take_unmerged();
+    assert_eq!(copies.len(), 1, "one copy for the full buffer");
+    assert!(!copies[0].recovery);
+    let kept = copy_texts(&copies[0].bytes);
+    assert!(kept.iter().any(|t| t.starts_with(&format!("chunk{} ", taken - 1))), "the copy holds the last typing");
+    a.pump();
+    assert!(a.le.take_unmerged().is_empty(), "offered once per fill, not every frame");
+
+    relay.borrow_mut().restore_link(0);
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(a.le.editable(), "editing resumes once the buffer went out: {:?}", a.le.status());
+    assert_same(&a, &b, "every taken chunk reached the room");
+    assert_eq!(texts(&b.s.doc).iter().filter(|t| t.starts_with("chunk")).count(), taken);
+}
+
+/// LP2 fix 1, I2: an edit larger than the relay carries, made while the link is down, never
+/// reaches the room, not even in part; it is kept, with what was typed before it, as a copy.
+#[test]
+fn an_edit_past_the_relays_cap_never_reaches_the_room_in_part() {
+    let relay = relay(None);
+    relay.borrow_mut().text_cap = Some(16 * 1024);
+    let bytes = file(&["Start"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    relay.borrow_mut().drop_link(0);
+    a.pump();
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": " small"})));
+    a.pump();
+    let big = format!("BIG{}", "y".repeat(64 * 1024));
+    let _ = a.run("text.insert", json!({"text": big.clone()}));
+    a.pump();
+    relay.borrow_mut().restore_link(0);
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(
+        texts(&b.s.doc).iter().all(|t| !t.contains("BIG") && !t.contains("yyyy")),
+        "{:?}",
+        texts(&b.s.doc).iter().map(|t| t.len()).collect::<Vec<_>>()
+    );
+    let copies = a.le.take_unmerged();
+    assert!(!copies.is_empty(), "the edit was kept for a copy");
+    let kept: Vec<String> = copies.iter().filter(|c| !c.recovery).flat_map(|c| copy_texts(&c.bytes)).collect();
+    assert!(kept.iter().any(|t| t.contains(&big)), "the copy holds the whole edit");
+    assert!(a.le.take_notices().iter().any(|n| n == UNMERGED_TEXT));
 }

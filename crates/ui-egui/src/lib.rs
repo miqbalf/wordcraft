@@ -885,6 +885,10 @@ pub struct WordApp {
     pub zotero: zotero::ZoteroLink,
     /// The live co-editing session, when the host started one ([`WordApp::start_live`]).
     pub live: Option<live::LiveMode>,
+    /// Copies of live edits the other editors never got, waiting to be saved
+    /// ([`WordApp::live_save_copy`]): offered on the status bar until saved, never saved on
+    /// their own, and they keep the document unsaved.
+    pub(crate) live_copies: Vec<wordcraft_live::UnmergedCopy>,
     /// The egui context, once the first frame has run (background work wakes the UI with it).
     pub(crate) ctx: Option<egui::Context>,
     /// Whether the current command was entered by an input method's own transaction. The engine

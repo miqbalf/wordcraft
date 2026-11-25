@@ -27,6 +27,14 @@ pub use wordcraft_live::{Access, LiveStatus, Peer};
 
 use crate::{WordApp, i18n, now_ms};
 
+/// The status bar's offer of a waiting copy of live edits the other editors never got
+/// ([`WordApp::live_save_copy`]).
+pub const SAVE_COPY: &str = "Save a copy of your unshared changes";
+/// Told when the copy went to the browser's downloads; `{name}` is its name.
+pub const COPY_SAVED: &str = "Downloaded a copy with your unshared changes as {name}.";
+/// Told when the copy could not be handed over; `{error}` says why. It still waits.
+pub const COPY_FAILED: &str = "Couldn't save the copy with your unshared changes: {error}. Try again.";
+
 /// The status line when the room speaks a protocol this build does not.
 pub const NEWER: &str = "This file is being edited with a newer WordCraft. Update to join.";
 /// The status line once the link is broken for good ([`LiveStatus::Broken`]).
@@ -69,6 +77,14 @@ impl Hub for DynHub {
 
     fn set_token(&mut self, token: String) {
         self.0.set_token(token);
+    }
+
+    fn set_space(&mut self, space: u32) {
+        self.0.set_space(space);
+    }
+
+    fn close(&mut self) {
+        self.0.close();
     }
 }
 
@@ -173,7 +189,8 @@ impl WordApp {
     /// one shown; with [`Access::Read`] nothing is ever sent.
     pub fn start_live(&mut self, hub: Box<dyn Hub>, room: &str, bytes: &[u8], file_name: &str, access: Access) -> Result<(), String> {
         if let Some(LiveMode::Linked(old)) = self.live.take() {
-            old.editing.stop(&mut self.session);
+            let copies = old.editing.stop(&mut self.session);
+            self.keep_live_copies(copies);
         }
         let before = self.session.document_id();
         let mut editing = LiveEditing::start_as(DynHub(hub), room, bytes, file_name, &mut self.session, access).map_err(|e| e.to_string())?;
@@ -204,7 +221,8 @@ impl WordApp {
     /// The room speaks a protocol newer than this build's: say so, and take no edits.
     pub fn live_newer(&mut self) {
         if let Some(LiveMode::Linked(old)) = self.live.take() {
-            old.editing.stop(&mut self.session);
+            let copies = old.editing.stop(&mut self.session);
+            self.keep_live_copies(copies);
         }
         self.live = Some(LiveMode::Newer);
         // Nothing was sent to open: show the empty page, whose status bar says why.
@@ -296,8 +314,45 @@ impl WordApp {
     /// own unsaved changes.
     pub(crate) fn live_unsaved(&self) -> bool {
         match self.live_link() {
+            _ if !self.live_copies.is_empty() => true,
             Some(link) if self.live_saves() => !link.editing.edits_saved(),
             _ => self.session.dirty,
+        }
+    }
+
+    /// Copies handed back when a link stopped: they wait like any other, and the person is told.
+    fn keep_live_copies(&mut self, copies: Vec<wordcraft_live::UnmergedCopy>) {
+        if !copies.is_empty() {
+            self.live_copies.extend(copies);
+            self.status_long(tl!(wordcraft_live::UNMERGED_TEXT));
+        }
+    }
+
+    /// Whether a copy of live edits the other editors never got waits to be saved.
+    pub fn live_copy_waiting(&self) -> bool {
+        !self.live_copies.is_empty()
+    }
+
+    /// Save the oldest waiting copy of live edits the other editors never got, as the person
+    /// asked (the status bar's [`SAVE_COPY`]): a plain browser download
+    /// ([`crate::Services::download_copy`]), named after the file with the time. It is never
+    /// saved without being asked. A copy whose download did not start still waits.
+    pub fn live_save_copy(&mut self) {
+        let Some(copy) = self.live_copies.first() else { return };
+        let stem = self.title_stem();
+        let stem = stem.strip_suffix(".docx").unwrap_or(&stem).to_owned();
+        let name = format!("{stem} (unshared {}).{}", crate::local_time::file_stamp(unix_secs()), copy.ext());
+        let sent = match (&self.services.download_copy, &self.services.download) {
+            (Some(download), _) => download(&name, crate::save_as::mime_of(&name), &copy.bytes),
+            (None, Some(download)) => download(&name, &copy.bytes),
+            (None, None) => Err(tl!("this window cannot download files").to_string()),
+        };
+        match sent {
+            Ok(()) => {
+                self.live_copies.remove(0);
+                self.status_long(i18n::fmt(tl!(COPY_SAVED), &[("name", &name)]));
+            }
+            Err(error) => self.status_long(i18n::fmt(tl!(COPY_FAILED), &[("error", &error)])),
         }
     }
 
@@ -366,7 +421,8 @@ impl WordApp {
             // Another document is shown: this one is no longer edited live.
             if let Some(LiveMode::Linked(old)) = self.live.take() {
                 let document = old.document;
-                old.editing.stop(&mut self.session);
+                let copies = old.editing.stop(&mut self.session);
+                self.keep_live_copies(copies);
                 self.live = Some(LiveMode::Left { document });
             }
             self.status_long(tl!(LEFT_LIVE));
@@ -374,6 +430,7 @@ impl WordApp {
         }
         let document = self.session.document_id();
         link.peers = link.editing.pump(&mut self.session);
+        self.live_copies.extend(link.editing.take_unmerged());
         // The room's catch-up can replace the whole document: it is still the one edited live
         // (the window follows it on its own, as after any command).
         if self.session.document_id() != document {

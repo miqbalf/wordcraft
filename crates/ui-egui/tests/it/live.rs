@@ -13,7 +13,9 @@ use wordcraft_doc::Document;
 use wordcraft_engine::Session;
 use wordcraft_live::LiveEditing;
 use wordcraft_live::testing::{MemHub, MemRelay, ROOM};
-use wordcraft_ui_egui::live::{Access, COPY_DOWNLOADED, ENDED, ENDED_UNSAVED, LiveReport, LiveStatus, NEWER, NOT_SAVING, SAVED_FOR_YOU};
+use wordcraft_ui_egui::live::{
+    Access, COPY_DOWNLOADED, COPY_FAILED, ENDED, ENDED_UNSAVED, LiveReport, LiveStatus, NEWER, NOT_SAVING, SAVE_COPY, SAVED_FOR_YOU,
+};
 use wordcraft_ui_egui::{Services, WordApp};
 
 fn file() -> Vec<u8> {
@@ -854,4 +856,67 @@ fn hosted_live_non_docx_is_not_locked_on() {
     h.state_mut().session.path = Some("plan.odt".into());
     assert!(!h.state().saved_by_service());
     assert_eq!(h.state().autosave_tip(), HOSTED_TIP);
+}
+
+/// LP2 fix 1: typing made while the link was down, then the link ended for good (the host ended
+/// it), comes back as a copy that is only offered: the status bar offers it on every frame until
+/// it is saved, a download that did not start keeps it waiting, the leave guard stays on while
+/// it waits, and Save a copy hands it to a plain download, named after the file.
+#[test]
+fn unshared_typing_is_offered_as_a_copy_until_saved() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let saved: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::default();
+    let fail = Rc::new(Cell::new(true));
+    let dirty = Rc::new(RefCell::new(Vec::new()));
+    let (seen, failing, guard) = (Rc::clone(&saved), Rc::clone(&fail), Rc::clone(&dirty));
+    let services = Services {
+        download_copy: Some(Box::new(move |name: &str, _: &str, bytes: &[u8]| {
+            if failing.get() {
+                return Err("the browser blocked it".to_owned());
+            }
+            seen.borrow_mut().push((name.to_owned(), bytes.to_vec()));
+            Ok(())
+        })),
+        on_dirty: Some(Box::new(move |d| guard.borrow_mut().push(d))),
+        ..Services::default()
+    };
+    let (mut h, hub) = alice_with(&relay, Access::Edit, true, services);
+    settle(&relay, &mut h, &mut bob);
+    relay.drop_link(&hub);
+    for _ in 0..3 {
+        h.step();
+    }
+    type_text(&mut h, "Offline");
+    assert!(alice_text(&mut h).contains("Offline"), "typing is taken while the link is down");
+    assert!(!has_label(&h, SAVE_COPY), "nothing to offer while the edit can still be shared");
+    assert!(h.state_mut().live_end("The live session was restarted. Reopen the file."));
+    for _ in 0..3 {
+        h.step();
+    }
+    assert!(has_label(&h, SAVE_COPY), "the copy is offered");
+    for _ in 0..30 {
+        h.step();
+    }
+    assert!(has_label(&h, SAVE_COPY), "and offered again on every frame while it waits");
+    assert!(saved.borrow().is_empty(), "never saved without being asked");
+    assert_eq!(dirty.borrow().last(), Some(&true), "the leave guard is on while the copy waits");
+
+    h.get_by_label(SAVE_COPY).click();
+    h.step();
+    h.step();
+    assert!(has_label(&h, SAVE_COPY), "a download that did not start keeps the copy waiting");
+    assert!(h.state().status_msg.as_ref().is_some_and(|(m, _)| m.starts_with(&COPY_FAILED[..20])), "{:?}", h.state().status_msg);
+
+    fail.set(false);
+    h.get_by_label(SAVE_COPY).click();
+    h.step();
+    h.step();
+    assert!(!has_label(&h, SAVE_COPY), "saved: no longer offered");
+    let saved = saved.borrow();
+    let (name, bytes) = saved.first().expect("downloaded");
+    assert!(name.starts_with("plan (unshared ") && name.ends_with(".docx"), "{name}");
+    let doc = wordcraft_engine::io::open_bytes(name, bytes).unwrap();
+    assert!(doc.body.iter().filter_map(|b| b.as_para()).any(|p| p.text.contains("Offline")), "the copy holds the typing");
+    assert!(!bob.text().contains("Offline"), "the room never got it");
 }

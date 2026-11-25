@@ -217,6 +217,7 @@ impl WordApp {
             autosave: _,
             zotero: _,
             live: _,
+            live_copies: _,
             ctx: _,
             read_aloud_error: _,
             saves_in_flight: _,

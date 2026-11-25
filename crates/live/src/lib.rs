@@ -96,6 +96,7 @@ mod ops;
 mod remote;
 pub mod session;
 mod shareable;
+mod unmerged;
 /// An in-memory relay for host tests (craft-live's); feature `test-util`, never in a release build.
 #[cfg(feature = "test-util")]
 pub use craft_live::testing;
@@ -111,6 +112,7 @@ pub use session::{
     Access, ENDED_KIND, LiveEditing, LiveFail, LiveStatus, NOTICE_KIND, Peer, SAVED_KIND, SERVICE_UID, SaveEvent, Tap, Word, document_from_state,
 };
 pub use shareable::{SHAREABLE, is_shareable};
+pub use unmerged::{FULL_TEXT, UNMERGED_TEXT, UnmergedCopy};
 
 /// How many removals and moves a peer remembers for recovering and forwarding text.
 pub const REMEMBERED: usize = 4096;

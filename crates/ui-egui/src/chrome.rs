@@ -1025,6 +1025,10 @@ pub fn status_bar(app: &mut WordApp, ui: &mut Ui) {
                     {
                         let _ = resp.on_hover_text(detail);
                     }
+                    // A copy of live edits the other editors never got is offered until saved.
+                    if app.live_copy_waiting() && st(ui, tl!(crate::live::SAVE_COPY)).is_some_and(|r| r.clicked()) {
+                        app.live_save_copy();
+                    }
                     app.live_presence_bar(ui);
                     // Fonts the document uses that aren't installed: they're drawn in other fonts, so
                     // the text can wrap and paginate unlike where the document was made.

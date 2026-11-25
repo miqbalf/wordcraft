@@ -103,6 +103,8 @@ struct App<'a> {
     map: &'a mut LiveMap,
     /// The last batch's mapping, for its paragraph ids once its updates are sent.
     pending: &'a mut Option<LocalEdit>,
+    /// Replica states holding local edits the room does not have ([`LiveEditing::take_unmerged`]).
+    unmerged: &'a mut Vec<Vec<u8>>,
 }
 
 impl LiveApp<Word> for App<'_> {
@@ -166,6 +168,11 @@ impl LiveApp<Word> for App<'_> {
         self.map.set_space(space);
     }
 
+    fn unmerged(&mut self, state: &[u8], edits: usize) {
+        log::warn!("wordcraft-live: {edits} local edits the room does not have are kept for a copy");
+        self.unmerged.push(state.to_vec());
+    }
+
     fn caret(&self, payload: &Value) -> Option<Caret> {
         let (pid, at) = payload.get("pid").and_then(Value::as_u64).zip(payload.get("at").and_then(Value::as_u64))?;
         let text = para_text(&self.session.doc, pid)?;
@@ -223,6 +230,13 @@ pub struct LiveEditing<H: Hub> {
     /// many pumps since they have not moved.
     seen: (u64, u64),
     quiet: u32,
+    /// The room's file as opened, for what a copy of kept edits does not share (styles, settings).
+    base: Document,
+    /// Replica states with local edits the room does not have, oldest first, until the host takes
+    /// them as copies ([`LiveEditing::take_unmerged`]).
+    unmerged: Vec<Vec<u8>>,
+    /// A copy was kept for the buffer that is full now ([`crate::FULL_TEXT`]).
+    full_kept: bool,
 }
 
 impl<H: Hub> LiveEditing<H> {
@@ -242,6 +256,7 @@ impl<H: Hub> LiveEditing<H> {
         session.assign_pids(assign_seed_pids).map_err(LiveFail::Ids)?;
         let core = craft_live::LiveEditing::start(hub, room, seed_blocks(&session.doc).as_slice(), access).map_err(LiveFail::Seed)?;
         let map = LiveMap::new(&session.doc, 0);
+        let base = session.doc.clone();
         session.set_observer(Some(Box::new(Observer(core.queue()))));
         session.live_undo_hook(Some(core.queue().history_hook()));
         Ok(LiveEditing {
@@ -256,13 +271,17 @@ impl<H: Hub> LiveEditing<H> {
             repairs: 0,
             seen: (0, 0),
             quiet: 0,
+            base,
+            unmerged: Vec::new(),
+            full_kept: false,
         })
     }
 
     /// One frame: share the local edits, take in the other editors' edits, carets and saves,
     /// and say who else is here.
     pub fn pump(&mut self, session: &mut Session) -> Vec<Peer> {
-        let peers = self.core.pump(&mut App { session, map: &mut self.map, pending: &mut self.pending });
+        let peers = self.core.pump(&mut App { session, map: &mut self.map, pending: &mut self.pending, unmerged: &mut self.unmerged });
+        self.keep_when_full();
         self.since_verify = self.since_verify.saturating_add(1);
         let now = (session.rev(), self.core.newest_seq());
         if now == self.seen {
@@ -322,7 +341,7 @@ impl<H: Hub> LiveEditing<H> {
         self.repairs = self.repairs.saturating_add(1);
         log::warn!("live: the window's document drifted from the shared copy ({why}); it is rebuilt from the shared copy");
         let Some(doc) = self.core.live().doc() else { return true };
-        if let Err(e) = (App { session, map: &mut self.map, pending: &mut self.pending }).resync(doc) {
+        if let Err(e) = (App { session, map: &mut self.map, pending: &mut self.pending, unmerged: &mut self.unmerged }).resync(doc) {
             log::warn!("live: the rebuild from the shared copy did not land: {e}");
         }
         true
@@ -356,7 +375,43 @@ impl<H: Hub> LiveEditing<H> {
     /// Share the edits the session made since the last flush, and run the Undo and Redo it
     /// asked for. Refused edits are put back, with a notice.
     pub fn flush(&mut self, session: &mut Session) {
-        self.core.flush(&mut App { session, map: &mut self.map, pending: &mut self.pending });
+        self.core.flush(&mut App { session, map: &mut self.map, pending: &mut self.pending, unmerged: &mut self.unmerged });
+        self.keep_when_full();
+    }
+
+    /// Too much waits to be sent ([`Live::buffer_full`]): new edits are refused until it has
+    /// gone out. Nothing waiting is dropped, but the person may not wait that long, so a copy of
+    /// everything typed is kept once each time the buffer fills, and they are told.
+    fn keep_when_full(&mut self) {
+        let full = self.core.live().buffer_full();
+        if full
+            && !self.full_kept
+            && let Some(doc) = self.core.live().doc()
+        {
+            log::warn!("wordcraft-live: the buffer for the other editors is full; a copy of what waits is kept");
+            self.unmerged.push(doc.state());
+            self.core.push_notice(crate::FULL_TEXT.to_owned());
+        }
+        self.full_kept = full;
+    }
+
+    /// Copies of local edits the room does not have, built for the host to offer (never to save
+    /// on its own): empty when none waits. Taken once; [`UNMERGED_TEXT`](crate::UNMERGED_TEXT)
+    /// is told for them unless the buffer filled ([`crate::FULL_TEXT`] said so already).
+    pub fn take_unmerged(&mut self) -> Vec<crate::UnmergedCopy> {
+        if self.unmerged.is_empty() {
+            return Vec::new();
+        }
+        let states = std::mem::take(&mut self.unmerged);
+        if !self.full_kept {
+            self.core.push_notice(crate::UNMERGED_TEXT.to_owned());
+        }
+        crate::unmerged::build(&self.base, &states)
+    }
+
+    /// Whether kept edits wait to be taken ([`LiveEditing::take_unmerged`]).
+    pub fn has_unmerged(&self) -> bool {
+        !self.unmerged.is_empty()
     }
 
     /// Tell the room where this editor's caret is: paragraph `pid`, char `char_at`, and the
@@ -449,9 +504,23 @@ impl<H: Hub> LiveEditing<H> {
     }
 
     /// End the link from outside (the host learned the session is over: another room, less
-    /// access): [`LiveStatus::Broken`] with `reason`, at once and for good.
+    /// access): [`LiveStatus::Broken`] with `reason`, at once and for good. Every edit the room
+    /// has not confirmed is kept for a copy first ([`LiveEditing::take_unmerged`]): the room is
+    /// being left, so what was sent to it may never be ordered.
     pub fn end(&mut self, reason: &str) {
+        self.keep_unconfirmed();
         self.core.end(reason);
+    }
+
+    /// Keep a copy of the replica when it holds edits the room has not confirmed, unless the
+    /// link already broke (craft-live handed those over at the break) or only reads.
+    fn keep_unconfirmed(&mut self) {
+        if matches!(self.core.status(), LiveStatus::Broken(_) | LiveStatus::ReadOnly) || self.core.live().unconfirmed_edits() == 0 {
+            return;
+        }
+        if let Some(doc) = self.core.live().doc() {
+            self.unmerged.push(doc.state());
+        }
     }
 
     /// The uid whose `saved` markers count, [`SERVICE_UID`] unless the relay names another.
@@ -491,10 +560,19 @@ impl<H: Hub> LiveEditing<H> {
         &mut self.core
     }
 
-    /// Stop editing live: the session keeps the document and takes back its own undo.
-    pub fn stop(self, session: &mut Session) {
+    /// Stop editing live: the session keeps the document and takes back its own undo. Returns
+    /// the copies of local edits the room does not have ([`LiveEditing::take_unmerged`]),
+    /// including every edit it has not confirmed yet: the room is being left, so what was sent
+    /// to it may never be ordered. A link that already broke handed its edits over at the break.
+    #[must_use = "the copies hold edits the other editors never got"]
+    pub fn stop(mut self, session: &mut Session) -> Vec<crate::UnmergedCopy> {
+        if session.document_id() == self.document {
+            self.flush(session);
+        }
+        self.keep_unconfirmed();
         session.set_observer(None);
         session.live_undo_hook(None);
+        self.take_unmerged()
     }
 
     fn refusal_for(&self, id: &str) -> String {
