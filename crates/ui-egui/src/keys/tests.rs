@@ -1935,3 +1935,26 @@ fn a_desktop_mod_v_key_still_pastes_at_once() {
     web_frame(&ctx, &mut a, 0.0, Modifiers::COMMAND, vec![key_event(Key::V, true, Modifiers::COMMAND)]);
     assert_eq!(a.session.doc.plain_text(wordcraft_doc::StoryRef::Body), "source target source");
 }
+
+/// Shift+Delete in an open equation, in a browser that follows it with a cut event: one
+/// command runs, the cut, as in body text; the equation does not also lose a character
+/// (review round 3, M2). With no cut event (the desktop shape), the key still deletes.
+#[test]
+fn a_browser_shift_delete_in_an_equation_runs_once() {
+    let linear = |a: &mut WordApp| a.run("equation.get", json!({})).unwrap().get("linear").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    for (events_with_cut, want) in [(true, "abc"), (false, "bc")] {
+        let mut a = web_app("x ");
+        a.run("insert.equation", json!({"linear": "abc"})).unwrap();
+        a.run("equation.move", json!({"dir": "home"})).unwrap();
+        let ctx = egui::Context::default();
+        let m = Modifiers::SHIFT;
+        let mut events = vec![key_event(Key::Delete, true, m)];
+        if events_with_cut {
+            events.push(egui::Event::Cut);
+        }
+        web_frame(&ctx, &mut a, 0.0, m, events);
+        web_frame(&ctx, &mut a, 0.05, m, vec![key_event(Key::Delete, false, m)]);
+        assert!(a.session.math.is_some(), "still in the equation");
+        assert_eq!(linear(&mut a), want, "cut event: {events_with_cut}");
+    }
+}
