@@ -14302,7 +14302,13 @@ fn remote_session() -> Session {
 /// The start of the issue that covers `word`, as a position `review.*` takes.
 fn issue_start(s: &mut Session, word: &str) -> serde_json::Value {
     let issues = run(s, "review.issues", json!({}));
-    issues.as_array().unwrap().iter().find(|i| i["text"] == word).map(|i| i["start"].clone()).unwrap_or_else(|| panic!("no issue on {word}: {issues}"))
+    issues
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["text"] == word)
+        .map(|i| i["start"].clone())
+        .unwrap_or_else(|| panic!("no issue on {word}: {issues}"))
 }
 
 fn settle_polls(s: &mut Session, from: f64) {
@@ -14385,7 +14391,14 @@ fn ignore_all_also_hides_remote_spelling_of_that_word() {
     run(&mut s, "text.insert", json!({"text": format!("The {word} sat down.")}));
     s.proof_remote.set_enabled(true);
     let r = proof_request(&mut s, 0.0);
-    let m = RemoteMatch { offset: 4, length: word.len(), kind: RemoteKind::Spelling, message: "m".into(), replacements: vec![], rule: "MORFOLOGIK".into() };
+    let m = RemoteMatch {
+        offset: 4,
+        length: word.len(),
+        kind: RemoteKind::Spelling,
+        message: "m".into(),
+        replacements: vec![],
+        rule: "MORFOLOGIK".into(),
+    };
     s.proof_receive(&r.id, Ok(ProofReply { matches: vec![m], ..Default::default() }), 20_000.0);
     assert_eq!(remote_rules(&mut s), vec!["MORFOLOGIK"], "the remote spelling issue is shown");
     run(&mut s, "review.ignoreAll", json!({"word": word}));
