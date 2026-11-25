@@ -45,6 +45,10 @@ impl Session {
         self.touch();
         self.dirty = false;
         self.made_rev = self.rev;
+        // The replaced document's results and ignores go with it.
+        self.proof_remote.set_document(self.document_id);
+        self.proof_remote.forget(replaced);
+        self.proof_refresh();
         self.relayout();
     }
 
@@ -116,6 +120,7 @@ impl Session {
             typing: _,
             // Proofing results and ignores, keyed by paragraph revision: not an edit.
             proof_overlays: _,
+            proof_remote: _,
             originals: _,
             md_source: _,
             md_file: _,

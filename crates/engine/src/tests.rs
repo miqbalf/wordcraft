@@ -14124,3 +14124,165 @@ fn a_range_paste_formatting_keeps_the_targets_link_and_tracked_marks() {
     assert!(c.ins.is_some(), "Paste Formatting kept the insertion mark");
     assert_eq!(c.bold, Some(true));
 }
+
+/// Drives the session's remote proof source until it sends: the document is seen at `t` and
+/// sent once idle.
+fn proof_request(s: &mut Session, t: f64) -> crate::proof_remote::ProofRequest {
+    let mut at = t;
+    while at < t + 10_000.0 {
+        if let Some(r) = s.proof_poll(at).send.into_iter().next() {
+            return r;
+        }
+        at += 250.0;
+    }
+    panic!("nothing was sent");
+}
+
+/// A reply with a grammar match on each `(word, rule)` of the request.
+fn proof_reply(r: &crate::proof_remote::ProofRequest, words: &[(&str, &str)]) -> crate::proof_remote::ProofReply {
+    use crate::proof_remote::{ProofReply, RemoteKind, RemoteMatch};
+    let matches = words
+        .iter()
+        .map(|(word, rule)| {
+            let at = r.text.find(word).unwrap();
+            let offset = r.text[..at].chars().count();
+            let length = word.chars().count();
+            RemoteMatch {
+                offset,
+                length,
+                kind: RemoteKind::Grammar,
+                message: "remote".into(),
+                replacements: vec!["rug".into()],
+                rule: rule.to_string(),
+            }
+        })
+        .collect();
+    ProofReply { matches, ..Default::default() }
+}
+
+fn remote_rules(s: &mut Session) -> Vec<String> {
+    let issues = run(s, "review.issues", json!({}));
+    issues.as_array().unwrap().iter().filter(|i| i["source"] == "remote").map(|i| i["rule"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn session_poll_and_receive_put_remote_issues_into_review_issues() {
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "The cat sat on the mat today."}));
+    s.proof_remote.set_enabled(true);
+    let r = proof_request(&mut s, 0.0);
+    assert!(r.text.contains("mat"));
+    assert!(remote_rules(&mut s).is_empty());
+    s.proof_receive(&r.id, Ok(proof_reply(&r, &[("mat", "REMOTE_RULE")])), 20_000.0);
+    let issues = run(&mut s, "review.issues", json!({}));
+    let remote: Vec<_> = issues.as_array().unwrap().iter().filter(|i| i["source"] == "remote").collect();
+    assert_eq!(remote.len(), 1, "{issues}");
+    assert_eq!(remote[0]["text"], "mat");
+    assert_eq!(remote[0]["rule"], "REMOTE_RULE");
+}
+
+#[test]
+fn ignored_rule_in_one_document_does_not_hide_issues_in_another() {
+    let text = "The cat sat on the mat today.";
+    let mut s = s();
+    let a = s.document_id();
+    run(&mut s, "text.insert", json!({"text": text}));
+    s.proof_remote.set_enabled(true);
+    let r = proof_request(&mut s, 0.0);
+    s.proof_receive(&r.id, Ok(proof_reply(&r, &[("mat", "R_X"), ("cat", "R_Y")])), 20_000.0);
+    assert_eq!(remote_rules(&mut s), vec!["R_Y", "R_X"]);
+    s.proof_remote.ignore_rule(a, "R_X");
+    s.proof_poll(20_000.0);
+    assert_eq!(remote_rules(&mut s), vec!["R_Y"], "R_X ignored in A");
+
+    run(&mut s, "file.new", json!({}));
+    run(&mut s, "text.insert", json!({"text": text}));
+    assert_ne!(s.document_id(), a);
+    assert!(remote_rules(&mut s).is_empty(), "nothing checked in B yet");
+    // B has the same text: the cached result applies without a request, and A's ignore does not.
+    for t in 0..40 {
+        assert!(s.proof_poll(30_000.0 + f64::from(t) * 250.0).send.is_empty());
+    }
+    assert_eq!(remote_rules(&mut s), vec!["R_Y", "R_X"], "B shows the rule A ignored");
+
+    s.activate(a).unwrap();
+    assert_eq!(remote_rules(&mut s), vec!["R_Y"], "back in A at once: its own underlines, R_X still ignored");
+    s.proof_poll(60_000.0);
+    assert_eq!(remote_rules(&mut s), vec!["R_Y"], "and after a poll");
+}
+
+#[test]
+fn an_ignore_right_after_a_switch_lands_in_the_document_switched_to() {
+    let text = "The cat sat on the mat today.";
+    let mut s = s();
+    let a = s.document_id();
+    run(&mut s, "text.insert", json!({"text": text}));
+    s.proof_remote.set_enabled(true);
+    let r = proof_request(&mut s, 0.0);
+    s.proof_receive(&r.id, Ok(proof_reply(&r, &[("mat", "R_X")])), 20_000.0);
+    run(&mut s, "file.new", json!({}));
+    run(&mut s, "text.insert", json!({"text": text}));
+    for t in 0..40 {
+        s.proof_poll(30_000.0 + f64::from(t) * 250.0);
+    }
+    s.activate(a).unwrap();
+    // No poll since the switch: the ignore is for A.
+    let mat = text.find("mat").unwrap();
+    let p = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().clone();
+    let id = s.document_id();
+    s.proof_remote.ignore_occurrence(id, &p, mat, mat + 3, "R_X");
+    s.proof_refresh();
+    assert!(remote_rules(&mut s).is_empty(), "ignored in A");
+    let b = s.documents().iter().map(|d| d.id).find(|d| *d != a).unwrap();
+    s.activate(b).unwrap();
+    assert_eq!(remote_rules(&mut s), vec!["R_X"], "not in B");
+}
+
+/// The built-in grammar issues of the active document, as (start offset, rule).
+fn builtin_grammar(s: &mut Session) -> Vec<(usize, usize, String)> {
+    let issues = run(s, "review.issues", json!({}));
+    issues
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["source"] == "builtin" && i["kind"] == "grammar")
+        .map(|i| (i["start"]["off"].as_u64().unwrap() as usize, i["end"]["off"].as_u64().unwrap() as usize, i["rule"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+#[test]
+fn ignores_work_without_a_remote_source() {
+    // The desktop app never polls a remote source: Ignore on built-in grammar still works.
+    if no_language_data("ignores_work_without_a_remote_source") {
+        return;
+    }
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": "this is is a test. we went home."}));
+    let found = builtin_grammar(&mut s);
+    assert!(found.len() >= 2, "{found:?}");
+    let (a, b, rule) = found[0].clone();
+    let p = s.doc.para(StoryRef::Body, &wordcraft_doc::Path::top(0)).unwrap().clone();
+    let id = s.document_id();
+    s.proof_remote.ignore_occurrence(id, &p, a, b, &rule);
+    s.proof_refresh();
+    let after = builtin_grammar(&mut s);
+    assert!(!after.contains(&found[0]) && after.len() == found.len() - 1, "{after:?}");
+}
+
+#[test]
+fn ignored_rule_does_not_survive_a_document_replace() {
+    if no_language_data("ignored_rule_does_not_survive_a_document_replace") {
+        return;
+    }
+    let text = "this is is a test. we went home.";
+    let mut s = s();
+    run(&mut s, "text.insert", json!({"text": text}));
+    let found = builtin_grammar(&mut s);
+    let rule = found.first().map(|f| f.2.clone()).expect("a built-in grammar issue");
+    let id = s.document_id();
+    s.proof_remote.ignore_rule(id, &rule);
+    s.proof_refresh();
+    assert!(builtin_grammar(&mut s).iter().all(|f| f.2 != rule));
+    s.set_document(wordcraft_doc::Document::from_text(text));
+    assert!(builtin_grammar(&mut s).iter().any(|f| f.2 == rule), "the new document does not inherit the ignore");
+}
