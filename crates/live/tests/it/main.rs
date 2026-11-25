@@ -548,3 +548,34 @@ fn a_large_integer_in_a_shared_attribute_reads_back_from_the_state() {
     let objects = |d: &Document| d.body[0].as_para().unwrap().objects.clone();
     assert_eq!(objects(&saved), objects(&doc), "the checkpoint keeps the ids");
 }
+
+#[test]
+fn improve_apply_is_shared_and_converges() {
+    let file = plain(&["she go to school yesterday", "Second"]);
+    let (mut a, mut b) = (Peer::join(&file, 1), Peer::join(&file, 2));
+    a.caret(0, 0);
+    let src = a.s.run("review.improveSource", &json!({})).unwrap();
+    assert!(a.edits.lock().unwrap().is_empty(), "reading the source is not an edit");
+    let out = a.run(
+        "review.improveApply",
+        json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "she went to school yesterday"}),
+    );
+    assert_eq!(a.refused, 0, "Improve is shared while live");
+    assert!(!out.is_empty(), "the replacement goes out");
+    exchange(&mut a, &mut b, out, Vec::new());
+    assert_converged(&a, &b, "improve");
+    assert_eq!(texts(&b.s.doc), ["she went to school yesterday", "Second"]);
+}
+
+#[test]
+fn apply_suggestion_is_shareable() {
+    assert!(is_shareable("review.applySuggestion") && is_shareable("review.improveApply"));
+    let file = plain(&["Hello wrld", "Second"]);
+    let (mut a, mut b) = (Peer::join(&file, 1), Peer::join(&file, 2));
+    a.select(0, 6, 10);
+    let out = a.run("review.applySuggestion", json!({"text": "world"}));
+    assert_eq!(a.refused, 0, "a proofing fix is shared while live");
+    exchange(&mut a, &mut b, out, Vec::new());
+    assert_converged(&a, &b, "suggestion");
+    assert_eq!(texts(&b.s.doc)[0], "Hello world");
+}

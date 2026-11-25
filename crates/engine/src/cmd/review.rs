@@ -11,6 +11,7 @@ use crate::{CmdError, CmdResult, CommandSpec, Selection, Session, p};
 
 mod changes;
 mod comments;
+mod improve;
 mod proofing;
 
 pub(crate) use changes::StyleTarget;
@@ -22,6 +23,10 @@ use comments::{
     comment_at_caret, comments_change, delete_comment, edit_comment, list_comments, nav_comment, new_comment, reply, validate_comment_id,
 };
 pub use comments::{comment_list, comment_range_at_caret};
+pub use improve::{
+    ACROSS_CELLS, BLANK_LINE, EMPTY_DOCUMENT, HAS_CHANGES, HAS_OBJECTS, IMPROVE_MAX_BYTES, NO_TEXT, PARAGRAPHS_CHANGED, SUMMARIZE_MAX_BYTES,
+    TEXT_CHANGED, TOO_LONG,
+};
 use proofing::{all_issues, issue_at, next_issue, suggestions, thesaurus, word_count};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -132,6 +137,14 @@ pub fn specs() -> Vec<CommandSpec> {
             sel_result(s)
         })
         .params(r#"{"text": string}"#),
+        CommandSpec::new("review.improveSource", "Improve with AI", "Review › Proofing", improve::improve_source)
+            .params(r#"{} → {"text": string (the selection, or the caret's paragraph; paragraphs joined by a blank line), "language": string, "anchor": Pos, "focus": Pos}"#)
+            .pure(),
+        CommandSpec::new("review.improveApply", "Improve with AI", "Review › Proofing", improve::improve_apply)
+            .params(r#"{"anchor": Pos, "focus": Pos, "original": string (improveSource's text), "proposal": string (the improved text, paragraphs separated by a blank line)}"#),
+        CommandSpec::new("review.summarySource", "Summarize Document", "Review › Proofing", improve::summary_source)
+            .params(r#"{} → {"text": string (the body's text), "language": string, "truncated": bool}"#)
+            .pure(),
         CommandSpec::new("review.proofing", "Check Spelling as You Type", "File › Options › Proofing", |s, v| {
             s.view.proofing = p::bool(v, "value").unwrap_or(!s.view.proofing);
             s.prefs.check_spelling = s.view.proofing;

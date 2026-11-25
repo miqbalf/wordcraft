@@ -228,7 +228,7 @@ fn mark_block(b: &Block, f: &dyn Fn(&mut CharProps), depth: usize) -> Block {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum Op {
+pub(crate) enum Op {
     Same,
     Del,
     Ins,
@@ -249,7 +249,7 @@ const MAX_COMPARE_CELLS: u64 = 50_000_000;
 /// charging comparison cells against `budget`. Between windows, intermediate common prefixes
 /// are trimmed to re-anchor alignment without table allocations. When the remaining cells
 /// exceed `budget`, the unaligned tail degrades honestly as whole deletions and insertions.
-pub(super) fn lcs_ops<T: PartialEq>(a: &[T], b: &[T], budget: &mut u64) -> Vec<Op> {
+pub(crate) fn lcs_ops<T: PartialEq>(a: &[T], b: &[T], budget: &mut u64) -> Vec<Op> {
     let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
     let (ra, rb) = (a.get(pre..).unwrap_or_default(), b.get(pre..).unwrap_or_default());
     let suf = ra.iter().rev().zip(rb.iter().rev()).take_while(|(x, y)| x == y).count();
