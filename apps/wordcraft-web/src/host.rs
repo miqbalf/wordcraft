@@ -444,8 +444,9 @@ impl Live {
         Rc::clone(&self.joining)
     }
 
-    /// Act on what arrived since the last frame.
-    pub fn frame(&mut self, app: &mut WordApp, events: &LiveEvents) {
+    /// Act on what arrived since the last frame. `ctx` is the window's, which a live link's hub
+    /// wakes when the relay sends something.
+    pub fn frame(&mut self, app: &mut WordApp, events: &LiveEvents, ctx: &egui::Context) {
         let arrived = std::mem::take(&mut *events.borrow_mut());
         for event in arrived {
             match event {
@@ -457,7 +458,7 @@ impl Live {
                     log::error!("live file not fetched: {e}");
                     not_opened(app, &e);
                 }
-                LiveEvent::Open(message, bytes) => self.open(app, &message, &bytes),
+                LiveEvent::Open(message, bytes) => self.open(app, &message, &bytes, ctx),
                 // The hub uses it for its next connect, and starts again with it after the relay
                 // refused an expired one.
                 LiveEvent::Ticket(ticket) => {
@@ -469,13 +470,20 @@ impl Live {
         }
     }
 
-    fn open(&mut self, app: &mut WordApp, message: &LiveMessage, bytes: &[u8]) {
+    fn open(&mut self, app: &mut WordApp, message: &LiveMessage, bytes: &[u8], ctx: &egui::Context) {
         let access = crate::live_ticket::ticket_access(message.ticket());
         let started = relay_on_page_host(&message.relay_url)
             .and_then(|()| craft_collab::web::WebHub::connect(&message.relay_url, message.ticket(), None).map_err(|e| e.to_string()))
-            .and_then(|hub| app.start_live(Box::new(hub), &message.room, bytes, &message.file_name, access));
+            .and_then(|hub| {
+                // The socket's handlers draw a frame as soon as a message is in, instead of the
+                // window polling for it every 100 ms (PERF2).
+                let ctx = ctx.clone();
+                hub.set_wake(move || ctx.request_repaint());
+                app.start_live(Box::new(hub), &message.room, bytes, &message.file_name, access)
+            });
         match started {
             Ok(()) => {
+                app.live_woken();
                 self.joining.borrow_mut().joined(&message.room, access);
                 if let Some(ticket) = self.pending.take() {
                     app.live_refresh_ticket(ticket);

@@ -1,0 +1,122 @@
+use std::cell::Cell;
+
+use egui::{Context, Event, Id, RawInput, pos2, vec2};
+
+use super::{MAX_AGE, counts, set_enabled, show};
+
+/// One frame at `time` with `events`: a panel at the top holding the part, which paints a label
+/// (`text`) and counts its runs in `ran`. Returns the frame's shape count.
+fn frame(ctx: &Context, time: f64, events: Vec<Event>, key: u64, text: &str, ran: &Cell<u32>) -> usize {
+    let input =
+        RawInput { time: Some(time), screen_rect: Some(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))), events, ..Default::default() };
+    let out = ctx.run_ui(input, |ui| {
+        egui::Panel::top("part").exact_size(40.0).show(ui, |ui| {
+            show(ui, Id::unique("part"), key, |ui| {
+                ran.set(ran.get() + 1);
+                ui.label(text);
+            });
+        });
+    });
+    let shapes = out.shapes.len();
+    out.drop_without_applying_deltas();
+    shapes
+}
+
+/// A context with replays on (they are off by default outside the browser).
+fn on() -> Context {
+    let ctx = Context::default();
+    set_enabled(&ctx, true);
+    ctx
+}
+
+fn id() -> Id {
+    Id::unique("part")
+}
+
+#[test]
+fn a_settled_part_is_replayed_with_the_same_shapes_and_its_code_not_run() {
+    let (ctx, ran) = (on(), Cell::new(0));
+    let first = frame(&ctx, 1.0, vec![], 7, "Home", &ran);
+    let second = frame(&ctx, 1.1, vec![], 7, "Home", &ran);
+    assert_eq!(ran.get(), 2, "it runs until two runs painted the same");
+    let third = frame(&ctx, 1.2, vec![], 7, "Home", &ran);
+    let fourth = frame(&ctx, 1.3, vec![], 7, "Home", &ran);
+    assert_eq!(ran.get(), 2, "then it is replayed");
+    assert_eq!((first, second, third, fourth), (first, first, first, first), "a replay paints what a run painted");
+    assert_eq!(counts(&ctx, id()), (2, 2));
+}
+
+#[test]
+fn a_new_key_runs_the_part() {
+    let (ctx, ran) = (on(), Cell::new(0));
+    for t in [1.0, 1.1, 1.2] {
+        frame(&ctx, t, vec![], 7, "Home", &ran);
+    }
+    assert_eq!(ran.get(), 2);
+    frame(&ctx, 1.3, vec![], 8, "Home", &ran);
+    assert_eq!(ran.get(), 3);
+}
+
+#[test]
+fn changing_shapes_keep_the_part_running() {
+    let (ctx, ran) = (on(), Cell::new(0));
+    for (i, t) in [1.0, 1.1, 1.2, 1.3].into_iter().enumerate() {
+        frame(&ctx, t, vec![], 7, &format!("frame {i}"), &ran);
+    }
+    assert_eq!(ran.get(), 4, "an animating part is never replayed");
+}
+
+#[test]
+fn input_runs_the_part_that_frame_and_the_next() {
+    let (ctx, ran) = (on(), Cell::new(0));
+    for t in [1.0, 1.1, 1.2] {
+        frame(&ctx, t, vec![], 7, "Home", &ran);
+    }
+    assert_eq!(ran.get(), 2);
+    let key = Event::Key { key: egui::Key::B, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND };
+    frame(&ctx, 1.3, vec![key], 7, "Home", &ran);
+    frame(&ctx, 1.4, vec![], 7, "Home", &ran);
+    assert_eq!(ran.get(), 4, "a key's command shows a frame later");
+    frame(&ctx, 1.5, vec![], 7, "Home", &ran);
+    assert_eq!(ran.get(), 4);
+    frame(&ctx, 1.6, vec![Event::Text("x".into())], 7, "Home", &ran);
+    assert_eq!(ran.get(), 5);
+}
+
+#[test]
+fn the_pointer_over_the_part_runs_it_and_once_after_it_left() {
+    let (ctx, ran) = (on(), Cell::new(0));
+    for t in [1.0, 1.1, 1.2] {
+        frame(&ctx, t, vec![], 7, "Home", &ran);
+    }
+    assert_eq!(ran.get(), 2);
+    frame(&ctx, 1.3, vec![Event::PointerMoved(pos2(20.0, 10.0))], 7, "Home", &ran);
+    frame(&ctx, 1.4, vec![], 7, "Home", &ran);
+    assert_eq!(ran.get(), 4, "hovered: its widgets must take the pointer");
+    frame(&ctx, 1.5, vec![Event::PointerMoved(pos2(400.0, 400.0))], 7, "Home", &ran);
+    assert_eq!(ran.get(), 5, "the frame the pointer left clears the hover highlight");
+    frame(&ctx, 1.6, vec![], 7, "Home", &ran);
+    assert_eq!(ran.get(), 5);
+}
+
+#[test]
+fn a_recording_older_than_max_age_runs_the_part() {
+    let (ctx, ran) = (on(), Cell::new(0));
+    for t in [1.0, 1.1, 1.2] {
+        frame(&ctx, t, vec![], 7, "Home", &ran);
+    }
+    assert_eq!(ran.get(), 2);
+    frame(&ctx, 1.1 + MAX_AGE + 0.01, vec![], 7, "Home", &ran);
+    assert_eq!(ran.get(), 3);
+}
+
+#[test]
+fn a_disabled_cache_runs_the_part_every_frame() {
+    let (ctx, ran) = (Context::default(), Cell::new(0));
+    set_enabled(&ctx, false);
+    for t in [1.0, 1.1, 1.2, 1.3] {
+        frame(&ctx, t, vec![], 7, "Home", &ran);
+    }
+    assert_eq!(ran.get(), 4);
+    assert_eq!(counts(&ctx, id()), (0, 0), "a disabled cache keeps no books");
+}

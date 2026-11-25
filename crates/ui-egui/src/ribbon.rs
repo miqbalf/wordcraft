@@ -414,147 +414,151 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     .stroke(Stroke::new(1.0, t.border)),
             )
             .show(ui, |ui| {
-                // Bring newly selected ribbon content in from the side of its tab.
-                let index = tabs.iter().position(|(name, _)| name == &app.ui.tab).unwrap_or(0);
-                let (settled, direction) = tab_content_entry(ui.ctx(), &app.ui.tab, index, now, animate);
-                let shift = vec2(direction * (1.0 - settled) * CONTENT_SWITCH_SLIDE, 0.0);
-                // The display button keeps its own column at the corner: the content (the last
-                // group, its launcher and label, the scroll cue) is laid out beside it, not under it.
-                let full = ui.max_rect();
-                let mut content = full.translate(shift);
-                if crate::rtl::on() {
-                    content.min.x += CORNER_W;
-                } else {
-                    content.max.x -= CORNER_W;
-                }
-                let mut shifted = ui.new_child(egui::UiBuilder::new().max_rect(content).layout(*ui.layout()));
-                shifted.set_opacity(0.2 + 0.8 * settled);
-                let ui = &mut shifted;
-                // Right-click on the ribbon (outside a button): Customize Ribbon. Registered first, so
-                // the buttons drawn over it keep their own clicks.
-                // No document open (#1129): every command is greyed out but Help's.
-                if !app.has_document() && app.ui.tab != "Help" {
-                    ui.disable();
-                }
-                let bg = ui.interact(ui.max_rect(), ui.scope_id().with("ribbon_background"), Sense::click());
-                crate::rtl::context_menu(&bg, |ui| crate::rtl::root(ui, |ui| crate::widgets::customize_menu_items(ui, app)));
-                let entry = user_tabs.iter().find(|e| e.name == app.ui.tab);
-                crate::ribbon_fit::begin(ui.ctx(), &app.ui.tab, ui.available_width() - 4.0);
-                // 0.37 keeps the scroll offset private: an edge-chevron click leaves a one-frame
-                // request here and the next scroll area is built at that offset.
-                let pending_id = ui.scope_id().with("ribbon_scroll_pending");
-                let pending = ui.data(|d| d.get_temp::<f32>(pending_id));
-                // Right to left, the groups start at the right edge. A scroll area's content is
-                // unbounded, so the row gets a width: the view's, or last frame's content if wider.
-                // The scroll position is kept as a distance from the right, where reading starts.
-                let rtl = crate::rtl::on();
-                let view_w = ui.available_width();
-                let row_id = ui.scope_id().with(("ribbon_row", app.ui.tab.as_str()));
-                let (content_w, from_right, last_over) = ui.data(|d| d.get_temp::<(f32, f32, f32)>(row_id)).unwrap_or((0.0, 0.0, 0.0));
-                let row_w = content_w.max(view_w);
-                let set_offset = (last_over - from_right).max(0.0);
-                let mut area = egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
-                if rtl {
-                    area = area.horizontal_scroll_offset(set_offset);
-                } else if let Some(x) = pending {
-                    area = area.horizontal_scroll_offset(x);
-                }
-                let mut measured = 0.0;
-                let scroll = area.show(ui, |ui| {
-                    let size = vec2(if rtl { row_w } else { ui.available_size_before_wrap().x }, ui.available_size_before_wrap().y);
-                    let body = |ui: &mut Ui| {
-                        ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
-                        match entry {
-                            // Every tab hidden: nothing to show.
-                            Some(e) if e.hidden => return,
-                            Some(e) if e.custom => return custom_groups(app, ui, &e.groups),
-                            _ => {}
-                        }
-                        match app.ui.tab.as_str() {
-                            "Home" => home(app, ui),
-                            "Insert" => insert(app, ui),
-                            "Draw" => draw(app, ui),
-                            "Design" => design(app, ui),
-                            "Layout" => layout(app, ui),
-                            "References" => references(app, ui),
-                            "Mailings" => mailings(app, ui),
-                            "Review" => review(app, ui),
-                            "View" => view(app, ui),
-                            "Developer" => developer(app, ui),
-                            "Zotero" => zotero(app, ui),
-                            "Help" => help(app, ui),
-                            "Table Design" => table_design(app, ui),
-                            "Table Layout" => table_layout(app, ui),
-                            "Equation" if app.session.math.is_some() => crate::equation_tab::show(app, ui),
-                            "Picture Format" => picture_format(app, ui),
-                            "Shape Format" => shape_format(app, ui),
-                            "SmartArt Design" => smart_art_design(app, ui),
-                            "Outlining" => outlining(app, ui),
-                            "Chart Design" => chart_design(app, ui),
-                            _ => home(app, ui),
-                        }
-                        if let Some(e) = entry {
-                            custom_groups(app, ui, &e.groups);
-                        }
-                    };
-                    if rtl {
-                        measured = ui.allocate_ui_with_layout(size, egui::Layout::right_to_left(egui::Align::Min), body).response.rect.width();
+                // Settled frames paint last frame's body without running it (PERF2).
+                let key = body_key(app, ui);
+                crate::frame_cache::show(ui, app.window_id("ribbon_body"), key, |ui| {
+                    // Bring newly selected ribbon content in from the side of its tab.
+                    let index = tabs.iter().position(|(name, _)| name == &app.ui.tab).unwrap_or(0);
+                    let (settled, direction) = tab_content_entry(ui.ctx(), &app.ui.tab, index, now, animate);
+                    let shift = vec2(direction * (1.0 - settled) * CONTENT_SWITCH_SLIDE, 0.0);
+                    // The display button keeps its own column at the corner: the content (the last
+                    // group, its launcher and label, the scroll cue) is laid out beside it, not under it.
+                    let full = ui.max_rect();
+                    let mut content = full.translate(shift);
+                    if crate::rtl::on() {
+                        content.min.x += CORNER_W;
                     } else {
-                        crate::rtl::horizontal_top(ui, body);
+                        content.max.x -= CORNER_W;
                     }
-                });
-                if rtl {
-                    let over = (scroll.content_size.x - scroll.inner_rect.width()).max(0.0);
-                    // Only the user's own scrolling moves the remembered distance: while the width
-                    // is still settling, the offset set above lags a frame behind.
-                    let scrolled = (scroll.state.clamped_offset().x - set_offset).abs() > 0.5 && set_offset <= over;
-                    let from_right = if scrolled { (over - scroll.state.clamped_offset().x).max(0.0) } else { from_right.min(over) };
-                    ui.data_mut(|d| d.insert_temp(row_id, (measured, from_right, over)));
-                    if (over - last_over).abs() > 0.5 {
+                    let mut shifted = ui.new_child(egui::UiBuilder::new().max_rect(content).layout(*ui.layout()));
+                    shifted.set_opacity(0.2 + 0.8 * settled);
+                    let ui = &mut shifted;
+                    // Right-click on the ribbon (outside a button): Customize Ribbon. Registered first, so
+                    // the buttons drawn over it keep their own clicks.
+                    // No document open (#1129): every command is greyed out but Help's.
+                    if !app.has_document() && app.ui.tab != "Help" {
+                        ui.disable();
+                    }
+                    let bg = ui.interact(ui.max_rect(), ui.scope_id().with("ribbon_background"), Sense::click());
+                    crate::rtl::context_menu(&bg, |ui| crate::rtl::root(ui, |ui| crate::widgets::customize_menu_items(ui, app)));
+                    let entry = user_tabs.iter().find(|e| e.name == app.ui.tab);
+                    crate::ribbon_fit::begin(ui.ctx(), &app.ui.tab, ui.available_width() - 4.0);
+                    // 0.37 keeps the scroll offset private: an edge-chevron click leaves a one-frame
+                    // request here and the next scroll area is built at that offset.
+                    let pending_id = ui.scope_id().with("ribbon_scroll_pending");
+                    let pending = ui.data(|d| d.get_temp::<f32>(pending_id));
+                    // Right to left, the groups start at the right edge. A scroll area's content is
+                    // unbounded, so the row gets a width: the view's, or last frame's content if wider.
+                    // The scroll position is kept as a distance from the right, where reading starts.
+                    let rtl = crate::rtl::on();
+                    let view_w = ui.available_width();
+                    let row_id = ui.scope_id().with(("ribbon_row", app.ui.tab.as_str()));
+                    let (content_w, from_right, last_over) = ui.data(|d| d.get_temp::<(f32, f32, f32)>(row_id)).unwrap_or((0.0, 0.0, 0.0));
+                    let row_w = content_w.max(view_w);
+                    let set_offset = (last_over - from_right).max(0.0);
+                    let mut area = egui::ScrollArea::horizontal().scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+                    if rtl {
+                        area = area.horizontal_scroll_offset(set_offset);
+                    } else if let Some(x) = pending {
+                        area = area.horizontal_scroll_offset(x);
+                    }
+                    let mut measured = 0.0;
+                    let scroll = area.show(ui, |ui| {
+                        let size = vec2(if rtl { row_w } else { ui.available_size_before_wrap().x }, ui.available_size_before_wrap().y);
+                        let body = |ui: &mut Ui| {
+                            ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+                            match entry {
+                                // Every tab hidden: nothing to show.
+                                Some(e) if e.hidden => return,
+                                Some(e) if e.custom => return custom_groups(app, ui, &e.groups),
+                                _ => {}
+                            }
+                            match app.ui.tab.as_str() {
+                                "Home" => home(app, ui),
+                                "Insert" => insert(app, ui),
+                                "Draw" => draw(app, ui),
+                                "Design" => design(app, ui),
+                                "Layout" => layout(app, ui),
+                                "References" => references(app, ui),
+                                "Mailings" => mailings(app, ui),
+                                "Review" => review(app, ui),
+                                "View" => view(app, ui),
+                                "Developer" => developer(app, ui),
+                                "Zotero" => zotero(app, ui),
+                                "Help" => help(app, ui),
+                                "Table Design" => table_design(app, ui),
+                                "Table Layout" => table_layout(app, ui),
+                                "Equation" if app.session.math.is_some() => crate::equation_tab::show(app, ui),
+                                "Picture Format" => picture_format(app, ui),
+                                "Shape Format" => shape_format(app, ui),
+                                "SmartArt Design" => smart_art_design(app, ui),
+                                "Outlining" => outlining(app, ui),
+                                "Chart Design" => chart_design(app, ui),
+                                _ => home(app, ui),
+                            }
+                            if let Some(e) = entry {
+                                custom_groups(app, ui, &e.groups);
+                            }
+                        };
+                        if rtl {
+                            measured = ui.allocate_ui_with_layout(size, egui::Layout::right_to_left(egui::Align::Min), body).response.rect.width();
+                        } else {
+                            crate::rtl::horizontal_top(ui, body);
+                        }
+                    });
+                    if rtl {
+                        let over = (scroll.content_size.x - scroll.inner_rect.width()).max(0.0);
+                        // Only the user's own scrolling moves the remembered distance: while the width
+                        // is still settling, the offset set above lags a frame behind.
+                        let scrolled = (scroll.state.clamped_offset().x - set_offset).abs() > 0.5 && set_offset <= over;
+                        let from_right = if scrolled { (over - scroll.state.clamped_offset().x).max(0.0) } else { from_right.min(over) };
+                        ui.data_mut(|d| d.insert_temp(row_id, (measured, from_right, over)));
+                        if (over - last_over).abs() > 0.5 {
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                    if pending.is_some() {
+                        let _ = ui.data_mut(|d| d.remove_temp::<f32>(pending_id));
+                    }
+                    crate::ribbon_fit::end(ui.ctx());
+                    // The bar is hidden, so a row wider than the window would be clipped with no sign. Edge chevrons show
+                    // where more is and scroll it on click. Every command also stays reachable through Search Commands.
+                    let r = scroll.inner_rect;
+                    let overflow = scroll.content_size.x - r.width();
+                    // Test-only: where the content ended and how far it was scrolled.
+                    #[cfg(test)]
+                    ui.data_mut(|d| d.insert_temp(egui::Id::unique("ribbon_probe_content"), (r, scroll.state.clamped_offset().x, overflow)));
+                    let offset = scroll.state.clamped_offset().x;
+                    let step = 160.0;
+                    let mut next = None;
+                    if offset > 1.0 {
+                        let left = Rect::from_min_max(r.left_top(), pos2(r.left() + 18.0, r.bottom()));
+                        if edge_cue(ui, left, "‹", tl!("Scroll ribbon left"), &t) {
+                            next = Some(offset - step);
+                        }
+                    }
+                    if overflow - offset > 1.0 {
+                        let right = Rect::from_min_max(pos2(r.right() - 18.0, r.top()), r.right_bottom());
+                        if edge_cue(ui, right, "›", tl!("Scroll ribbon right"), &t) {
+                            next = Some(offset + step);
+                        }
+                    }
+                    if let Some(x) = next {
+                        let x = x.clamp(0.0, overflow.max(0.0));
+                        if rtl {
+                            ui.data_mut(|d| d.insert_temp(row_id, (measured, (overflow - x).max(0.0), overflow.max(0.0))));
+                        }
+                        ui.data_mut(|d| d.insert_temp(pending_id, x));
                         ui.ctx().request_repaint();
                     }
-                }
-                if pending.is_some() {
-                    let _ = ui.data_mut(|d| d.remove_temp::<f32>(pending_id));
-                }
-                crate::ribbon_fit::end(ui.ctx());
-                // The bar is hidden, so a row wider than the window would be clipped with no sign. Edge chevrons show
-                // where more is and scroll it on click. Every command also stays reachable through Search Commands.
-                let r = scroll.inner_rect;
-                let overflow = scroll.content_size.x - r.width();
-                // Test-only: where the content ended and how far it was scrolled.
-                #[cfg(test)]
-                ui.data_mut(|d| d.insert_temp(egui::Id::unique("ribbon_probe_content"), (r, scroll.state.clamped_offset().x, overflow)));
-                let offset = scroll.state.clamped_offset().x;
-                let step = 160.0;
-                let mut next = None;
-                if offset > 1.0 {
-                    let left = Rect::from_min_max(r.left_top(), pos2(r.left() + 18.0, r.bottom()));
-                    if edge_cue(ui, left, "‹", tl!("Scroll ribbon left"), &t) {
-                        next = Some(offset - step);
-                    }
-                }
-                if overflow - offset > 1.0 {
-                    let right = Rect::from_min_max(pos2(r.right() - 18.0, r.top()), r.right_bottom());
-                    if edge_cue(ui, right, "›", tl!("Scroll ribbon right"), &t) {
-                        next = Some(offset + step);
-                    }
-                }
-                if let Some(x) = next {
-                    let x = x.clamp(0.0, overflow.max(0.0));
-                    if rtl {
-                        ui.data_mut(|d| d.insert_temp(row_id, (measured, (overflow - x).max(0.0), overflow.max(0.0))));
-                    }
-                    ui.data_mut(|d| d.insert_temp(pending_id, x));
-                    ui.ctx().request_repaint();
-                }
-                // The chevron at the bottom corner: collapse the ribbon, and Ribbon Display Options.
-                let (w, h) = (CORNER_W, 2.0 * TARGET);
-                let x = if rtl { full.left() } else { full.right() - w };
-                let button = Rect::from_min_size(pos2(x, full.bottom() - h - 1.0), vec2(w, h));
-                #[cfg(test)]
-                ui.data_mut(|d| d.insert_temp(egui::Id::unique("ribbon_probe_button"), button));
-                display_button(app, ui, button, &t, true);
+                    // The chevron at the bottom corner: collapse the ribbon, and Ribbon Display Options.
+                    let (w, h) = (CORNER_W, 2.0 * TARGET);
+                    let x = if rtl { full.left() } else { full.right() - w };
+                    let button = Rect::from_min_size(pos2(x, full.bottom() - h - 1.0), vec2(w, h));
+                    #[cfg(test)]
+                    ui.data_mut(|d| d.insert_temp(egui::Id::unique("ribbon_probe_button"), button));
+                    display_button(app, ui, button, &t, true);
+                });
             });
     };
     if overlay {
@@ -568,6 +572,29 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     } else {
         body(app, ui);
     }
+}
+
+/// What the ribbon's body shows, as a [`crate::frame_cache`] key (PERF2): the document and the
+/// selection (the format the buttons show), the tab, the language, the scale and the theme.
+/// Anything else it shows changes through a command, whose input runs the body anyway, or shows
+/// within [`crate::frame_cache::MAX_AGE`].
+fn body_key(app: &WordApp, ui: &Ui) -> u64 {
+    let ctx = ui.ctx();
+    // Keytip badges are placed over the buttons as they are laid out: run every frame while shown.
+    let keytips = (app.ui.keytips != crate::keytips::Phase::Off).then(|| ctx.cumulative_frame_nr());
+    crate::frame_cache::hash((
+        app.session.rev(),
+        (&app.session.sel.anchor, &app.session.sel.focus),
+        app.ui.tab.as_str(),
+        app.has_document(),
+        crate::i18n::current().code(),
+        ctx.pixels_per_point().to_bits(),
+        ui.visuals().dark_mode,
+        app.canvas.scale.to_bits(),
+        crate::rtl::on(),
+        keytips,
+        app.session.math.is_some(),
+    ))
 }
 
 /// Width of the ribbon display button: the chevron and the options arrow.

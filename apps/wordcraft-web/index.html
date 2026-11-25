@@ -8,6 +8,34 @@
   <link data-trunk rel="rust" data-bin="wordcraft-web" data-wasm-opt="z" data-weak-refs />
   <!-- socket.io-client 4.8.1 for live editing, served by the relay's web root (same origin). -->
   <script src="/craft/vendor/socket.io.min.js"></script>
+  <script>
+    // The page renderer is built for WebAssembly SIMD, which every current browser has. A browser
+    // without it cannot load the module at all: say so, rather than stay on "Loading" (PERF2).
+    (function () {
+      var simd = false;
+      try {
+        // A function that returns i8x16.popcnt(i8x16.splat(0)).
+        simd = typeof WebAssembly === "object" && WebAssembly.validate(new Uint8Array([
+          0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]));
+      } catch (e) {}
+      if (simd) return;
+      window.wordcraftUnsupported = true;
+      var text = /^id\b/i.test(navigator.language || "")
+        ? "Peramban ini tidak dapat menjalankan WordCraft karena tidak mendukung WebAssembly SIMD. Perbarui peramban, atau buka berkas di peramban lain."
+        : "This browser cannot run WordCraft because it does not support WebAssembly SIMD. Update the browser, or open the file in another browser.";
+      document.addEventListener("DOMContentLoaded", function () {
+        var loading = document.getElementById("wordcraft_loading");
+        if (loading) {
+          loading.textContent = text;
+          loading.setAttribute("role", "alert");
+          loading.style.padding = "0 24px";
+          loading.style.textAlign = "center";
+        }
+        var canvas = document.getElementById("wordcraft_canvas");
+        if (canvas) canvas.style.display = "none";
+      });
+    })();
+  </script>
   <style>
     html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #e6e6e6; }
     #wordcraft_canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }

@@ -846,3 +846,12 @@ fn status_bar_texts_never_overlap_controls_on_cache_miss_with_single_pass() {
         }
     }
 }
+
+#[test]
+fn the_status_bar_recounts_at_most_every_half_second_while_the_document_changes() {
+    assert_eq!(recount_wait(None, 3.0), None, "never counted: count now");
+    assert_eq!(recount_wait(Some(3.0), 3.0 + COUNT_DEBOUNCE_SECS), None, "counted long enough ago");
+    let wait = recount_wait(Some(3.0), 3.2).expect("counted 0.2 s ago: wait");
+    assert!((wait - (COUNT_DEBOUNCE_SECS - 0.2)).abs() < 1e-9, "until half a second after the last count, not {wait}");
+    assert_eq!(recount_wait(Some(3.0), 2.0), None, "a clock that went back counts now");
+}
