@@ -1,5 +1,5 @@
 use super::state::DefaultApp;
-use super::{FileDialogAnswer, FileDialogRequest, WordApp, async_saves, paste_picture, printing, system_clipboard};
+use super::{assist, FileDialogAnswer, FileDialogRequest, WordApp, async_saves, paste_picture, printing, system_clipboard};
 
 /// Platform services injected by the host (file dialogs, file I/O).
 #[derive(Default)]
@@ -61,6 +61,9 @@ pub struct Services {
     /// itself, so New, Open and Close are hidden and refused, a dropped document is refused, and
     /// the Recent list is neither shown nor recorded.
     pub hosted: bool,
+    /// Web, hosted (`?host=parent`): the page's grammar check and AI help ([`assist`]). The desktop
+    /// app sets none, and everything stays off and hidden there.
+    pub assist: Option<assist::AssistHost>,
     /// Web, hosted (`?host=parent`): the document the page sends, kept apart from [`Self::inbox`]
     /// (the picker and drops), which may not open documents while hosted.
     pub host_open: Option<Inbox>,
