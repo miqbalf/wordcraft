@@ -533,6 +533,50 @@ fn redo_of_a_join_is_refused_when_bob_typed_in_the_paragraph_it_removes() {
     assert_eq!(texts(&a.s.doc), want, "nothing was redone");
     assert_eq!(texts(&b.s.doc), want, "Bob keeps his typing");
     assert_converged(&a, &b, "after a refused redo");
+    // The refused step is put back: Redo is still there, and runs once Bob takes his typing out.
+    select(&mut b, (1, 5), (1, 9));
+    assert!(b.run("text.delete", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(a.run("edit.redo", json!({})));
+    assert!(a.le.take_notices().is_empty());
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Helloworld"]);
+    assert_converged(&a, &b, "after the redo ran");
+}
+
+/// A Redo of several replica steps (a cut across two paragraphs) is checked as a whole: Bob
+/// typed in the paragraph the undo put back, so the Redo is refused, every time it is asked,
+/// with nothing sent; once Bob's typing is gone it runs (review round 3, M6).
+#[test]
+fn redo_of_a_cut_across_paragraphs_is_refused_and_kept() {
+    let (relay, mut a, mut b) = two(&["Hello world", "Second line"]);
+    select(&mut a, (0, 6), (1, 6));
+    assert!(a.run("edit.cut", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Hello  line"]);
+    assert!(a.run("edit.undo", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Hello world", "Second line"]);
+    b.end_of(1);
+    assert!(b.run("text.insert", json!({"text": " BOB"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    let want = ["Hello world", "Second line BOB"];
+    for ask in 0..2 {
+        let _ = a.run("edit.redo", json!({}));
+        assert_eq!(a.le.take_notices(), [REDO_TAKES_OTHERS], "ask {ask}");
+        settle(&relay, &mut [&mut a, &mut b]);
+        assert_eq!(texts(&a.s.doc), want, "ask {ask}: nothing was redone");
+        assert_eq!(texts(&b.s.doc), want, "ask {ask}: Bob keeps his typing");
+    }
+    assert_converged(&a, &b, "after refused redos");
+    select(&mut b, (1, 11), (1, 15));
+    assert!(b.run("text.delete", json!({})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert!(a.run("edit.redo", json!({})));
+    assert!(a.le.take_notices().is_empty());
+    settle(&relay, &mut [&mut a, &mut b]);
+    assert_eq!(texts(&b.s.doc), ["Hello  line"]);
+    assert_converged(&a, &b, "after the redo ran");
 }
 
 /// The file's bytes: a paragraph, a 2x2 table, a paragraph.
