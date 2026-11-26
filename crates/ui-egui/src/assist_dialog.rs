@@ -75,11 +75,37 @@ pub(crate) struct AssistDialog {
     /// The phase changed: a button takes the keyboard on the next frame (the first one once the
     /// answer is there, else Cancel or Close).
     focus: bool,
+    /// The buttons drawn last frame: label, screen rect, enabled (for `ui.inspect`).
+    buttons: Vec<(String, egui::Rect, bool)>,
 }
 
 impl AssistDialog {
     fn new(kind: Kind, phase: Phase, document: u64) -> AssistDialog {
-        AssistDialog { kind, phase, document, focus: true }
+        AssistDialog { kind, phase, document, focus: true, buttons: Vec::new() }
+    }
+
+    /// The modal as `ui.inspect` reports it: what it is, its phase, the text it shows (the
+    /// proposal or summary when ready, the sentence when it failed), and its buttons on screen.
+    pub(crate) fn inspect(&self) -> Value {
+        let kind = match self.kind {
+            Kind::Improve(_) => "improve",
+            Kind::Summary { .. } => "summary",
+        };
+        let (phase, text) = match &self.phase {
+            Phase::Waiting(_) => ("waiting", None),
+            Phase::Ready { shown, .. } => ("ready", Some(shown.as_str())),
+            Phase::Failed(why) => ("failed", Some(why.as_str())),
+        };
+        let original = match &self.kind {
+            Kind::Improve(Some(src)) => Some(src.original.as_str()),
+            _ => None,
+        };
+        let buttons: Vec<Value> = self
+            .buttons
+            .iter()
+            .map(|(label, r, on)| json!({"label": label, "rect": [r.left(), r.top(), r.width(), r.height()], "enabled": on}))
+            .collect();
+        json!({"kind": kind, "phase": phase, "text": text, "original": original, "buttons": buttons})
     }
 
     /// A Summary modal for `review.summarySource`'s answer `source`, waiting for request `id`.
@@ -364,6 +390,7 @@ fn body(ui: &mut Ui, d: &mut AssistDialog, can: Can) -> Option<Choice> {
     let ready = matches!(d.phase, Phase::Ready { .. });
     let focus = std::mem::take(&mut d.focus);
     let mut out = None;
+    let mut drawn: Vec<(String, egui::Rect, bool)> = Vec::new();
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         let (first, close) = match d.kind {
@@ -373,6 +400,8 @@ fn body(ui: &mut Ui, d: &mut AssistDialog, can: Can) -> Option<Choice> {
                     out = Some(Choice::Replace);
                 }
                 let cancel = button(ui, tl!("Cancel"), true, false);
+                drawn.push((tl!("Replace").to_string(), replace.rect, replace.enabled()));
+                drawn.push((tl!("Cancel").to_string(), cancel.rect, cancel.enabled()));
                 (replace, cancel)
             }
             Kind::Summary { .. } => {
@@ -380,10 +409,14 @@ fn body(ui: &mut Ui, d: &mut AssistDialog, can: Can) -> Option<Choice> {
                 if copy.clicked() {
                     out = Some(Choice::Copy);
                 }
-                if button(ui, tl!("Insert at Cursor"), ready && can.insert, false).clicked() {
+                let insert = button(ui, tl!("Insert at Cursor"), ready && can.insert, false);
+                if insert.clicked() {
                     out = Some(Choice::Insert);
                 }
                 let close = button(ui, tl!("Close"), true, false);
+                drawn.push((tl!("Copy").to_string(), copy.rect, copy.enabled()));
+                drawn.push((tl!("Insert at Cursor").to_string(), insert.rect, insert.enabled()));
+                drawn.push((tl!("Close").to_string(), close.rect, close.enabled()));
                 (copy, close)
             }
         };
@@ -394,6 +427,9 @@ fn body(ui: &mut Ui, d: &mut AssistDialog, can: Can) -> Option<Choice> {
             if first.enabled() { first.request_focus() } else { close.request_focus() }
         }
     });
+    if !ui.is_sizing_pass() {
+        d.buttons = drawn;
+    }
     out
 }
 

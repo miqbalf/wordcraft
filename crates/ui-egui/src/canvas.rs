@@ -201,6 +201,9 @@ pub struct CanvasState {
     pub context_menu_from_keys: bool,
     /// Where the context menu stands: the right-click point, or below the caret.
     pub context_menu_at: Option<Pos2>,
+    /// The open context menu's items last frame: shown label, the command an item runs and its
+    /// screen rect (for the control channel's `ui.inspect`, so a page script can click them).
+    pub(crate) menu_items: Vec<MenuItem>,
     /// The frame drawn around the equation being edited, on screen (its options strip opens the
     /// equation's menu).
     pub eq_options: Option<EquationFrame>,
@@ -447,6 +450,7 @@ impl Default for CanvasState {
             context_menu_open: false,
             context_menu_from_keys: false,
             context_menu_at: None,
+            menu_items: Vec::new(),
             eq_options: None,
             mini_anchor: None,
             mini_dismissed: None,
@@ -850,6 +854,22 @@ struct CanvasFinish<'a> {
 }
 
 /// What a window's own scrolling is measured against for Synchronous Scrolling (#322).
+/// One item of the open context menu, as `ui.inspect` reports it.
+#[derive(Clone, Debug)]
+pub(crate) struct MenuItem {
+    pub label: String,
+    pub command: String,
+    pub rect: Rect,
+    pub enabled: bool,
+}
+
+impl MenuItem {
+    pub(crate) fn json(&self) -> serde_json::Value {
+        let r = self.rect;
+        serde_json::json!({"label": self.label, "command": self.command, "rect": [r.left(), r.top(), r.width(), r.height()], "enabled": self.enabled})
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ScrollSync {
     /// The vertical offset the frame started from, the partner's scrolling included.
@@ -1495,6 +1515,7 @@ fn finish_canvas_frame(finish: CanvasFinish<'_>, out: egui::scroll_area::ScrollA
     let menu = crate::rtl::menu(&resp).open_bool(&mut shown);
     let menu = menu.at_position(app.canvas.context_menu_at.unwrap_or(out.inner_rect.left_top()));
     let with_toolbar = crate::mini_toolbar::context_menu_visible(app);
+    app.canvas.menu_items.clear();
     let menu = if with_toolbar { menu.frame(egui::Frame::NONE).close_behavior(egui::PopupCloseBehavior::IgnoreClicks) } else { menu };
     menu.show(|ui| {
         if with_toolbar {

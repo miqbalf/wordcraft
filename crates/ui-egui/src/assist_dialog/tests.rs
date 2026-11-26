@@ -522,7 +522,10 @@ fn inspect_reports_the_modal_text_and_buttons_where_a_click_lands() {
     let modal = modal_rect(&h).expect("the modal is on screen");
     for b in &buttons {
         let r = &b["rect"];
-        let c = egui::pos2((r[0].as_f64().unwrap_or(-1.0) + r[2].as_f64().unwrap_or(0.0) / 2.0) as f32, (r[1].as_f64().unwrap_or(-1.0) + r[3].as_f64().unwrap_or(0.0) / 2.0) as f32);
+        let c = egui::pos2(
+            (r[0].as_f64().unwrap_or(-1.0) + r[2].as_f64().unwrap_or(0.0) / 2.0) as f32,
+            (r[1].as_f64().unwrap_or(-1.0) + r[3].as_f64().unwrap_or(0.0) / 2.0) as f32,
+        );
         assert!(modal.contains(c), "{b} lies inside the modal {modal:?}");
         assert_eq!(b["enabled"], true, "{b}");
     }
@@ -564,7 +567,8 @@ fn inspect_lists_an_issues_suggestion_that_a_click_applies() {
     let mut h = harness(app);
     h.state_mut().run("ui.contextMenu", json!({})).unwrap();
     h.run_steps(1);
-    h.state_mut().canvas.context_issue = Some(json!({"kind": "grammar", "source": "remote", "rule": "HE_VERB_AGR", "message": "Agreement", "suggestions": ["goes"], "text": "go"}));
+    h.state_mut().canvas.context_issue =
+        Some(json!({"kind": "grammar", "source": "remote", "rule": "HE_VERB_AGR", "message": "Agreement", "suggestions": ["goes"], "text": "go"}));
     h.run_steps(3);
     let v = inspect(&mut h);
     let items = v["contextMenu"].as_array().cloned().unwrap_or_default();

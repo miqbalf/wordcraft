@@ -66,6 +66,18 @@ pub(crate) fn shows_ignore(issue: &serde_json::Value) -> bool {
     issue.get("kind").and_then(|k| k.as_str()) != Some("spelling") || issue.get("source").and_then(|k| k.as_str()) == Some("remote")
 }
 
+/// Notes a drawn item for `ui.inspect` (not in egui's sizing pass, where nothing is on screen).
+fn record(app: &mut WordApp, ui: &Ui, label: &str, command: &str, resp: &egui::Response) {
+    if !ui.is_sizing_pass() {
+        app.canvas.menu_items.push(super::MenuItem {
+            label: label.to_string(),
+            command: command.to_string(),
+            rect: resp.rect,
+            enabled: resp.enabled(),
+        });
+    }
+}
+
 pub(super) fn context_menu(app: &mut WordApp, ui: &mut Ui) {
     if app.session.math.is_some() {
         return equation_menu(app, ui);
@@ -74,7 +86,9 @@ pub(super) fn context_menu(app: &mut WordApp, ui: &mut Ui) {
     let item = |ui: &mut Ui, app: &mut WordApp, label: &str, id: &str, params: serde_json::Value| {
         let sc = crate::widgets::shortcut_text(app, id);
         let on = crate::widgets::enabled(app, id);
-        if ui.add_enabled(on, crate::rtl::menu_item(ui, tl!(label), &sc, 0.0)).clicked() {
+        let resp = ui.add_enabled(on, crate::rtl::menu_item(ui, tl!(label), &sc, 0.0));
+        record(app, ui, tl!(label), id, &resp);
+        if resp.clicked() {
             let _ = app.run(id, params);
             ui.close();
         }
@@ -90,7 +104,9 @@ pub(super) fn context_menu(app: &mut WordApp, ui: &mut Ui) {
             ui.label(egui::RichText::new(tl!("(no suggestions)")).italics());
         }
         for sgt in sugg {
-            if ui.button(egui::RichText::new(&sgt).strong()).clicked() {
+            let resp = ui.button(egui::RichText::new(&sgt).strong());
+            record(app, ui, &sgt, "review.applySuggestion", &resp);
+            if resp.clicked() {
                 let _ = app.run("review.applySuggestion", json!({"text": sgt}));
                 ui.close();
             }
