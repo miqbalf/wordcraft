@@ -239,9 +239,9 @@ pub fn hold_presses(ctx: &egui::Context, raw: &mut egui::RawInput) {
         raw.events.splice(0..0, held.events);
         return;
     }
-    let rects: Vec<Rect> = ctx.data(|d| d.get_temp::<Replayed>(replayed_id())).map_or_else(Vec::new, |r| {
-        r.0.values().filter(|(at, _)| at + 1 == frame).map(|(_, rect)| *rect).collect()
-    });
+    let rects: Vec<Rect> = ctx
+        .data(|d| d.get_temp::<Replayed>(replayed_id()))
+        .map_or_else(Vec::new, |r| r.0.values().filter(|(at, _)| at + 1 == frame).map(|(_, rect)| *rect).collect());
     if rects.is_empty() {
         return;
     }
