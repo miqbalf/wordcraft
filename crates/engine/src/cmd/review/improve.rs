@@ -36,6 +36,10 @@ pub const BLANK_LINE: &str = "Improve can't keep an empty line inside a paragrap
 /// Paragraphs are sent, and come back, separated by a blank line.
 const SEPARATOR: &str = "\n\n";
 
+/// The least an original must have to be found again after it moved: words and characters.
+const RELOCATE_MIN_WORDS: usize = 2;
+const RELOCATE_MIN_CHARS: usize = 12;
+
 /// Comparison table cells the word diff of one paragraph may fill.
 const DIFF_BUDGET: u64 = 1_000_000;
 
@@ -359,6 +363,11 @@ fn source_of(s: &Session, anchor: &Pos, focus: &Pos, original: &str) -> Result<S
         return Ok(src);
     }
     if original.is_empty() || original.contains(SEPARATOR) || original.trim() != original {
+        return Err(changed());
+    }
+    // A short original ("Yes.") could stand anywhere: only text of some length is taken as the
+    // same text moved.
+    if original.chars().count() < RELOCATE_MIN_CHARS || original.split_whitespace().count() < RELOCATE_MIN_WORDS {
         return Err(changed());
     }
     let mut found: Option<(Pos, Pos)> = None;
