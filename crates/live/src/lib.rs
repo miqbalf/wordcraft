@@ -109,8 +109,9 @@ use wordcraft_engine::{CmdError, Session};
 
 pub use map::{RECOVERED_STYLE, RECOVERED_STYLE_ID, assign_seed_pids, seed_blocks, seed_ids, write_pids};
 pub use session::{
-    Access, ENDED_KIND, LiveEditing, LiveFail, LiveStatus, NOTICE_KIND, PASTE_REFUSED, PASTED_AS_TEXT, PASTED_WITHOUT_FORMATTING, Peer, SAVED_KIND,
-    SERVICE_UID, SaveEvent, Tap, Word, document_from_state, paste_notice,
+    Access, ENDED_KIND, LIST_AND, LiveEditing, LiveFail, LiveNotice, LiveStatus, NOT_PASTED, NOTICE_KIND, PASTE_ITEM_CONTEXT, PASTE_REFUSED,
+    PASTED_AS_TEXT, PASTED_ITEMS, PASTED_WITHOUT_FORMATTING, PasteNotice, Peer, SAVED_KIND, SERVICE_UID, SaveEvent, Tap, Word, document_from_state,
+    paste_notice,
 };
 pub use shareable::{SHAREABLE, is_shareable};
 pub use unmerged::{FULL_TEXT, UNMERGED_TEXT, UnmergedCopy};

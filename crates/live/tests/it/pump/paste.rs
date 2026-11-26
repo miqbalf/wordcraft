@@ -2,7 +2,7 @@
 
 use wordcraft_doc::edit::Fragment;
 use wordcraft_doc::{Block, Document, InlineObject, Paragraph, StoryRef};
-use wordcraft_live::{PASTED_AS_TEXT, PASTED_WITHOUT_FORMATTING, paste_notice};
+use wordcraft_live::{PASTE_REFUSED, PASTED_AS_TEXT, PASTED_ITEMS, PASTED_WITHOUT_FORMATTING, PasteNotice, paste_notice};
 
 /// craft-live's notice for an Undo that would remove another editor's text.
 const UNDO_TAKES_OTHERS: &str = "Someone else has typed in what this Undo would remove, so it wasn't undone.";
@@ -302,7 +302,7 @@ fn the_notice_names_what_was_taken_out() {
         if !pasted {
             r["pasted"] = json!(false);
         }
-        paste_notice(&r)
+        paste_notice(&r).map(|n| n.english())
     };
     let f = false;
     let lost = |p: bool, t: bool, fi: bool, n: bool, fm: bool| json!({"pictures": p, "tables": t, "fields": fi, "notes": n, "formatting": fm});
@@ -317,11 +317,17 @@ fn the_notice_names_what_was_taken_out() {
         say(lost(true, true, f, f, true), true).as_deref(),
         Some("Pasted as text: pictures, tables and some formatting can't be shared while others are editing.")
     );
-    assert_eq!(say(lost(true, f, f, f, f), false).as_deref(), Some("Pictures can't be shared while others are editing, so nothing was pasted."));
+    assert_eq!(say(lost(true, f, f, f, f), false).as_deref(), Some("Nothing was pasted: pictures can't be shared while others are editing."));
     assert_eq!(
         say(lost(true, true, f, f, f), false).as_deref(),
-        Some("Pictures and tables can't be shared while others are editing, so nothing was pasted.")
+        Some("Nothing was pasted: pictures and tables can't be shared while others are editing.")
     );
+    // LI2 (W7 review I1): with nothing to name, no gap before "can't": the plain refusal.
+    assert_eq!(say(lost(f, f, f, f, true), false).as_deref(), Some(PASTE_REFUSED));
+    assert_eq!(say(lost(f, f, f, f, f), false).as_deref(), Some(PASTE_REFUSED));
+    // The window gets the parts, to translate each.
+    let r = json!({"lost": lost(true, f, true, f, true)});
+    assert_eq!(paste_notice(&r), Some(PasteNotice { template: PASTED_ITEMS, items: vec!["pictures", "fields", "some formatting"] }));
 }
 
 /// A copy of text with a bookmark in it (Word files are full of hidden ones) pastes with no
@@ -366,7 +372,7 @@ fn a_picture_alone_pastes_nothing_and_says_so() {
         select(&mut a, sel.0, sel.1);
         let kept = a.s.sel.clone();
         assert!(a.run("edit.paste", json!({})));
-        assert_eq!(a.le.take_notices(), ["Pictures can't be shared while others are editing, so nothing was pasted."]);
+        assert_eq!(a.le.take_notices(), ["Nothing was pasted: pictures can't be shared while others are editing."]);
         assert!(before.same_content(&a.s.doc), "nothing applied: {:?}", texts(&a.s.doc));
         assert_eq!(a.s.sel, kept, "the selection stays");
     }
@@ -777,7 +783,7 @@ fn paste_merge_and_paste_special_run_live() {
     let ids: Vec<String> = offered["formats"].as_array().unwrap().iter().map(|f| f["id"].as_str().unwrap().to_owned()).collect();
     assert!(!ids.contains(&"picture".to_owned()), "{ids:?}");
     assert!(a.run("edit.pasteSpecial", json!({"as": "picture", "picture": PIXEL})));
-    assert_eq!(a.le.take_notices(), ["Pictures can't be shared while others are editing, so nothing was pasted."]);
+    assert_eq!(a.le.take_notices(), ["Nothing was pasted: pictures can't be shared while others are editing."]);
     assert!(before.same_content(&a.s.doc));
     settle(&relay, &mut [&mut a, &mut b]);
     assert_converged(&a, &b, "after Paste Special");

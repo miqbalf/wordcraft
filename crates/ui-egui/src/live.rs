@@ -463,7 +463,7 @@ impl WordApp {
                 self.host_document = Some(link.document);
             }
         }
-        let mut notices: Vec<String> = link.editing.take_notices().iter().map(|n| tl!(n.as_str()).to_string()).collect();
+        let mut notices: Vec<String> = link.editing.take_live_notices().iter().map(live_notice_text).collect();
         if let LiveStatus::Live { saved_at: Some(etag) } = link.editing.status()
             && link.saved.as_ref().is_none_or(|(e, _)| e != etag)
         {
@@ -649,5 +649,59 @@ mod tests {
         let at = caret_of(&doc, &pos);
         assert_eq!(at, Some((7, 2)), "two chars in, not three bytes");
         assert_eq!(pos_of(&doc, &blocks_by_pid(&doc), 7, 2), Some(pos), "and back to the same byte");
+    }
+}
+
+/// A live notice in the interface language: a line is its own key; a paste's notice is put
+/// together from its template and items, each translated, so it reads whole in any language.
+pub fn live_notice_text(notice: &wordcraft_live::LiveNotice) -> String {
+    match notice {
+        wordcraft_live::LiveNotice::Text(line) => tl!(line.as_str()).to_string(),
+        wordcraft_live::LiveNotice::Paste(paste) => paste.compose(
+            |t| tl!(t).to_string(),
+            |item| crate::i18n::tc(wordcraft_live::PASTE_ITEM_CONTEXT, item).to_string(),
+            crate::i18n::fmt,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod paste_notice_tests {
+    use wordcraft_live::{LiveNotice, NOT_PASTED, PASTE_REFUSED, PASTED_ITEMS, PasteNotice};
+
+    use super::live_notice_text;
+    use crate::i18n::{Lang, set_current};
+
+    fn paste(template: &'static str, items: &[&'static str]) -> LiveNotice {
+        LiveNotice::Paste(PasteNotice { template, items: items.to_vec() })
+    }
+
+    /// LI2 (W7 review I1): a paste notice reads whole in English and in Indonesian, its items
+    /// and their joiner translated too, and a refusal with nothing to name has no gap.
+    #[test]
+    fn a_paste_notice_reads_whole_in_english_and_indonesian() {
+        set_current(Lang::EN);
+        assert_eq!(
+            live_notice_text(&paste(PASTED_ITEMS, &["pictures", "tables", "some formatting"])),
+            "Pasted as text: pictures, tables and some formatting can't be shared while others are editing."
+        );
+        assert_eq!(live_notice_text(&paste(NOT_PASTED, &["notes"])), "Nothing was pasted: notes can't be shared while others are editing.");
+        assert_eq!(live_notice_text(&paste(PASTE_REFUSED, &[])), PASTE_REFUSED);
+        assert_eq!(live_notice_text(&LiveNotice::Text("Reconnecting…".into())), "Reconnecting…");
+
+        set_current(Lang::from_code("id").expect("the Indonesian interface"));
+        assert_eq!(
+            live_notice_text(&paste(PASTED_ITEMS, &["pictures", "tables", "some formatting"])),
+            "Ditempel sebagai teks: gambar, tabel dan sebagian format tidak dapat dibagikan saat orang lain sedang menyunting."
+        );
+        assert_eq!(
+            live_notice_text(&paste(NOT_PASTED, &["fields", "notes"])),
+            "Tidak ada yang ditempel: medan dan catatan tidak dapat dibagikan saat orang lain sedang menyunting."
+        );
+        assert_eq!(
+            live_notice_text(&paste(PASTE_REFUSED, &[])),
+            "Hasil tempel ini tidak dapat dibagikan saat orang lain sedang menyunting, jadi tidak ada yang ditempel."
+        );
+        set_current(Lang::EN);
     }
 }

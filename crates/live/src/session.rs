@@ -62,40 +62,79 @@ pub const PASTED_AS_TEXT: &str = "Pasted as text: pictures and tables can't be s
 /// list the document lacks, a section break).
 pub const PASTED_WITHOUT_FORMATTING: &str = "Pasted without some formatting: it can't be shared while others are editing.";
 
-/// `items` as an English list: `a`, `a and b`, `a, b and c`.
-fn english_list(items: &[&str]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => (*one).to_owned(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+/// A line for the user ([`LiveEditing::take_live_notices`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LiveNotice {
+    /// An English line, the key of its translation.
+    Text(String),
+    /// A paste's notice, to compose in the window's language.
+    Paste(PasteNotice),
+}
+
+/// A paste that took nothing in, naming what live editing does not share.
+pub const NOT_PASTED: &str = "Nothing was pasted: {items} can't be shared while others are editing.";
+
+/// A paste that was kept to text, naming what was left out.
+pub const PASTED_ITEMS: &str = "Pasted as text: {items} can't be shared while others are editing.";
+
+/// How the last item joins a list of them: `{list}` is the items before it, joined by ", ".
+pub const LIST_AND: &str = "{list} and {last}";
+
+/// The translation context of a [`PasteNotice`]'s items (`pictures`, `tables`, …), so they do
+/// not take the wording of a capitalised label with the same letters.
+pub const PASTE_ITEM_CONTEXT: &str = "paste";
+
+/// The notice for a paste's result, as keys the window translates: a template, and the items
+/// that fill its `{items}` (none for a template without it). [`PasteNotice::english`] is the
+/// untranslated line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasteNotice {
+    /// [`NOT_PASTED`], [`PASTED_ITEMS`], [`PASTED_WITHOUT_FORMATTING`] or [`PASTE_REFUSED`].
+    pub template: &'static str,
+    /// What was left out, in [`PASTE_ITEM_CONTEXT`]: `pictures`, `tables`, `fields`, `notes`,
+    /// `some formatting`.
+    pub items: Vec<&'static str>,
+}
+
+impl PasteNotice {
+    /// The line, with `template` and `item` translating a template and an item, and `fill`
+    /// putting named values into a template (`{items}`, `{list}`, `{last}`).
+    pub fn compose(&self, template: impl Fn(&str) -> String, item: impl Fn(&str) -> String, fill: impl Fn(&str, &[(&str, &str)]) -> String) -> String {
+        let items: Vec<String> = self.items.iter().map(|i| item(i)).collect();
+        let list = match items.as_slice() {
+            [] => String::new(),
+            [one] => one.clone(),
+            [rest @ .., last] => fill(&template(LIST_AND), &[("list", &rest.join(", ")), ("last", last)]),
+        };
+        fill(&template(self.template), &[("items", &list)])
+    }
+
+    /// The line in English.
+    pub fn english(&self) -> String {
+        self.compose(str::to_owned, str::to_owned, |t, values| values.iter().fold(t.to_owned(), |t, (k, v)| t.replace(&format!("{{{k}}}"), v)))
     }
 }
 
 /// The notice for a paste's result, from what the engine's live filter took out (its `lost`
 /// and `pasted` keys, `wordcraft_engine::cmd::paste::Lost`); `None` when nothing the user
 /// would miss was taken out (only bookmarks or comment anchors, or nothing).
-pub fn paste_notice(result: &Value) -> Option<String> {
+pub fn paste_notice(result: &Value) -> Option<PasteNotice> {
     let lost = result.get("lost");
     let has = |k: &str| lost.and_then(|l| l.get(k)).and_then(Value::as_bool) == Some(true);
-    let kinds: Vec<&str> = [("pictures", "pictures"), ("tables", "tables"), ("fields", "fields"), ("notes", "notes")]
-        .into_iter()
-        .filter(|(k, _)| has(k))
-        .map(|(_, word)| word)
-        .collect();
+    let mut items: Vec<&'static str> = ["pictures", "tables", "fields", "notes"].into_iter().filter(|k| has(k)).collect();
     if result.get("pasted").and_then(Value::as_bool) == Some(false) {
-        let list = english_list(&kinds);
-        let mut chars = list.chars();
-        let list = chars.next().map(|c| c.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default();
-        return Some(format!("{list} can't be shared while others are editing, so nothing was pasted."));
+        // Nothing went in. With no picture, table, field or note to name (only formatting,
+        // bookmarks or comment anchors), the plain refusal says so.
+        let template = if items.is_empty() { PASTE_REFUSED } else { NOT_PASTED };
+        return Some(PasteNotice { template, items });
     }
-    if kinds.is_empty() {
-        return has("formatting").then(|| PASTED_WITHOUT_FORMATTING.to_owned());
+    if items.is_empty() {
+        return has("formatting").then_some(PasteNotice { template: PASTED_WITHOUT_FORMATTING, items });
     }
-    let mut items = kinds;
     if has("formatting") {
         items.push("some formatting");
     }
-    Some(format!("Pasted as text: {} can't be shared while others are editing.", english_list(&items)))
+    Some(PasteNotice { template: PASTED_ITEMS, items })
 }
 
 /// The notice when a paste still could not be shared: nothing of it was applied.
@@ -308,6 +347,8 @@ pub struct LiveEditing<H: Hub> {
     quiet_since: Option<f64>,
     /// How many checks ran ([`LiveEditing::verify`]), for the host's report and the tests.
     checks: u64,
+    /// Paste notices not taken yet ([`LiveEditing::take_live_notices`]).
+    pastes: Vec<PasteNotice>,
 }
 
 /// A clock both this link and its core read.
@@ -353,6 +394,7 @@ impl<H: Hub> LiveEditing<H> {
             verified_at: None,
             quiet_since: None,
             checks: 0,
+            pastes: Vec::new(),
         })
     }
 
@@ -496,7 +538,7 @@ impl<H: Hub> LiveEditing<H> {
             && let Ok(v) = &result
             && let Some(notice) = paste_notice(v)
         {
-            self.core.push_notice(notice);
+            self.pastes.push(notice);
         }
         result
     }
@@ -590,9 +632,20 @@ impl<H: Hub> LiveEditing<H> {
         self.core.edits_saved()
     }
 
-    /// Lines for the user since the last call, in plain English (untranslated).
+    /// Lines for the user since the last call, in plain English (untranslated). A window that
+    /// translates takes [`LiveEditing::take_live_notices`] instead.
     pub fn take_notices(&mut self) -> Vec<String> {
-        self.core.take_notices()
+        let mut lines = self.core.take_notices();
+        lines.extend(self.pastes.drain(..).map(|p| p.english()));
+        lines
+    }
+
+    /// Lines for the user since the last call, for a window that translates them: each is a
+    /// key, except a paste's, which comes as its parts ([`PasteNotice`]).
+    pub fn take_live_notices(&mut self) -> Vec<LiveNotice> {
+        let mut lines: Vec<LiveNotice> = self.core.take_notices().into_iter().map(LiveNotice::Text).collect();
+        lines.extend(self.pastes.drain(..).map(LiveNotice::Paste));
+        lines
     }
 
     /// Whether the link is live but no document service has been in the room for 15 s (it never
