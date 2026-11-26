@@ -92,6 +92,10 @@ impl Hub for DynHub {
     fn close(&mut self) {
         self.0.close();
     }
+
+    fn set_wake(&mut self, wake: &craft_collab::Wake) {
+        self.0.set_wake(wake);
+    }
 }
 
 /// What the host is told about the session (`live-state`).
@@ -691,6 +695,12 @@ mod paste_notice_tests {
         assert_eq!(live_notice_text(&LiveNotice::Text("Reconnecting…".into())), "Reconnecting…");
 
         if !crate::i18n::catalogs_embedded() {
+            // A gate that must prove the Indonesian text sets CRAFT_I18N_REQUIRED=1: skipping
+            // there would pass without running a single Indonesian assertion (LI2 review I1).
+            assert!(
+                std::env::var_os("CRAFT_I18N_REQUIRED").is_none_or(|v| v != "1"),
+                "CRAFT_I18N_REQUIRED=1 but the catalogs are not embedded (set CRAFT_I18N_DIR)"
+            );
             return;
         }
         set_current(crate::i18n::embedded_lang("id").expect("the Indonesian catalogs"));
@@ -707,5 +717,47 @@ mod paste_notice_tests {
             "Hasil tempel ini tidak dapat dibagikan saat orang lain sedang menyunting, jadi tidak ada yang ditempel."
         );
         set_current(Lang::EN);
+    }
+}
+
+#[cfg(test)]
+mod dyn_hub_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use craft_collab::{ClientMsg, Hub, ServerMsg, Wake};
+
+    use super::DynHub;
+
+    struct Inner(Rc<Cell<bool>>);
+
+    impl Hub for Inner {
+        fn send(&mut self, _: ClientMsg) -> craft_collab::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> Vec<ServerMsg> {
+            Vec::new()
+        }
+        fn connected(&self) -> bool {
+            true
+        }
+        fn set_token(&mut self, _: String) {}
+        fn set_space(&mut self, _: u32) {}
+        fn set_wake(&mut self, wake: &Wake) {
+            wake.fire();
+            self.0.set(true);
+        }
+    }
+
+    /// LI2 review M1: the boxed hub the window holds forwards the wake to the hub inside it.
+    #[test]
+    fn a_boxed_hub_forwards_the_wake_to_the_hub_inside() {
+        let (seen, fired) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+        let wake = Wake::default();
+        let f = fired.clone();
+        wake.set(move || f.set(true));
+        DynHub(Box::new(Inner(seen.clone()))).set_wake(&wake);
+        assert!(seen.get(), "the inner hub got set_wake");
+        assert!(fired.get(), "and the same wake");
     }
 }
