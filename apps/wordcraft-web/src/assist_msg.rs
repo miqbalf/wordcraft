@@ -13,17 +13,18 @@ const MAX_REPLACEMENTS: usize = 5;
 const MAX_REPLACEMENT_CHARS: usize = 200;
 const MAX_RULE_CHARS: usize = 200;
 const MAX_SPANS: usize = 2000;
-const MAX_ERROR_CHARS: usize = 64;
+/// The longest `ai-result` text in UTF-8 bytes: the page's summarize limit (`LIMITS.summarize`).
+const MAX_AI_TEXT_BYTES: usize = 204_800;
 
 /// Whether `kind` (a message's `type`) is one the app reads; the listener checks it before it
 /// serialises anything.
-pub fn wants(_kind: &str) -> bool {
-    true
+pub fn wants(kind: &str) -> bool {
+    matches!(kind.strip_prefix("wordcraft:"), Some("assist" | "proof-result" | "proof-failed" | "ai-result" | "ai-failed"))
 }
 
 /// Whether messages can be posted to `origin`: not an opaque one.
-pub fn usable_origin(_origin: &str) -> bool {
-    true
+pub fn usable_origin(origin: &str) -> bool {
+    !origin.is_empty() && origin != "null"
 }
 
 /// One message from the page, or `None` when it is not a usable assist message: another type or
@@ -33,9 +34,16 @@ pub fn parse(json: &str) -> Option<AssistIn> {
     let kind = v.get("type")?.as_str()?.strip_prefix("wordcraft:")?;
     match kind {
         "assist" => Some(AssistIn::Enabled { proof: v.get("proof")?.as_bool()?, ai: v.get("ai")?.as_bool()? }),
-        "proof-result" => Some(AssistIn::ProofResult { id: id(&v)?, reply: reply(&v)? }),
+        // A good id with a bad body fails that request now, instead of leaving it to time out.
+        "proof-result" => Some(match reply(&v) {
+            Some(reply) => AssistIn::ProofResult { id: id(&v)?, reply },
+            None => AssistIn::ProofFailed { id: id(&v)?, error: UNAVAILABLE.to_string() },
+        }),
         "proof-failed" => Some(AssistIn::ProofFailed { id: id(&v)?, error: error(&v)? }),
-        "ai-result" => Some(AssistIn::AiResult { id: id(&v)?, text: v.get("text")?.as_str()?.to_string() }),
+        "ai-result" => {
+            let text = v.get("text")?.as_str().filter(|t| t.len() <= MAX_AI_TEXT_BYTES)?;
+            Some(AssistIn::AiResult { id: id(&v)?, text: text.to_string() })
+        }
         "ai-failed" => Some(AssistIn::AiFailed { id: id(&v)?, error: error(&v)? }),
         _ => None,
     }
@@ -61,9 +69,12 @@ fn id(v: &Value) -> Option<String> {
     (!id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')).then(|| id.to_string())
 }
 
-/// The error code, cut short: the app maps any unknown code to "unavailable".
+const UNAVAILABLE: &str = "unavailable";
+
+/// The error code: one of the page's, and "unavailable" for any other string.
 fn error(v: &Value) -> Option<String> {
-    Some(v.get("error")?.as_str()?.chars().take(MAX_ERROR_CHARS).collect())
+    let code = v.get("error")?.as_str()?;
+    Some(if matches!(code, "busy" | "too_large" | "disabled" | "bad_request") { code } else { UNAVAILABLE }.to_string())
 }
 
 /// A non-negative whole number.

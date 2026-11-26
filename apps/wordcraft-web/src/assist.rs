@@ -9,7 +9,7 @@ use wasm_bindgen::closure::Closure;
 use web_sys::js_sys;
 use wordcraft_ui_egui::assist::{AssistInbox, AssistOut};
 
-use crate::assist_msg::{build, parse};
+use crate::assist_msg::{build, parse, usable_origin, wants};
 
 /// The poster to the framing parent, with its answers delivered to `inbox` (and `ctx` woken), or
 /// `None` on an unframed page or a parent on another origin.
@@ -20,6 +20,10 @@ pub fn connect(inbox: AssistInbox, ctx: egui::Context) -> Option<Box<dyn Fn(&Ass
         return None;
     }
     let origin = window.location().origin().ok()?;
+    // An opaque origin (a sandboxed frame) cannot be posted to: the feature stays off.
+    if !usable_origin(&origin) {
+        return None;
+    }
     // Reading another origin's location throws, which is `None` too.
     if parent.location().origin().ok()? != origin {
         return None;
@@ -31,7 +35,8 @@ pub fn connect(inbox: AssistInbox, ctx: egui::Context) -> Option<Box<dyn Fn(&Ass
         }
         let data = event.data();
         let Some(kind) = js_sys::Reflect::get(&data, &"type".into()).ok().and_then(|t| t.as_string()) else { return };
-        if !kind.starts_with("wordcraft:") {
+        // Nothing else is serialised: `wordcraft:open` carries a whole document.
+        if !wants(&kind) {
             return;
         }
         let Some(json) = js_sys::JSON::stringify(&data).ok().and_then(|s| s.as_string()) else { return };

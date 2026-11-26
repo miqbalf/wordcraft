@@ -52,6 +52,9 @@ pub struct AssistState {
     pub ai: bool,
     /// The last AI request id handed out.
     next_ai: u64,
+    /// Tells this page load's ids from an earlier one's: a reloaded app must never take the old
+    /// page's answer for its own request.
+    session: Option<String>,
     /// The AI request whose answer is wanted; any other answer is a cancelled or late one.
     waiting: Option<String>,
     /// The answer to the waiting request, until it is taken.
@@ -93,7 +96,13 @@ impl WordApp {
             AssistIn::Enabled { proof, ai } => {
                 self.assist.proof = proof;
                 self.assist.ai = ai;
+                let was = self.session.proof_remote.enabled();
                 self.session.proof_remote.set_enabled(proof);
+                if was && !proof {
+                    // Turning it off drops the remote results; a poll rebuilds the overlays
+                    // without them (it sends nothing while off).
+                    self.session.proof_poll(now);
+                }
                 if !ai {
                     self.assist.waiting = None;
                     self.assist.answer = None;
@@ -131,12 +140,22 @@ impl WordApp {
         if !self.assist_ai_on() {
             return Err("AI help is not available here".to_string());
         }
+        // The request that waited is replaced, even when the new one never leaves.
+        self.assist.waiting = None;
+        self.assist.answer = None;
+        let session = self
+            .assist
+            .session
+            .get_or_insert_with(|| {
+                let ms = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+                format!("{ms:x}")
+            })
+            .clone();
         let Some(host) = &self.services.assist else { return Err("AI help is not available here".to_string()) };
-        let id = format!("ai-{}", self.assist.next_ai + 1);
+        let id = format!("ai-{session}-{}", self.assist.next_ai + 1);
         (host.send)(&AssistOut::Ai { id: id.clone(), task, language, text })?;
         self.assist.next_ai += 1;
         self.assist.waiting = Some(id.clone());
-        self.assist.answer = None;
         Ok(id)
     }
 

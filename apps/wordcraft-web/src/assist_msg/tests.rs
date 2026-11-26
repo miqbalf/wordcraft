@@ -185,10 +185,19 @@ fn ai_result_text_is_capped_at_the_pages_summarize_limit() {
 #[test]
 fn host_error_codes_are_an_allow_list() {
     for code in ["busy", "unavailable", "too_large", "disabled", "bad_request"] {
-        assert_eq!(p(json!({"type": "wordcraft:ai-failed", "id": "a", "error": code})), Some(AssistIn::AiFailed { id: "a".into(), error: code.into() }));
+        assert_eq!(
+            p(json!({"type": "wordcraft:ai-failed", "id": "a", "error": code})),
+            Some(AssistIn::AiFailed { id: "a".into(), error: code.into() })
+        );
     }
-    assert_eq!(p(json!({"type": "wordcraft:ai-failed", "id": "a", "error": "<b>boom</b>"})), Some(AssistIn::AiFailed { id: "a".into(), error: "unavailable".into() }));
-    assert_eq!(p(json!({"type": "wordcraft:proof-failed", "id": "a", "error": "weird"})), Some(AssistIn::ProofFailed { id: "a".into(), error: "unavailable".into() }));
+    assert_eq!(
+        p(json!({"type": "wordcraft:ai-failed", "id": "a", "error": "<b>boom</b>"})),
+        Some(AssistIn::AiFailed { id: "a".into(), error: "unavailable".into() })
+    );
+    assert_eq!(
+        p(json!({"type": "wordcraft:proof-failed", "id": "a", "error": "weird"})),
+        Some(AssistIn::ProofFailed { id: "a".into(), error: "unavailable".into() })
+    );
 }
 
 /// M1: only the assist types are read from the page's messages at all.
