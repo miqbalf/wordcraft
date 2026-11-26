@@ -120,3 +120,48 @@ fn a_disabled_cache_runs_the_part_every_frame() {
     assert_eq!(ran.get(), 4);
     assert_eq!(counts(&ctx, id()), (0, 0), "a disabled cache keeps no books");
 }
+
+/// The delay until the next frame that a frame at `time` asked for.
+fn repaint_delay(ctx: &Context, time: f64, ran: &Cell<u32>) -> std::time::Duration {
+    let input = RawInput { time: Some(time), screen_rect: Some(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))), ..Default::default() };
+    let out = ctx.run_ui(input, |ui| {
+        egui::Panel::top("part").exact_size(40.0).show(ui, |ui| {
+            show(ui, id(), 7, |ui| {
+                ran.set(ran.get() + 1);
+                ui.label("Home");
+            });
+        });
+    });
+    let delay = out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or(std::time::Duration::MAX);
+    out.drop_without_applying_deltas();
+    delay
+}
+
+#[test]
+fn a_replay_asks_for_a_frame_when_its_recording_is_max_age_old() {
+    let (ctx, ran) = (on(), Cell::new(0));
+    frame(&ctx, 1.0, vec![], 7, "Home", &ran);
+    frame(&ctx, 1.2, vec![], 7, "Home", &ran);
+    assert_eq!(ran.get(), 2);
+    let delay = repaint_delay(&ctx, 1.5, &ran);
+    assert_eq!(ran.get(), 2, "replayed");
+    // Recorded at 1.2: the next frame is due at 2.2, 0.7 s after this one.
+    assert!(delay <= std::time::Duration::from_secs_f64(MAX_AGE - 0.3 + 0.01), "{delay:?}");
+    assert!(delay >= std::time::Duration::from_secs_f64(MAX_AGE - 0.3 - 0.01), "{delay:?}");
+}
+
+#[test]
+fn new_fonts_run_the_part_again() {
+    let (ctx, ran) = (on(), Cell::new(0));
+    for t in [1.0, 1.1, 1.2] {
+        frame(&ctx, t, vec![], 7, "Home", &ran);
+    }
+    assert_eq!(ran.get(), 2, "settled and replayed");
+    // A font arrives (a CJK fallback, a host font) with no input: the recorded glyphs point into
+    // the old atlas.
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.families.entry(egui::FontFamily::Proportional).or_default().reverse();
+    ctx.set_fonts(fonts);
+    frame(&ctx, 1.3, vec![], 7, "Home", &ran);
+    assert_eq!(ran.get(), 3, "the part ran with the new fonts");
+}

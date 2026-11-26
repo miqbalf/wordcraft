@@ -855,3 +855,35 @@ fn the_status_bar_recounts_at_most_every_half_second_while_the_document_changes(
     assert!((wait - (COUNT_DEBOUNCE_SECS - 0.2)).abs() < 1e-9, "until half a second after the last count, not {wait}");
     assert_eq!(recount_wait(Some(3.0), 2.0), None, "a clock that went back counts now");
 }
+
+/// The status bar's and the ribbon's cache keys this frame.
+fn keys(ctx: &egui::Context, a: &mut WordApp) -> (u64, u64) {
+    let mut k = (0, 0);
+    ctx.run_ui(egui::RawInput::default(), |ui| k = (status_key(a, ui), crate::ribbon::body_key(a, ui))).drop_without_applying_deltas();
+    k
+}
+
+#[test]
+fn the_cached_bars_rerun_when_state_beside_the_document_changes() {
+    let ctx = ctx();
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("One two")), crate::Services::default());
+    let start = keys(&ctx, &mut a);
+    assert_eq!(keys(&ctx, &mut a), start, "nothing changed: same keys");
+    let changes: [(&str, fn(&mut WordApp)); 3] = [
+        ("track changes", |a| a.session.doc.settings.track_changes = !a.session.doc.settings.track_changes),
+        ("overtype", |a| a.session.prefs.overtype = !a.session.prefs.overtype),
+        ("mail-merge recipients arriving", |a| a.recipient_list_pending = !a.recipient_list_pending),
+    ];
+    for (what, change) in changes {
+        let before = keys(&ctx, &mut a);
+        change(&mut a);
+        let after = keys(&ctx, &mut a);
+        assert_ne!(before.1, after.1, "the ribbon reruns after {what}");
+        if what != "mail-merge recipients arriving" {
+            assert_ne!(before.0, after.0, "the status bar reruns after {what}");
+        }
+    }
+    let before = keys(&ctx, &mut a);
+    crate::theme::apply(&ctx, crate::theme::Appearance::Dark);
+    assert_ne!(keys(&ctx, &mut a), before, "and after a theme change");
+}
