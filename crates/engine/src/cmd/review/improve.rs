@@ -390,13 +390,22 @@ fn source_of(s: &Session, anchor: &Pos, focus: &Pos, original: &str) -> Result<S
 }
 
 /// Where `needle` starts in `text` as whole words: every start, overlapping ones included, with
-/// no letter or digit just before or just after it (so "cat" is not found in "category").
+/// no letter or digit just before or just after it (so "cat" is not found in "category"). An
+/// apostrophe or a hyphen followed by a letter or digit continues the word ("we'll", "co-op"),
+/// so it is no boundary either.
 fn whole_word_matches(text: &str, needle: &str) -> Vec<usize> {
     let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let joiner = |c: Option<char>| matches!(c, Some('\'' | '\u{2019}' | '-' | '\u{2010}' | '\u{2011}'));
+    // The word goes on past the edge: a letter or digit next to it, or a joiner and then one.
+    let glued = |mut side: std::str::Chars<'_>, back: bool| {
+        let mut next = || if back { side.next_back() } else { side.next() };
+        let first = next();
+        word(first) || (joiner(first) && word(next()))
+    };
     text.char_indices()
         .map(|(i, _)| i)
         .filter(|&i| text[i..].starts_with(needle))
-        .filter(|&i| !word(text[..i].chars().next_back()) && !word(text[i + needle.len()..].chars().next()))
+        .filter(|&i| !glued(text[..i].chars(), true) && !glued(text[i + needle.len()..].chars(), false))
         .collect()
 }
 

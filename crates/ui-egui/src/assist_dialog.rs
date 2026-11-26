@@ -26,7 +26,10 @@ pub(crate) const DISABLED: &str = "AI writing help is turned off on this server.
 pub(crate) const BAD_REQUEST: &str = "The AI service could not read this request.";
 pub(crate) const TRUNCATED: &str = "Only the first 200 KB of the document was summarized.";
 const OFF: &str = "AI writing help is not available here.";
-const READ_ONLY: &str = "Improve with AI changes the text, and this document can't be edited here.";
+/// Why Improve is refused before anything is sent when Replace could not apply: a viewer, a
+/// protected document, a Markdown source view or a live link that takes no edits now. One sentence
+/// that is true for each of them.
+const READ_ONLY: &str = "Improve with AI is off here because this text can't be changed now.";
 
 /// The sentence for the page's error `code`; any code the app does not know is "unavailable".
 pub(crate) fn error_sentence(code: &str) -> &'static str {
