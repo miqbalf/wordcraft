@@ -9958,3 +9958,78 @@ fn the_autosave_format_block_points_at_the_switch_not_save_as() {
     assert!(!reason.contains("Save as"), "{reason}");
     assert!(reason.contains("Click AutoSave"), "{reason}");
 }
+
+/// A window on `text` where the remote checker flagged each `(word, kind, rule)`.
+fn remote_app(text: &str, flags: &[(&str, wordcraft_engine::proof_remote::RemoteKind, &str)]) -> WordApp {
+    use wordcraft_engine::proof_remote::{ProofReply, RemoteMatch};
+    let mut app = WordApp::new(Session::new(wordcraft_doc::Document::from_text(text)), crate::Services::default());
+    app.session.proof_remote.set_enabled(true);
+    let mut at = 0.0;
+    let request = loop {
+        if let Some(r) = app.session.proof_poll(at).send.into_iter().next() {
+            break r;
+        }
+        at += 250.0;
+        assert!(at < 10_000.0, "nothing was sent");
+    };
+    let matches = flags
+        .iter()
+        .map(|(word, kind, rule)| RemoteMatch {
+            offset: request.text.find(word).map_or(0, |b| request.text[..b].chars().count()),
+            length: word.chars().count(),
+            kind: *kind,
+            message: "Remote message".into(),
+            replacements: vec!["rug".into()],
+            rule: rule.to_string(),
+        })
+        .collect();
+    app.session.proof_receive(&request.id, Ok(ProofReply { matches, ..Default::default() }), at + 20_000.0);
+    app
+}
+
+/// Whether the open context menu has a button labelled `label`. A menu item's label carries its
+/// shortcut after it (empty for a command without one), so the label is compared trimmed.
+fn menu_has(h: &egui_kittest::Harness<WordApp>, label: &str) -> bool {
+    use egui_kittest::kittest::NodeT as _;
+    h.query_all_by_label_contains(label)
+        .any(|n| n.accesskit_node().role() == egui::accesskit::Role::Button && n.accesskit_node().label().is_some_and(|l| l.trim_end() == label))
+}
+
+fn open_menu_on(mut app: WordApp, word: &str) -> egui_kittest::Harness<'static, WordApp> {
+    app.run("select.text", json!({"text": word})).unwrap();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+        |ui, app: &mut WordApp| {
+            let ctx = ui.ctx().clone();
+            app.logic(&ctx);
+            app.ui(ui);
+        },
+        app,
+    );
+    for _ in 0..4 {
+        h.step();
+    }
+    h.state_mut().run("ui.contextMenu", json!({})).unwrap();
+    h.step();
+    h.step();
+    assert!(h.state().canvas.context_menu_open);
+    h
+}
+
+#[test]
+fn context_menu_shows_ignore_and_ignore_rule_for_grammar_and_ignore_all_for_builtin_spelling() {
+    use wordcraft_engine::proof_remote::RemoteKind::{Grammar, Spelling};
+    let text = "The cat sat on the brwn mat.";
+    // Grammar (remote): Ignore and Ignore Rule, no Ignore All.
+    let h = open_menu_on(remote_app(text, &[("cat", Grammar, "R_X")]), "cat");
+    assert!(menu_has(&h, "Ignore") && menu_has(&h, "Ignore Rule"), "grammar gets Ignore and Ignore Rule");
+    assert!(!menu_has(&h, "Ignore All") && !menu_has(&h, "Add to Dictionary"));
+    // Built-in spelling keeps Ignore All and Add to Dictionary only.
+    let h = open_menu_on(remote_app(text, &[("cat", Grammar, "R_X")]), "brwn");
+    assert!(menu_has(&h, "Ignore All") && menu_has(&h, "Add to Dictionary"));
+    assert!(!menu_has(&h, "Ignore") && !menu_has(&h, "Ignore Rule"), "no Ignore for a built-in spelling issue");
+    // Remote spelling: all four.
+    let h = open_menu_on(remote_app(text, &[("mat", Spelling, "MORFOLOGIK")]), "mat");
+    for label in ["Ignore", "Ignore Rule", "Ignore All", "Add to Dictionary"] {
+        assert!(menu_has(&h, label), "a remote spelling issue shows {label}");
+    }
+}

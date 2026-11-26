@@ -27,7 +27,7 @@ pub use improve::{
     ACROSS_CELLS, BLANK_LINE, EMPTY_DOCUMENT, HAS_CHANGES, HAS_OBJECTS, IMPROVE_MAX_BYTES, NO_TEXT, PARAGRAPHS_CHANGED, SUMMARIZE_MAX_BYTES,
     TEXT_CHANGED, TOO_LONG,
 };
-use proofing::{all_issues, issue_at, next_issue, suggestions, thesaurus, word_count};
+use proofing::{all_issues, ignore_issue, ignore_rule, issue_at, next_issue, suggestions, thesaurus, word_count};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -107,6 +107,9 @@ pub fn specs() -> Vec<CommandSpec> {
             }
             wordcraft_proof::add_word(w.trim());
             s.persist_user_dictionary(&[]);
+            // The word's remote spelling issues go at once, not at the next poll.
+            s.proof_remote.read_dictionary();
+            s.proof_refresh();
             s.relayout();
             Ok(json!({"added": w}))
         })
@@ -122,11 +125,21 @@ pub fn specs() -> Vec<CommandSpec> {
             // For this session only, as in Word: not added to (or saved with) the dictionary.
             if !w.trim().is_empty() {
                 wordcraft_proof::ignore_word(w.trim());
+                // The same word's remote spelling issues too, in this document.
+                let document = s.document_id();
+                s.proof_remote.ignore_word(document, w.trim());
+                s.proof_refresh();
             }
             s.relayout();
             Ok(json!({"ignored": w}))
         })
         .pure(),
+        CommandSpec::new("review.ignoreIssue", "Ignore", "Review › Proofing", ignore_issue)
+            .params(r#"{"pos"?: Pos} → {"ignored": rule} (this issue, while the paragraph's text stays the same; this viewer only)"#)
+            .pure(),
+        CommandSpec::new("review.ignoreRule", "Ignore Rule", "Review › Proofing", ignore_rule)
+            .params(r#"{"pos"?: Pos, "rule"?: string} → {"ignoredRule": rule} (every issue of the rule in this document; this viewer only)"#)
+            .pure(),
         CommandSpec::new("review.applySuggestion", "Change", "Review › Proofing", |s, v| {
             let text = p::req_str(v, "text")?.to_string();
             let at = s.sel.focus.clone();
@@ -142,6 +155,9 @@ pub fn specs() -> Vec<CommandSpec> {
             .pure(),
         CommandSpec::new("review.improveApply", "Improve with AI", "Review › Proofing", improve::improve_apply)
             .params(r#"{"anchor": Pos, "focus": Pos, "original": string (improveSource's text), "proposal": string (the improved text, paragraphs separated by a blank line)}"#),
+        CommandSpec::new("review.improvePreview", "Improve with AI", "Review › Proofing", improve::improve_preview)
+            .params(r#"{"anchor": Pos, "focus": Pos, "original"?: string, "proposal": string} → {"text": string (the proposal as improveApply puts it in, paragraphs separated by a blank line)}"#)
+            .pure(),
         CommandSpec::new("review.summarySource", "Summarize Document", "Review › Proofing", improve::summary_source)
             .params(r#"{} → {"text": string (the body's text), "language": string, "truncated": bool}"#)
             .pure(),

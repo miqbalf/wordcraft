@@ -36,6 +36,10 @@ pub const BLANK_LINE: &str = "Improve can't keep an empty line inside a paragrap
 /// Paragraphs are sent, and come back, separated by a blank line.
 const SEPARATOR: &str = "\n\n";
 
+/// The least an original must have to be found again after it moved: words and characters.
+const RELOCATE_MIN_WORDS: usize = 2;
+const RELOCATE_MIN_CHARS: usize = 12;
+
 /// Comparison table cells the word diff of one paragraph may fill.
 const DIFF_BUDGET: u64 = 1_000_000;
 
@@ -300,48 +304,113 @@ fn is_word_char(p: &Paragraph, i: usize, c: char) -> bool {
     if c.is_whitespace() || c == OBJ {
         return false;
     }
-    let props = p.props_of_char(i);
-    let symbol = props.sym_font.as_deref().is_some_and(|f| !f.trim().is_empty())
-        || props.font.as_deref().is_some_and(wordcraft_doc::symbol_fonts::is_symbol_font);
-    !symbol && !matches!(props.style.as_deref(), Some("FootnoteReference" | "EndnoteReference"))
+    !is_symbol_char(p, i) && !matches!(p.props_of_char(i).style.as_deref(), Some("FootnoteReference" | "EndnoteReference"))
 }
 
-/// The formatting of the text replacing `x..y`.
+/// Whether the character at `i` is in a symbol's own font (an old-style symbol font or a `w:sym`).
+fn is_symbol_char(p: &Paragraph, i: usize) -> bool {
+    let props = p.props_of_char(i);
+    props.sym_font.as_deref().is_some_and(|f| !f.trim().is_empty()) || props.font.as_deref().is_some_and(wordcraft_doc::symbol_fonts::is_symbol_font)
+}
+
+/// The formatting of the text replacing `x..y` (W4 ruling, F1 and F2).
 ///
-/// Text that replaces words takes the formatting of the first word it replaces, link included,
-/// as typing over a selection does: a rephrased bold word stays bold, a corrected word in a link
-/// stays in it. Inserted words take the formatting of the word before them (past white space,
-/// objects and symbols), without its link; at the paragraph's start, that of the text after.
+/// Text that replaces old text takes the formatting of the first character it replaces, link
+/// included, as typing over a selection does: a rephrased bold word stays bold, a corrected
+/// word or a changed space in a link stays in it. A word character comes first, so a symbol in
+/// its own font never gives that font to the new words; then plain white space. Inserted words
+/// (and a replaced range of symbols only) take the formatting of the word before them (past
+/// white space, objects and symbols), without its link; at the paragraph's start, that of the
+/// word after.
 fn props_for(p: &Paragraph, x: usize, y: usize) -> CharProps {
     let replaced = p.text.get(x..y).unwrap_or("");
-    if let Some((i, _)) = replaced.char_indices().find(|(_, c)| !c.is_whitespace()) {
+    let first = replaced
+        .char_indices()
+        .find(|(i, c)| is_word_char(p, x + i, *c))
+        .or_else(|| replaced.char_indices().find(|(i, c)| c.is_whitespace() && !is_symbol_char(p, x + i)));
+    if let Some((i, _)) = first {
         return typed(p.props_of_char(x + i).clone());
     }
     let before = p.text.get(..x).unwrap_or("");
     let word = before.char_indices().rev().find(|(i, c)| is_word_char(p, *i, *c)).map(|(i, _)| i);
-    let props = match word {
-        Some(i) => p.props_of_char(i),
-        None if x < p.len() => p.props_of_char(x),
-        None => p.props_at(x),
+    let after = || p.text.get(y..).unwrap_or("").char_indices().find(|(i, c)| is_word_char(p, y + i, *c)).map(|(i, _)| y + i);
+    let props = match word.or_else(after) {
+        Some(i) => p.props_of_char(i).clone(),
+        None if x < p.len() && !is_symbol_char(p, x) => p.props_of_char(x).clone(),
+        None => {
+            let mut c = p.props_at(x).clone();
+            if c.font.as_deref().is_some_and(wordcraft_doc::symbol_fonts::is_symbol_font) {
+                c.font = None;
+            }
+            c
+        }
     };
     typed(props.unlinked())
 }
 
-/// `review.improveApply`: replace the range's text with the proposal, word by word.
-pub(super) fn improve_apply(s: &mut Session, v: &Value) -> CmdResult {
-    let pos = |k: &str| v.get(k).and_then(parse_pos).ok_or_else(|| CmdError::Params(format!("`{k}` (Pos) is required")));
-    let (anchor, focus) = (pos("anchor")?, pos("focus")?);
-    let original = p::req_str(v, "original")?;
-    let proposal = p::req_str(v, "proposal")?;
+/// The source of `anchor..focus` when its text is still `original`. When edits elsewhere (a
+/// co-editor's paragraph above, words typed earlier in the paragraph) moved it, the one place in
+/// the story that holds `original` now as whole words, for a range within one paragraph;
+/// refused when the text changed or is there more than once (overlapping copies count).
+fn source_of(s: &Session, anchor: &Pos, focus: &Pos, original: &str) -> Result<Source, CmdError> {
     let changed = || CmdError::Failed(TEXT_CHANGED.into());
     let valid = |x: &Pos| s.doc.para_at(x).is_some_and(|q| x.off <= q.len() && q.text.is_char_boundary(x.off));
-    if !valid(&anchor) || !valid(&focus) {
+    if valid(anchor)
+        && valid(focus)
+        && let Ok(src) = source(s, anchor, focus)
+        && src.text == original
+    {
+        return Ok(src);
+    }
+    if original.is_empty() || original.contains(SEPARATOR) || original.trim() != original {
         return Err(changed());
     }
-    let src = source(s, &anchor, &focus).map_err(|_| changed())?;
+    // A short original ("Yes.") could stand anywhere: only text of some length is taken as the
+    // same text moved.
+    if original.chars().count() < RELOCATE_MIN_CHARS || original.split_whitespace().count() < RELOCATE_MIN_WORDS {
+        return Err(changed());
+    }
+    let mut found: Option<(Pos, Pos)> = None;
+    for path in s.doc.para_paths(anchor.story) {
+        let Some(para) = s.doc.para(anchor.story, &path) else { continue };
+        for off in whole_word_matches(&para.text, original) {
+            if found.is_some() {
+                return Err(changed());
+            }
+            let at = |off: usize| Pos { story: anchor.story, path: path.clone(), off };
+            found = Some((at(off), at(off + original.len())));
+        }
+    }
+    let (a, b) = found.ok_or_else(changed)?;
+    let src = source(s, &a, &b).map_err(|_| changed())?;
     if src.text != original {
         return Err(changed());
     }
+    Ok(src)
+}
+
+/// Where `needle` starts in `text` as whole words: every start, overlapping ones included, with
+/// no letter or digit just before or just after it (so "cat" is not found in "category"). An
+/// apostrophe or a hyphen at the edge, with a letter or digit beyond it, continues the word
+/// ("we'll", "co-op"), so it is no boundary either.
+fn whole_word_matches(text: &str, needle: &str) -> Vec<usize> {
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let joiner = |c: Option<char>| matches!(c, Some('\'' | '\u{2019}' | '-' | '\u{2010}' | '\u{2011}'));
+    // The word goes on past the edge: a letter or digit next to it, or a joiner and then one.
+    let glued = |mut side: std::str::Chars<'_>, back: bool| {
+        let mut next = || if back { side.next_back() } else { side.next() };
+        let first = next();
+        word(first) || (joiner(first) && word(next()))
+    };
+    text.char_indices()
+        .map(|(i, _)| i)
+        .filter(|&i| text[i..].starts_with(needle))
+        .filter(|&i| !glued(text[..i].chars(), true) && !glued(text[i + needle.len()..].chars(), false))
+        .collect()
+}
+
+/// The proposal as it will be put in, a text per part of `src`, or the refusal.
+fn prepared(s: &Session, src: &Source, proposal: &str) -> Result<Vec<String>, CmdError> {
     let pieces = proposal_paragraphs(proposal);
     if pieces.len() != src.parts.len() {
         return Err(CmdError::Failed(PARAGRAPHS_CHANGED.into()));
@@ -358,6 +427,33 @@ pub(super) fn improve_apply(s: &mut Session, v: &Value) -> CmdResult {
     if paras.iter().any(String::is_empty) {
         return Err(CmdError::Failed(PARAGRAPHS_CHANGED.into()));
     }
+    Ok(paras)
+}
+
+fn range_params(v: &Value) -> Result<(Pos, Pos), CmdError> {
+    let pos = |k: &str| v.get(k).and_then(parse_pos).ok_or_else(|| CmdError::Params(format!("`{k}` (Pos) is required")));
+    Ok((pos("anchor")?, pos("focus")?))
+}
+
+/// `review.improvePreview`: the proposal as `review.improveApply` would put it in (paragraphs
+/// separated by a blank line), or the refusal Replace would give. Changes nothing.
+pub(super) fn improve_preview(s: &mut Session, v: &Value) -> CmdResult {
+    let (anchor, focus) = range_params(v)?;
+    let proposal = p::req_str(v, "proposal")?;
+    let src = match v.get("original").and_then(Value::as_str) {
+        Some(original) => source_of(s, &anchor, &focus, original)?,
+        None => source(s, &anchor, &focus).map_err(|m| CmdError::Failed(m.into()))?,
+    };
+    Ok(json!({"text": prepared(s, &src, proposal)?.join(SEPARATOR)}))
+}
+
+/// `review.improveApply`: replace the range's text with the proposal, word by word.
+pub(super) fn improve_apply(s: &mut Session, v: &Value) -> CmdResult {
+    let (anchor, focus) = range_params(v)?;
+    let original = p::req_str(v, "original")?;
+    let proposal = p::req_str(v, "proposal")?;
+    let src = source_of(s, &anchor, &focus, original)?;
+    let paras = prepared(s, &src, proposal)?;
     let end_len = s.doc.para_at(&src.end).map(Paragraph::len).unwrap_or(0);
     s.goal_x = None;
     for (part, new) in src.parts.iter().zip(&paras).rev() {

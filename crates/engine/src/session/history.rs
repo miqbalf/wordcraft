@@ -187,6 +187,7 @@ impl Session {
         self.typing_open = false;
         // While live, the co-editing layer owns undo.
         if let Some(undone) = self.run_live_undo(false) {
+            self.proof_refresh();
             return undone;
         }
         // Undoing the automatic capitalisation's own step makes its word an exception; any
@@ -207,6 +208,8 @@ impl Session {
         // Undo swaps the whole body back: a composition belongs to the text it showed.
         self.note_body_replaced();
         self.refresh_math_session();
+        // The text that is back may hold ignores the overlays dropped meanwhile.
+        self.proof_refresh();
         self.touch();
         true
     }
@@ -226,6 +229,7 @@ impl Session {
     pub fn redo(&mut self) -> bool {
         self.typing_open = false;
         if let Some(redone) = self.run_live_undo(true) {
+            self.proof_refresh();
             return redone;
         }
         let Some(u) = self.redo.pop().map(Arc::unwrap_or_clone) else { return false };
@@ -239,6 +243,7 @@ impl Session {
         self.history.push(Arc::new(cur));
         self.note_body_replaced();
         self.refresh_math_session();
+        self.proof_refresh();
         self.touch();
         true
     }

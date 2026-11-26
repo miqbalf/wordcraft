@@ -377,3 +377,219 @@ fn language_is_w2_text_language_english_and_indonesian_counting_together() {
     assert_eq!(s.run("review.improveSource", &json!({})).unwrap()["language"], "fr-FR");
     assert_eq!(s.run("review.summarySource", &json!({})).unwrap()["language"], "fr-FR");
 }
+
+/// W4 ruling (F2): replaced text takes the first replaced character's formatting with its link,
+/// white space included, so a changed space inside a link keeps one link.
+#[test]
+fn a_whitespace_change_inside_a_link_keeps_one_link() {
+    let mut s = session(&["click\there now"]);
+    format(&mut s, 0, 0, 10, &|c| c.link = Some("https://example.com".into()));
+    improve(&mut s, "click here now").unwrap();
+    let p = para(&s, 0);
+    assert_eq!(p.text, "click here now");
+    let end = find(p, "here") + 4;
+    for i in 0..end {
+        assert!(p.props_of_char(i).link.is_some(), "byte {i} of \"click here\" is still in the link");
+    }
+    assert!(p.props_of_char(find(p, "now")).link.is_none());
+}
+
+/// W4 ruling (F1): a replaced character in a legacy symbol font does not give that font to the
+/// new words; the first replaced word character does, and with none the insertion rule applies.
+#[test]
+fn a_replaced_symbol_font_character_does_not_give_its_font() {
+    let symbol = |c: &mut CharProps| c.font = Some("Wingdings".into());
+    // The symbol starts a replaced word: the word's next characters give the formatting.
+    let mut s = session(&["xDone now"]);
+    format(&mut s, 0, 0, 1, &symbol);
+    format(&mut s, 0, 1, 5, &|c| c.bold = Some(true));
+    improve(&mut s, "Finished now").unwrap();
+    let p = para(&s, 0);
+    assert_eq!(p.text, "Finished now");
+    let f = p.props_of_char(0);
+    assert_ne!(f.font.as_deref(), Some("Wingdings"), "no symbol font");
+    assert_eq!(f.bold, Some(true), "the first replaced word character's formatting");
+    // Only a symbol is replaced: the new word is not in the symbol font either.
+    let mut s = session(&["x Done"]);
+    format(&mut s, 0, 0, 1, &symbol);
+    improve(&mut s, "Ok Done").unwrap();
+    let p = para(&s, 0);
+    assert_eq!(p.text, "Ok Done");
+    assert_ne!(p.props_of_char(0).font.as_deref(), Some("Wingdings"));
+}
+
+/// W6 shows the proposal as it will be applied: a reply wrapped at a fixed width reads as one
+/// line, and a reply with another paragraph count is refused before Replace.
+#[test]
+fn improve_preview_is_the_text_as_it_will_be_applied() {
+    let mut s = session(&["Teh cat sat on teh mat."]);
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    let preview = |s: &mut Session, proposal: &str| {
+        s.run("review.improvePreview", &json!({"anchor": src["anchor"], "focus": src["focus"], "proposal": proposal}))
+    };
+    let shown = preview(&mut s, "The cat sat\non the mat.\u{7}").unwrap();
+    let before = s.doc.clone();
+    assert_eq!(shown["text"], "The cat sat on the mat.");
+    assert!(s.doc.same_content(&before), "a preview changes nothing");
+    improve(&mut s, "The cat sat\non the mat.\u{7}").unwrap();
+    assert_eq!(para(&s, 0).text, shown["text"].as_str().unwrap_or(""), "what was shown is what was applied");
+    let mut s = session(&["Teh cat sat."]);
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    let r = s.run("review.improvePreview", &json!({"anchor": src["anchor"], "focus": src["focus"], "proposal": "The cat.\n\nIt sat."}));
+    assert_eq!(failed(r), PARAGRAPHS_CHANGED);
+}
+
+/// M8: a co-editor's edit above the range moves it; the same text is found again and replaced.
+#[test]
+fn replace_after_an_edit_above_finds_the_text_again() {
+    let mut s = session(&["Intro.", "Teh cat sat."]);
+    select(&mut s, (1, 0), (1, 0));
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    // A paragraph above, and words typed earlier in a paragraph above.
+    select(&mut s, (0, 0), (0, 0));
+    s.run("text.insert", &json!({"text": "Zero.", "paragraphs": true})).unwrap();
+    s.run("text.newParagraph", &json!({})).unwrap();
+    let apply = |s: &mut Session| {
+        s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "The cat sat."}))
+    };
+    apply(&mut s).unwrap();
+    let texts: Vec<String> = s.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.text.clone()).collect();
+    assert_eq!(texts, ["Zero.", "Intro.", "The cat sat."]);
+    // Inside the same paragraph, before the range.
+    let mut s = session(&["Teh cat sat on teh mat."]);
+    select(&mut s, (0, 4), (0, 23));
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    assert_eq!(src["text"], "cat sat on teh mat.");
+    select(&mut s, (0, 0), (0, 0));
+    s.run("text.insert", &json!({"text": "So "})).unwrap();
+    s.run(
+        "review.improveApply",
+        &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "cat sat on the mat."}),
+    )
+    .unwrap();
+    assert_eq!(para(&s, 0).text, "So Teh cat sat on the mat.");
+}
+
+/// M8: the text is found again only when it is there once; otherwise nothing is replaced.
+#[test]
+fn a_moved_range_whose_text_is_there_twice_is_refused() {
+    let mut s = session(&["Intro.", "Teh cat sat."]);
+    select(&mut s, (1, 0), (1, 0));
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    select(&mut s, (0, 0), (0, 0));
+    s.run("text.insert", &json!({"text": "Teh cat sat.", "paragraphs": true})).unwrap();
+    s.run("text.newParagraph", &json!({})).unwrap();
+    let before = s.doc.clone();
+    let r =
+        s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "The cat sat."}));
+    assert_eq!(failed(r), TEXT_CHANGED);
+    assert!(s.doc.same_content(&before));
+}
+
+/// Fix 2, F1: a moved range is found again only as whole words. A deleted "cat" whose text is
+/// left only inside "category" is refused, never written into that word.
+#[test]
+fn a_moved_range_is_found_again_only_as_whole_words() {
+    let mut s = session(&["Intro.", "The cat sat.", "A category."]);
+    select(&mut s, (1, 4), (1, 7));
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    assert_eq!(src["text"], "cat");
+    s.doc.body.remove(1);
+    let before = s.doc.clone();
+    let r = s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "kitten"}));
+    assert_eq!(failed(r), TEXT_CHANGED);
+    assert!(s.doc.same_content(&before), "\"category\" is left alone");
+    // As a whole word elsewhere, once, it is found again.
+    let mut s = session(&["Intro.", "The cat sat.", "A fat cat sat here."]);
+    select(&mut s, (2, 2), (2, 18));
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    assert_eq!(src["text"], "fat cat sat here");
+    s.doc.body.remove(1);
+    s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "fat cat sits here"}))
+        .unwrap();
+    assert_eq!(para(&s, 1).text, "A fat cat sits here.");
+}
+
+/// Fix 2, F2: overlapping copies count as two, so the text is not taken as unique.
+#[test]
+fn overlapping_copies_of_a_moved_range_are_counted() {
+    let mut s = session(&["Intro.", "la la la la la"]);
+    select(&mut s, (1, 0), (1, 0));
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    assert_eq!(src["text"], "la la la la la");
+    s.doc.body[1] = para_block(Paragraph::with_text("la la la la la la", CharProps::default()));
+    s.doc.body.insert(0, para_block(Paragraph::with_text("Zero.", CharProps::default())));
+    let before = s.doc.clone();
+    let r = s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "Ha, ha."}));
+    assert_eq!(failed(r), TEXT_CHANGED);
+    assert!(s.doc.same_content(&before));
+}
+
+/// Fix 2: only an original of at least 2 words and 12 characters is found again when it moved;
+/// a short one ("Yes.") could stand anywhere, so it is refused.
+#[test]
+fn a_short_moved_original_is_refused() {
+    for short in ["Yes.", "Extraordinarily."] {
+        let mut s = session(&["Intro.", short]);
+        select(&mut s, (1, 0), (1, 0));
+        let src = s.run("review.improveSource", &json!({})).unwrap();
+        assert_eq!(src["text"], short);
+        s.doc.body.insert(0, para_block(Paragraph::with_text("Zero.", CharProps::default())));
+        let before = s.doc.clone();
+        let r = s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "Sure."}));
+        assert_eq!(failed(r), TEXT_CHANGED, "{short}");
+        assert!(s.doc.same_content(&before));
+    }
+}
+
+/// Replace after the original's paragraph is deleted, with `rest` after it: each copy in `rest`
+/// sits elsewhere than the original did, so only relocation can find it. A refusal changes
+/// nothing.
+fn relocate(original_para: &str, original: &str, rest: &[&str]) -> Result<Value, CmdError> {
+    let mut paras = vec!["Intro.", original_para];
+    paras.extend_from_slice(rest);
+    let mut s = session(&paras);
+    let from = original_para.find(original).expect("the original is in its paragraph");
+    assert!(rest.iter().all(|r| r.get(from..from + original.len()) != Some(original)), "no copy at the old place");
+    select(&mut s, (1, from), (1, from + original.len()));
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    assert_eq!(src["text"], original);
+    s.doc.body.remove(1);
+    let before = s.doc.clone();
+    let r = s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "Changed."}));
+    if r.is_err() {
+        assert!(s.doc.same_content(&before), "a refusal changes nothing");
+    }
+    r
+}
+
+/// Fix 2 review F1: an original long enough to be relocated (2 words and 12 characters) whose
+/// only other copy is glued to a letter or a digit, before or after, is refused: the boundary
+/// check alone refuses it.
+#[test]
+fn a_long_moved_original_inside_longer_words_is_refused() {
+    let original = "fat cat sat here";
+    for glued in ["A defat cat sat here.", "The fat cat sat herein.", "Room 9fat cat sat here.", "And a fat cat sat here7 times."] {
+        assert_eq!(failed(relocate("A fat cat sat here.", original, &[glued])), TEXT_CHANGED, "{glued}");
+    }
+    // The same text standing alone is found again.
+    relocate("A fat cat sat here.", original, &["Then a fat cat sat here, too."]).unwrap();
+}
+
+/// Fix 2 review F3: an apostrophe or a hyphen between letters joins a word ("we'll", "co-op"),
+/// so a moved original that stops at one is not found there.
+#[test]
+fn an_apostrophe_or_hyphen_inside_a_word_is_not_a_word_boundary() {
+    for (original, glued) in [
+        ("then they said we", "And then they said we'll go."),
+        ("then they said we", "And then they said we\u{2019}ll go."),
+        ("we joined the co", "Last year we joined the co-op."),
+        ("op members voted", "The co-op members voted."),
+        ("ll go home soon", "Then we'll go home soon."),
+    ] {
+        assert_eq!(failed(relocate(&format!("So {original}."), original, &[glued])), TEXT_CHANGED, "{glued}");
+    }
+    // A hyphen or an apostrophe with a space beside it is still a boundary.
+    relocate("So then they said we.", "then they said we", &["And then they said we - twice."]).unwrap();
+    relocate("So then they said we.", "then they said we", &["'And then they said we' twice."]).unwrap();
+}

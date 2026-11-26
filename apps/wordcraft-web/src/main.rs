@@ -16,6 +16,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(any(target_arch = "wasm32", test))]
+mod assist_msg;
+#[cfg(any(target_arch = "wasm32", test))]
 mod live_ticket;
 #[cfg(any(target_arch = "wasm32", test))]
 mod prefs;
@@ -24,6 +26,8 @@ mod save_fallback;
 
 #[cfg(target_arch = "wasm32")]
 mod api;
+#[cfg(target_arch = "wasm32")]
+mod assist;
 #[cfg(target_arch = "wasm32")]
 mod host;
 #[cfg(target_arch = "wasm32")]

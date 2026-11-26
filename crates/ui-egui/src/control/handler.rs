@@ -30,6 +30,9 @@ pub fn inspect(app: &mut WordApp, ctx: &egui::Context) -> Value {
         "caret": caret,
         "balloons": app.canvas.balloon_rects.iter().map(|(id, r)| json!({"id": id, "rect": [r.left(), r.top(), r.width(), r.height()]})).collect::<Vec<_>>(),
         "balloon": app.canvas.balloon,
+        // The open context menu's items and the AI modal, with screen rects, for page scripts.
+        "contextMenu": app.canvas.context_menu_open.then(|| app.canvas.menu_items.iter().map(crate::canvas::MenuItem::json).collect::<Vec<_>>()),
+        "assist": app.assist.dialog.as_ref().map(crate::assist_dialog::AssistDialog::inspect),
         "focused": app.canvas.focused,
         "title": app.title_stem(),
         "dirty": app.session.dirty,

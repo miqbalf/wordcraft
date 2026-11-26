@@ -24,6 +24,8 @@ macro_rules! tl {
 
 pub mod a11y;
 pub mod a11y_pane;
+pub mod assist;
+mod assist_dialog;
 pub mod async_saves;
 pub mod autoscroll;
 pub mod backstage;
@@ -762,6 +764,8 @@ pub struct WordApp {
     /// The documents (by id) the missing-fonts download box has been considered for
     /// ([`font_download::tick`]), in every window.
     pub(crate) font_notice_seen: Vec<u64>,
+    /// The state of the host's grammar and AI help ([`assist`]).
+    pub(crate) assist: assist::AssistState,
     /// Whether that box comes up by itself ([`WordApp::tell_about_font_downloads`]).
     pub(crate) font_notices: bool,
     /// Web: a host page has offered fonts that are still being fetched ([`WordApp::host_fonts_coming`]):

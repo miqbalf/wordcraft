@@ -17,6 +17,14 @@ pub(super) fn review(app: &mut WordApp, ui: &mut Ui) {
             );
         });
     });
+    // Only where the host page offers AI writing help.
+    if app.assist_ai_on() {
+        group(ui, "Writing Help", None, app, |ui, app| {
+            let r = big(ui, app, "summarize", "Summarize\nDocument", "ui.summarize", json!({}), false);
+            let (on, name) = (crate::widgets::enabled(app, "ui.summarize"), tl!("Summarize Document"));
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, on, name));
+        });
+    }
     group(ui, "Speech", None, app, |ui, app| {
         big(ui, app, "readAloud", "Read\nAloud", "review.readAloud", json!({}), false);
     });
