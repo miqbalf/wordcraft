@@ -456,13 +456,18 @@ fn replace_after_an_edit_above_finds_the_text_again() {
     let texts: Vec<String> = s.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.text.clone()).collect();
     assert_eq!(texts, ["Zero.", "Intro.", "The cat sat."]);
     // Inside the same paragraph, before the range.
-    let mut s = session(&["Teh cat sat."]);
-    select(&mut s, (0, 4), (0, 12));
+    let mut s = session(&["Teh cat sat on teh mat."]);
+    select(&mut s, (0, 4), (0, 23));
     let src = s.run("review.improveSource", &json!({})).unwrap();
+    assert_eq!(src["text"], "cat sat on teh mat.");
     select(&mut s, (0, 0), (0, 0));
     s.run("text.insert", &json!({"text": "So "})).unwrap();
-    s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "cat sits."})).unwrap();
-    assert_eq!(para(&s, 0).text, "So Teh cat sits.");
+    s.run(
+        "review.improveApply",
+        &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "cat sat on the mat."}),
+    )
+    .unwrap();
+    assert_eq!(para(&s, 0).text, "So Teh cat sat on the mat.");
 }
 
 /// M8: the text is found again only when it is there once; otherwise nothing is replaced.
@@ -495,25 +500,44 @@ fn a_moved_range_is_found_again_only_as_whole_words() {
     assert_eq!(failed(r), TEXT_CHANGED);
     assert!(s.doc.same_content(&before), "\"category\" is left alone");
     // As a whole word elsewhere, once, it is found again.
-    let mut s = session(&["Intro.", "The cat sat.", "A cat."]);
-    select(&mut s, (2, 2), (2, 5));
+    let mut s = session(&["Intro.", "The cat sat.", "A fat cat sat here."]);
+    select(&mut s, (2, 2), (2, 18));
     let src = s.run("review.improveSource", &json!({})).unwrap();
+    assert_eq!(src["text"], "fat cat sat here");
     s.doc.body.remove(1);
-    s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "kitten"})).unwrap();
-    assert_eq!(para(&s, 1).text, "A kitten.");
+    s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "fat cat sits here"}))
+        .unwrap();
+    assert_eq!(para(&s, 1).text, "A fat cat sits here.");
 }
 
 /// Fix 2, F2: overlapping copies count as two, so the text is not taken as unique.
 #[test]
 fn overlapping_copies_of_a_moved_range_are_counted() {
-    let mut s = session(&["Intro.", "ha ha"]);
+    let mut s = session(&["Intro.", "la la la la la"]);
     select(&mut s, (1, 0), (1, 0));
     let src = s.run("review.improveSource", &json!({})).unwrap();
-    assert_eq!(src["text"], "ha ha");
-    s.doc.body[1] = para_block(Paragraph::with_text("ha ha ha", CharProps::default()));
+    assert_eq!(src["text"], "la la la la la");
+    s.doc.body[1] = para_block(Paragraph::with_text("la la la la la la", CharProps::default()));
     s.doc.body.insert(0, para_block(Paragraph::with_text("Zero.", CharProps::default())));
     let before = s.doc.clone();
     let r = s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "Ha, ha."}));
     assert_eq!(failed(r), TEXT_CHANGED);
     assert!(s.doc.same_content(&before));
+}
+
+/// Fix 2: only an original of at least 2 words and 12 characters is found again when it moved;
+/// a short one ("Yes.") could stand anywhere, so it is refused.
+#[test]
+fn a_short_moved_original_is_refused() {
+    for short in ["Yes.", "Extraordinarily."] {
+        let mut s = session(&["Intro.", short]);
+        select(&mut s, (1, 0), (1, 0));
+        let src = s.run("review.improveSource", &json!({})).unwrap();
+        assert_eq!(src["text"], short);
+        s.doc.body.insert(0, para_block(Paragraph::with_text("Zero.", CharProps::default())));
+        let before = s.doc.clone();
+        let r = s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "Sure."}));
+        assert_eq!(failed(r), TEXT_CHANGED, "{short}");
+        assert!(s.doc.same_content(&before));
+    }
 }
