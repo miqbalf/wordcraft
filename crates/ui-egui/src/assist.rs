@@ -108,6 +108,7 @@ impl WordApp {
                 if !ai {
                     self.assist.waiting = None;
                     self.assist.answer = None;
+                    self.assist.dialog = None;
                 }
             }
             AssistIn::ProofResult { id, reply } => self.session.proof_receive(&id, Ok(reply), now),
@@ -159,6 +160,12 @@ impl WordApp {
         self.assist.next_ai += 1;
         self.assist.waiting = Some(id.clone());
         Ok(id)
+    }
+
+    /// Drops the request that waits and its answer (the modal was closed).
+    pub(crate) fn assist_forget(&mut self) {
+        self.assist.waiting = None;
+        self.assist.answer = None;
     }
 
     /// The answer to request `id`, once it came (the error is the page's code). Taken once.

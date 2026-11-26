@@ -350,6 +350,7 @@ fn controls(tab: &str) -> Vec<Control> {
             c("Spelling & Grammar", "review.spelling"),
             c("Thesaurus", "review.thesaurus"),
             d("Word Count", "wordCount"),
+            c("Summarize Document", "ui.summarize"),
             c("Read Aloud", "review.readAloud"),
             c("Check Accessibility", "file.accessibility"),
             c("Translate", "review.translate"),

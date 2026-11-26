@@ -32,6 +32,8 @@ pub fn enabled(app: &WordApp, id: &str) -> bool {
         None if id.starts_with("ui.zotero.") => app.zotero.busy.is_none() && !cfg!(target_arch = "wasm32"),
         None if id == "ui.linkTextBox" => enabled(app, "shape.link"),
         None if id == "ui.crop" => crate::crop::can_toggle(app),
+        // Only where the host page offers AI writing help.
+        None if matches!(id, "ui.improve" | "ui.summarize") => app.assist_ai_on(),
         None => id.starts_with("ui."),
     }
 }

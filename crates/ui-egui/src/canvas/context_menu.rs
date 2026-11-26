@@ -106,6 +106,11 @@ pub(super) fn context_menu(app: &mut WordApp, ui: &mut Ui) {
         }
         ui.separator();
     }
+    // Only where the host page offers AI writing help.
+    if app.assist_ai_on() {
+        item(ui, app, "Improve with AI", "ui.improve", json!({}));
+        ui.separator();
+    }
     item(ui, app, "Cut", "edit.cut", json!({}));
     item(ui, app, "Copy", "edit.copy", json!({}));
     // How to paste, chosen before pasting (#2583): the ribbon's Paste menu, item for item. Paste

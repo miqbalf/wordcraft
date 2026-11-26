@@ -800,6 +800,9 @@ impl WordApp {
                 self.pick_picture();
                 json!({"pending": self.change_picture_target.is_some()})
             }
+            // Improve with AI and Summarize Document: the host page's AI, in a modal (W6).
+            "ui.improve" => return Some(self.assist_improve()),
+            "ui.summarize" => return Some(self.assist_summarize()),
             // The page's context menu at the caret, as Shift+F10 or the Menu key opens it (#821).
             "ui.contextMenu" => {
                 self.canvas.context_menu_from_keys = true;

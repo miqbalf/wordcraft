@@ -919,6 +919,13 @@ fn paint_draw_to_review(pen: &Pen, name: &str) -> bool {
             pen.text(10.0, 9.5, 8.0, "Aa", a, true);
         }
         "wordCount" => pen.text(10.0, 10.0, 9.0, "123", a, true),
+        "summarize" => {
+            // A page of lines, and a short accent line beside it: the gist.
+            pen.page(2.5, 2.5, 13.0, 17.5);
+            pen.lines(4.5, 10.5, &[7.0, 10.0, 13.0]);
+            pen.line_c(&[(15.0, 8.0), (18.0, 8.0)], a);
+            pen.line_c(&[(15.0, 11.0), (17.0, 11.0)], a);
+        }
         "readAloud" => {
             pen.text(6.0, 10.0, 10.0, "A", c, false);
             pen.line_c(&[(12.0, 7.0), (13.5, 10.0), (12.0, 13.0)], a);

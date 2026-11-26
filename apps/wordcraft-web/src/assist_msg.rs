@@ -41,7 +41,11 @@ pub fn parse(json: &str) -> Option<AssistIn> {
         }),
         "proof-failed" => Some(AssistIn::ProofFailed { id: id(&v)?, error: error(&v)? }),
         "ai-result" => {
-            let text = v.get("text")?.as_str().filter(|t| t.len() <= MAX_AI_TEXT_BYTES)?;
+            let text = v.get("text")?.as_str()?;
+            // Over the cap the request fails, so whatever waits for it stops waiting.
+            if text.len() > MAX_AI_TEXT_BYTES {
+                return Some(AssistIn::AiFailed { id: id(&v)?, error: "too_large".to_string() });
+            }
             Some(AssistIn::AiResult { id: id(&v)?, text: text.to_string() })
         }
         "ai-failed" => Some(AssistIn::AiFailed { id: id(&v)?, error: error(&v)? }),
