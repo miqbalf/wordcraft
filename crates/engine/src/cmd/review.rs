@@ -155,6 +155,9 @@ pub fn specs() -> Vec<CommandSpec> {
             .pure(),
         CommandSpec::new("review.improveApply", "Improve with AI", "Review › Proofing", improve::improve_apply)
             .params(r#"{"anchor": Pos, "focus": Pos, "original": string (improveSource's text), "proposal": string (the improved text, paragraphs separated by a blank line)}"#),
+        CommandSpec::new("review.improvePreview", "Improve with AI", "Review › Proofing", improve::improve_preview)
+            .params(r#"{"anchor": Pos, "focus": Pos, "original"?: string, "proposal": string} → {"text": string (the proposal as improveApply puts it in, paragraphs separated by a blank line)}"#)
+            .pure(),
         CommandSpec::new("review.summarySource", "Summarize Document", "Review › Proofing", improve::summary_source)
             .params(r#"{} → {"text": string (the body's text), "language": string, "truncated": bool}"#)
             .pure(),

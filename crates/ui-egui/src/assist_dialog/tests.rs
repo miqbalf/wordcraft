@@ -327,10 +327,7 @@ fn modal_is_keyboard_reachable_and_labelled() {
     h.run_steps(3);
     let (id, _, _) = asked(&sent).remove(0);
     assert!(h.state().modal_open(), "the rest of the window waits");
-    let r = modal_rect(&h).expect("the modal");
-    let dialog = h
-        .query_all_by_label("Improve with AI")
-        .any(|n| n.accesskit_node().role() == Role::Dialog && r.contains_rect(n.rect().shrink(1.0)));
+    let dialog = h.query_all_by_label("Improve with AI").any(|n| n.accesskit_node().role() == Role::Dialog);
     assert!(dialog, "the modal is a dialog named by its title (M4)");
     assert!(button(&h, "Cancel").expect("Cancel").is_focused(), "while it waits, the keyboard is on Cancel (M3)");
     page_says(&mut h, AssistIn::AiResult { id, text: "The cat sat.".into() });

@@ -450,10 +450,7 @@ fn replace_after_an_edit_above_finds_the_text_again() {
     s.run("text.insert", &json!({"text": "Zero.", "paragraphs": true})).unwrap();
     s.run("text.newParagraph", &json!({})).unwrap();
     let apply = |s: &mut Session| {
-        s.run(
-            "review.improveApply",
-            &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "The cat sat."}),
-        )
+        s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "The cat sat."}))
     };
     apply(&mut s).unwrap();
     let texts: Vec<String> = s.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.text.clone()).collect();
@@ -464,11 +461,7 @@ fn replace_after_an_edit_above_finds_the_text_again() {
     let src = s.run("review.improveSource", &json!({})).unwrap();
     select(&mut s, (0, 0), (0, 0));
     s.run("text.insert", &json!({"text": "So "})).unwrap();
-    s.run(
-        "review.improveApply",
-        &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "cat sits."}),
-    )
-    .unwrap();
+    s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "cat sits."})).unwrap();
     assert_eq!(para(&s, 0).text, "So Teh cat sits.");
 }
 
@@ -482,10 +475,8 @@ fn a_moved_range_whose_text_is_there_twice_is_refused() {
     s.run("text.insert", &json!({"text": "Teh cat sat.", "paragraphs": true})).unwrap();
     s.run("text.newParagraph", &json!({})).unwrap();
     let before = s.doc.clone();
-    let r = s.run(
-        "review.improveApply",
-        &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "The cat sat."}),
-    );
+    let r =
+        s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "The cat sat."}));
     assert_eq!(failed(r), TEXT_CHANGED);
     assert!(s.doc.same_content(&before));
 }

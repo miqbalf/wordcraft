@@ -790,10 +790,7 @@ fn a_viewer_is_not_offered_improve_and_sends_nothing() {
     for _ in 0..4 {
         h.step();
     }
-    let insert = h
-        .query_all_by_label("Insert at Cursor")
-        .find(|n| n.accesskit_node().role() == Role::Button)
-        .expect("Insert at Cursor");
+    let insert = h.query_all_by_label("Insert at Cursor").find(|n| n.accesskit_node().role() == Role::Button).expect("Insert at Cursor");
     assert!(insert.accesskit_node().is_disabled(), "a viewer can't insert");
     let copy = h.query_all_by_label("Copy").find(|n| n.accesskit_node().role() == Role::Button && !n.accesskit_node().is_disabled());
     assert!(copy.is_some(), "but can copy");
