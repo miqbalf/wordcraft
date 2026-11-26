@@ -391,8 +391,8 @@ fn source_of(s: &Session, anchor: &Pos, focus: &Pos, original: &str) -> Result<S
 
 /// Where `needle` starts in `text` as whole words: every start, overlapping ones included, with
 /// no letter or digit just before or just after it (so "cat" is not found in "category"). An
-/// apostrophe or a hyphen followed by a letter or digit continues the word ("we'll", "co-op"),
-/// so it is no boundary either.
+/// apostrophe or a hyphen at the edge, with a letter or digit beyond it, continues the word
+/// ("we'll", "co-op"), so it is no boundary either.
 fn whole_word_matches(text: &str, needle: &str) -> Vec<usize> {
     let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
     let joiner = |c: Option<char>| matches!(c, Some('\'' | '\u{2019}' | '-' | '\u{2010}' | '\u{2011}'));
