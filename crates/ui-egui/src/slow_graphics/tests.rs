@@ -16,6 +16,7 @@ fn software_renderers_are_told_apart_from_gpus() {
         "llvmpipe (LLVM 17.0.6, 256 bits)",
         "Microsoft Basic Render Driver Software Adapter",
         "Google SwiftShader",
+        "ANGLE (Microsoft, Microsoft Basic Render Driver (0x0000008C) Direct3D11 vs_5_0 ps_5_0, D3D11)",
     ] {
         assert!(is_software(name), "{name}");
     }

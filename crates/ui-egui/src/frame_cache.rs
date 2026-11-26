@@ -139,18 +139,15 @@ pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
         && !hovered
         && !screen_reader
         && !ctx.any_popup_open()
-        && state
-            .rec
-            .as_ref()
-            .is_some_and(|r| {
-                !r.busy
-                    && r.stable
-                    && r.key == key
-                    && r.rect == rect
-                    && r.layer == layer
-                    && Arc::ptr_eq(&r.fonts, &fonts)
-                    && (0.0..MAX_AGE).contains(&(now - r.at))
-            });
+        && state.rec.as_ref().is_some_and(|r| {
+            !r.busy
+                && r.stable
+                && r.key == key
+                && r.rect == rect
+                && r.layer == layer
+                && Arc::ptr_eq(&r.fonts, &fonts)
+                && (0.0..MAX_AGE).contains(&(now - r.at))
+        });
     if replay && let Some(rec) = &state.rec {
         ctx.graphics_mut(|g| {
             let list = g.entry(layer);
