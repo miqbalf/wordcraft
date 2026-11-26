@@ -58,6 +58,12 @@ pub const COPY_DOWNLOADED: &str = "A copy was downloaded. Check it, then reopen 
 const REPORT_MS: f64 = 1000.0;
 /// How often a live window draws a frame to take in the relay's messages, in milliseconds.
 const PUMP_MS: u64 = 100;
+/// The same for a window whose hub wakes it when a message arrives ([`WordApp::live_woken`]):
+/// a safety tick for anything the wake missed, in milliseconds (PERF2).
+const SAFETY_MS: u64 = 1000;
+/// After the caret moved, when a woken window draws again to send it if the link held it back
+/// (`craft-live` sends at most five carets a second, one per 200 ms), in milliseconds.
+const CARET_FOLLOW_MS: u64 = 210;
 
 /// Any hub, so the window does not care which transport the host connected.
 pub struct DynHub(pub Box<dyn Hub>);
@@ -131,6 +137,8 @@ pub struct LiveLink {
     /// Milliseconds for the report throttle: the frame clock unless set
     /// ([`WordApp::live_set_clock`]).
     clock: Box<dyn Fn() -> f64>,
+    /// The hub wakes the window when the relay sends something: pump on [`SAFETY_MS`].
+    woken: bool,
 }
 
 impl LiveLink {
@@ -214,8 +222,24 @@ impl WordApp {
             reported: None,
             told_broken: false,
             clock: Box::new(now_ms),
+            woken: false,
         })));
         Ok(())
+    }
+
+    /// The host's hub wakes the window when the relay sends something (`craft_collab::Wake`), so
+    /// the link no longer needs a frame every [`PUMP_MS`] to take messages in: it pumps on a
+    /// slow safety tick of [`SAFETY_MS`] instead (PERF2).
+    pub fn live_woken(&mut self) {
+        if let Some(LiveMode::Linked(link)) = &mut self.live {
+            link.woken = true;
+        }
+    }
+
+    /// How long a live window waits at most before its next frame, in milliseconds: `None`
+    /// without a link.
+    pub fn live_pump_ms(&self) -> Option<u64> {
+        self.live_link().map(|l| if l.woken { SAFETY_MS } else { PUMP_MS })
     }
 
     /// The room speaks a protocol newer than this build's: say so, and take no edits.
@@ -465,6 +489,10 @@ impl WordApp {
             if link.sent_caret != Some(caret) {
                 link.editing.send_cursor(at.0, at.1, anchor);
                 link.sent_caret = Some(caret);
+                if link.woken {
+                    // The link may hold the caret back for a moment: send it then.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(CARET_FOLLOW_MS));
+                }
             }
         }
         let report = report_of(link);
@@ -480,10 +508,11 @@ impl WordApp {
             }
             link.reported = Some((report, now));
         }
+        let pump = if link.woken { SAFETY_MS } else { PUMP_MS };
         for n in notices {
             self.status_long(n);
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(PUMP_MS));
+        ctx.request_repaint_after(std::time::Duration::from_millis(pump));
     }
 
     /// The status bar's live item: its text and, for a broken link, the detail for its tooltip.

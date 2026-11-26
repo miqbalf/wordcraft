@@ -475,3 +475,24 @@ fn the_canvas_caret_glides_after_a_key() {
     h.step();
     assert!(state(&h.ctx).drawn().is_some());
 }
+
+/// The browser build blinks on the edges: a resting caret is fully on or fully off, so a blink
+/// costs one frame per edge instead of a fade's handful (PERF2: idle repaints). Glides stay.
+#[test]
+fn without_blink_fades_the_resting_caret_switches_on_its_edges() {
+    let mut r = Rig::new(bar(100.0, 100.0));
+    r.glide = CaretGlide::with_secs(GLIDE_SECS).with_blink_fades(false);
+    assert!(!r.glide.blink_fades());
+    assert_eq!(r.step(DT).opacity, 1.0);
+    assert_eq!(r.rest(0.4).opacity, 1.0);
+    // Where the fading caret would be half-way out, this one is already off, and at rest.
+    let look = r.rest(0.18);
+    assert_eq!((look.opacity, look.moving), (0.0, false));
+    assert!(!blink_fading(0.58, 0.0));
+    // A key still glides the caret to its new place, lit.
+    r.key_to(bar(200.0, 100.0));
+    let look = r.step(DT);
+    assert!(look.moving && r.glide.is_gliding(), "{look:?}");
+    // The default keeps the fade (desktop).
+    assert!(CaretGlide::with_secs(GLIDE_SECS).blink_fades() == !cfg!(target_arch = "wasm32"));
+}

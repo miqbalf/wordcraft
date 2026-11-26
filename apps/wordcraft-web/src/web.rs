@@ -55,11 +55,15 @@ pub fn start() {
                 canvas,
                 options,
                 Box::new(move |cc| {
-                    if let Some(rs) = &cc.wgpu_render_state {
-                        log::info!("wordcraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
-                    }
                     // Fonts the user added on an earlier visit (#582); the app notices them arrive.
                     font_store::load_all(cc.egui_ctx.clone());
+                    // A browser drawing in software gets a one-time notice that editing may be slow (PERF2).
+                    if let Some(render) = &cc.wgpu_render_state {
+                        let info = render.adapter.get_info();
+                        let cpu = info.device_type == eframe::wgpu::DeviceType::Cpu;
+                        log::info!("wordcraft-web: wgpu backend {:?}, {} ({:?})", info.backend, info.name, info.device_type);
+                        wordcraft_ui_egui::slow_graphics::renderer(&cc.egui_ctx, &info.name, cpu);
+                    }
                     let inbox: Inbox = Inbox::default();
                     let pasted: Inbox = Inbox::default();
                     if let Err(e) = listen_for_pasted_pictures(pasted.clone(), cc.egui_ctx.clone()) {
@@ -173,7 +177,7 @@ impl eframe::App for WebShell {
         for msg in msgs {
             self.app.status(msg);
         }
-        self.live.frame(&mut self.app, &self.live_events);
+        self.live.frame(&mut self.app, &self.live_events, ctx);
         if let Some(bridge) = &self.bridge {
             bridge.apply_saves(&mut self.app.services, &self.saves);
             bridge.apply_share(&mut self.app.services);
@@ -233,6 +237,7 @@ impl eframe::App for WebShell {
             }
         }
         self.app.ui(ui);
+        wordcraft_ui_egui::slow_graphics::show(ui.ctx());
     }
 }
 

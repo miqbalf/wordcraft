@@ -981,3 +981,18 @@ fn copy_cut_and_paste_work_while_live() {
     assert_eq!(bob.text(), "Hello again\nSecond pasted");
     assert_eq!(alice_text(&mut h), bob.text());
 }
+
+#[test]
+fn a_window_its_hub_wakes_pumps_on_a_slow_safety_tick_and_still_takes_edits_in() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let (mut h, _hub) = alice(&relay, Access::Edit, true);
+    assert_eq!(h.state().live_pump_ms(), Some(100), "a polled hub: a frame every 100 ms");
+    h.state_mut().live_woken();
+    assert_eq!(h.state().live_pump_ms(), Some(1000), "a waking hub: a safety tick of at most 1 s");
+    settle(&relay, &mut h, &mut bob);
+    bob.s.sel = wordcraft_engine::Selection::caret(wordcraft_doc::Pos::body(0, 0));
+    bob.le.run(&mut bob.s, "text.insert", &json!({"text": "Bob "})).unwrap();
+    settle(&relay, &mut h, &mut bob);
+    assert!(alice_text(&mut h).contains("Bob "), "{}", alice_text(&mut h));
+}

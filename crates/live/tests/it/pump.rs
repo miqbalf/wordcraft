@@ -1644,3 +1644,43 @@ fn an_edit_past_the_relays_cap_never_reaches_the_room_in_part() {
     assert!(kept.iter().any(|t| t.contains(&big)), "the copy holds the whole edit");
     assert!(a.le.take_notices().iter().any(|n| n == UNMERGED_TEXT));
 }
+
+#[test]
+fn with_a_clock_the_drift_check_runs_every_30_seconds_at_a_3_second_pause() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use wordcraft_live::session::{VERIFY_EVERY_MS, VERIFY_QUIET_MS};
+    let relay = relay(None);
+    let bytes = file(&["One", "Two"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    let ms = Arc::new(AtomicU64::new(1_000));
+    let clock = Arc::clone(&ms);
+    a.le.set_clock(Box::new(move || clock.load(Ordering::SeqCst) as f64));
+    let at = |t: f64| ms.store(t as u64, Ordering::SeqCst);
+    // A woken browser window pumps about once a second when idle: far fewer than VERIFY_EVERY pumps.
+    a.pump();
+    let before = a.le.checks();
+    at(1_000.0 + VERIFY_EVERY_MS - 1_000.0);
+    a.pump();
+    assert_eq!(a.le.checks(), before, "not before 30 s");
+    at(1_000.0 + VERIFY_EVERY_MS + 1.0);
+    a.pump();
+    assert_eq!(a.le.checks(), before + 1, "30 s on, after a pause: one check");
+    a.pump();
+    assert_eq!(a.le.checks(), before + 1, "and not again at once");
+    // A due check waits for 3 s without changes.
+    let t0 = 1_000.0 + 2.0 * VERIFY_EVERY_MS + 10.0;
+    at(t0);
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": "x"})));
+    a.pump();
+    assert_eq!(a.le.checks(), before + 1, "not while the document just changed");
+    at(t0 + VERIFY_QUIET_MS - 10.0);
+    a.pump();
+    assert_eq!(a.le.checks(), before + 1, "nor before the pause is 3 s long");
+    at(t0 + VERIFY_QUIET_MS + 10.0);
+    a.pump();
+    assert_eq!(a.le.checks(), before + 2, "at the pause");
+}
