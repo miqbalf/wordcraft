@@ -199,7 +199,7 @@ fn a_blinking_caret_gets_no_extra_frames_from_the_cache() {
     assert!(extra.is_empty(), "frames asked for before the next caret edge: {extra:?}");
     // And the bars do not run at every edge: with the cache off this part runs 12 times
     // (PERF2 fix round 2 review, F2).
-    assert!(ran.get() <= 7, "the part ran {} times over 12 caret edges", ran.get());
+    assert!(ran.get() <= 5, "the part ran {} times over 12 caret edges", ran.get());
 }
 
 // ---- LI3: a press that arrives with the pointer must still click a replayed part ----

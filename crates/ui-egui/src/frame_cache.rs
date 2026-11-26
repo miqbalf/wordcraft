@@ -18,11 +18,13 @@
 //! - the fonts changed, or egui cleared its font atlas: recorded text points into the old atlas
 //!   (a probe galley laid out every frame is a new one then);
 //! - the recording is [`MAX_AGE`] old or older. The window is longer than the longest period of
-//!   the frames that come anyway (the caret blinks every 0.53 s), so a blinking window replays at
-//!   most one frame in three and its bars run about once a second. A replay asks for a frame only
-//!   as a backstop, [`BACKSTOP_GRACE`] after [`MAX_AGE`], for a window that would otherwise draw no
-//!   further frame: a frame that comes first clears that request, and a run asks for none, so
-//!   anything the key misses is shown at most [`MAX_AGE`] + [`BACKSTOP_GRACE`] late;
+//!   the frames that come anyway (the caret blinks every 0.53 s), so a blinking window runs its
+//!   bars on about one edge in four. A run after a replay costs two more frames, because egui
+//!   styles a widget from the last pass's response and a replay registers none, so it asks to
+//!   repaint: at one second that made three frames in every two blinks. A replay asks for a frame
+//!   only as a backstop, [`BACKSTOP_GRACE`] after [`MAX_AGE`], for a window that would otherwise
+//!   draw no further frame: a frame that comes first clears that request, and a run asks for
+//!   none, so anything the key misses is shown at most [`MAX_AGE`] + [`BACKSTOP_GRACE`] late;
 //! - the last two runs painted different shapes: the part is still settling or animating (a tab
 //!   sliding in, a group re-planned for the width), which asks for frames the replay would not.
 //!
@@ -39,7 +41,7 @@ use egui::epaint::{ClippedShape, Galley};
 use egui::{Id, LayerId, Rect, Ui};
 
 /// The oldest recording [`show`] replays, in seconds.
-pub const MAX_AGE: f64 = 1.0;
+pub const MAX_AGE: f64 = 2.0;
 
 /// How long past [`MAX_AGE`] a replay waits for a frame to come anyway before it asks for one: more
 /// than the caret's blink period, so in a window that blinks the request is always cleared first.
