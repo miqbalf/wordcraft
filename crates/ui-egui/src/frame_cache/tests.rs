@@ -327,3 +327,52 @@ fn quiet_frames_and_pointer_moves_elsewhere_still_replay_with_the_hook_on() {
     }
     assert_eq!(ran.get(), before, "no frame ran the part");
 }
+
+/// Frames of a top panel holding the part (`inside`: a text field in it that has the keyboard, or
+/// a label) over a page whose canvas has the keyboard and is as tall as the window, so its
+/// rectangle reaches the part's.
+fn focus_frame(ctx: &Context, time: f64, inside: bool, ran: &Cell<u32>) {
+    let input = RawInput { time: Some(time), screen_rect: Some(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))), ..Default::default() };
+    let out = ctx.run_ui(input, |ui| {
+        egui::Panel::top("part").exact_size(40.0).show(ui, |ui| {
+            show(ui, id(), 7, |ui| {
+                ran.set(ran.get() + 1);
+                if inside {
+                    let mut text = String::from("x");
+                    let r = ui.add(egui::TextEdit::singleline(&mut text).id(Id::new("field")));
+                    r.request_focus();
+                } else {
+                    ui.label("Home");
+                }
+            });
+        });
+        if !inside {
+            let page = ui.max_rect();
+            let r = ui.interact(page.union(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))), Id::new("page"), egui::Sense::focusable_noninteractive());
+            r.request_focus();
+        }
+    });
+    out.drop_without_applying_deltas();
+}
+
+#[test]
+fn a_focused_widget_outside_the_part_does_not_keep_it_running() {
+    let (ctx, ran) = (on(), Cell::new(0));
+    for i in 0..4 {
+        focus_frame(&ctx, 1.0 + f64::from(i) * 0.1, false, &ran);
+    }
+    let before = ran.get();
+    for i in 4..10 {
+        focus_frame(&ctx, 1.0 + f64::from(i) * 0.1, false, &ran);
+    }
+    assert_eq!(ran.get(), before, "the page's keyboard focus overlaps the bar but is not in it (PERF2 fix round 3)");
+}
+
+#[test]
+fn a_focused_widget_inside_the_part_keeps_it_running() {
+    let (ctx, ran) = (on(), Cell::new(0));
+    for i in 0..10 {
+        focus_frame(&ctx, 1.0 + f64::from(i) * 0.1, true, &ran);
+    }
+    assert_eq!(ran.get(), 10, "a text field with the keyboard in the part runs it every frame");
+}

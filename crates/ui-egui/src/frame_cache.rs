@@ -201,7 +201,7 @@ pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
     let start = ctx.graphics(|g| g.get(layer).map_or(0, |l| l.next_idx().0));
     build(ui);
     let shapes: Vec<ClippedShape> = ctx.graphics(|g| g.get(layer).map(|l| l.all_entries().skip(start).cloned().collect()).unwrap_or_default());
-    let focus_inside = ctx.memory(|m| m.focused()).and_then(|f| ctx.read_response(f)).is_some_and(|r| rect.intersects(r.rect));
+    let focus_inside = ctx.memory(|m| m.focused()).and_then(|f| ctx.read_response(f)).is_some_and(|r| rect.contains_rect(r.rect));
     let stable = state.rec.as_ref().is_some_and(|r| r.rect == rect && r.layer == layer && *r.shapes == shapes);
     state.rec = Some(Recording { key, rect, layer, shapes: Arc::new(shapes), at: now, busy: hovered || focus_inside, stable, fonts });
     state.built += 1;
