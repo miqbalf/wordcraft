@@ -275,12 +275,21 @@ fn finish(app: &mut WordApp, mut d: AssistDialog, done: Option<Result<Value, Str
 /// Insert at Cursor: the lines as whole paragraphs after the caret's paragraph (in it when it is
 /// empty), so no line is glued to the text around the caret and a selection is left alone. One
 /// command, so one undo step.
+/// The caret moves through `caret.set`, and back (`select.range`) when the insert is refused.
 fn insert_paragraphs(app: &mut WordApp, text: &str) -> Result<Value, String> {
-    let focus = app.session.sel.focus.clone();
+    use wordcraft_engine::cmd::pos_json;
+    let (anchor, focus) = (app.session.sel.anchor.clone(), app.session.sel.focus.clone());
     let len = app.session.doc.para_at(&focus).map_or(0, wordcraft_doc::Paragraph::len);
-    app.session.sel = wordcraft_engine::Selection::caret(wordcraft_doc::Pos { off: len, ..focus });
+    let end = wordcraft_doc::Pos { off: len, ..focus.clone() };
+    app.session.run("caret.set", &json!({"pos": pos_json(&end)})).map_err(|e| e.to_string())?;
     let text = if len > 0 { format!("\n{text}") } else { text.to_string() };
-    app.run("text.insert", json!({"text": text, "paragraphs": true}))
+    let done = app.run("text.insert", json!({"text": text, "paragraphs": true}));
+    if done.is_err()
+        && let Err(e) = app.session.run("select.range", &json!({"anchor": pos_json(&anchor), "focus": pos_json(&focus)}))
+    {
+        log::warn!("selection not restored: {e}");
+    }
+    done
 }
 
 /// Closes the modal: the request it waited for is dropped, so a late answer changes nothing.

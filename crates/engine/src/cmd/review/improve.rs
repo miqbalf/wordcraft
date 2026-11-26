@@ -346,8 +346,8 @@ fn props_for(p: &Paragraph, x: usize, y: usize) -> CharProps {
 
 /// The source of `anchor..focus` when its text is still `original`. When edits elsewhere (a
 /// co-editor's paragraph above, words typed earlier in the paragraph) moved it, the one place in
-/// the story that holds `original` now, for a range within one paragraph; refused when the text
-/// changed or is there more than once.
+/// the story that holds `original` now as whole words, for a range within one paragraph;
+/// refused when the text changed or is there more than once (overlapping copies count).
 fn source_of(s: &Session, anchor: &Pos, focus: &Pos, original: &str) -> Result<Source, CmdError> {
     let changed = || CmdError::Failed(TEXT_CHANGED.into());
     let valid = |x: &Pos| s.doc.para_at(x).is_some_and(|q| x.off <= q.len() && q.text.is_char_boundary(x.off));
@@ -364,7 +364,7 @@ fn source_of(s: &Session, anchor: &Pos, focus: &Pos, original: &str) -> Result<S
     let mut found: Option<(Pos, Pos)> = None;
     for path in s.doc.para_paths(anchor.story) {
         let Some(para) = s.doc.para(anchor.story, &path) else { continue };
-        for (off, _) in para.text.match_indices(original) {
+        for off in whole_word_matches(&para.text, original) {
             if found.is_some() {
                 return Err(changed());
             }
@@ -378,6 +378,17 @@ fn source_of(s: &Session, anchor: &Pos, focus: &Pos, original: &str) -> Result<S
         return Err(changed());
     }
     Ok(src)
+}
+
+/// Where `needle` starts in `text` as whole words: every start, overlapping ones included, with
+/// no letter or digit just before or just after it (so "cat" is not found in "category").
+fn whole_word_matches(text: &str, needle: &str) -> Vec<usize> {
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    text.char_indices()
+        .map(|(i, _)| i)
+        .filter(|&i| text[i..].starts_with(needle))
+        .filter(|&i| !word(text[..i].chars().next_back()) && !word(text[i + needle.len()..].chars().next()))
+        .collect()
 }
 
 /// The proposal as it will be put in, a text per part of `src`, or the refusal.
