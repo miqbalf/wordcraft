@@ -385,6 +385,12 @@ impl<H: Hub> LiveEditing<H> {
         self.checks
     }
 
+    /// How many checks compared the window's body with the shared copy. Red-test stub: it counts
+    /// every check for now.
+    pub fn compared(&self) -> u64 {
+        self.checks
+    }
+
     /// Check every `pumps` pumps ([`LiveEditing::verify`]); 0 turns the periodic check off (a
     /// test that must see the mapping on its own).
     pub fn set_verify_every(&mut self, pumps: u32) {
