@@ -660,11 +660,9 @@ mod tests {
 pub fn live_notice_text(notice: &wordcraft_live::LiveNotice) -> String {
     match notice {
         wordcraft_live::LiveNotice::Text(line) => tl!(line.as_str()).to_string(),
-        wordcraft_live::LiveNotice::Paste(paste) => paste.compose(
-            |t| tl!(t).to_string(),
-            |item| crate::i18n::tc(wordcraft_live::PASTE_ITEM_CONTEXT, item).to_string(),
-            crate::i18n::fmt,
-        ),
+        wordcraft_live::LiveNotice::Paste(paste) => {
+            paste.compose(|t| tl!(t).to_string(), |item| crate::i18n::tc(wordcraft_live::PASTE_ITEM_CONTEXT, item).to_string(), crate::i18n::fmt)
+        }
     }
 }
 

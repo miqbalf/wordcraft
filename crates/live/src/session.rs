@@ -99,7 +99,12 @@ pub struct PasteNotice {
 impl PasteNotice {
     /// The line, with `template` and `item` translating a template and an item, and `fill`
     /// putting named values into a template (`{items}`, `{list}`, `{last}`).
-    pub fn compose(&self, template: impl Fn(&str) -> String, item: impl Fn(&str) -> String, fill: impl Fn(&str, &[(&str, &str)]) -> String) -> String {
+    pub fn compose(
+        &self,
+        template: impl Fn(&str) -> String,
+        item: impl Fn(&str) -> String,
+        fill: impl Fn(&str, &[(&str, &str)]) -> String,
+    ) -> String {
         let items: Vec<String> = self.items.iter().map(|i| item(i)).collect();
         let list = match items.as_slice() {
             [] => String::new(),
