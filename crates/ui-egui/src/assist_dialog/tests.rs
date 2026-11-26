@@ -430,3 +430,24 @@ fn a_click_beside_a_ready_modal_keeps_the_answer() {
     assert!(open(h.state()), "the summary is still there");
     assert_eq!(box_value(&h, "Summary").as_deref(), Some("A point."));
 }
+
+/// Fix 2, F3: a new document shown while the modal is open closes it, so the old proposal can
+/// never be applied to the new document, and its late answer changes nothing.
+#[test]
+fn the_modal_closes_when_another_document_is_shown() {
+    let (app, sent) = app_on("Teh cat sat.", true);
+    let mut h = harness(app);
+    h.state_mut().run("ui.improve", json!({})).unwrap();
+    h.run_steps(3);
+    let (id, _, _) = asked(&sent).remove(0);
+    assert!(open(h.state()));
+    let first = h.state().session.document_id();
+    h.state_mut().run("file.new", json!({})).unwrap();
+    h.run_steps(3);
+    assert_ne!(h.state().session.document_id(), first, "another document is shown");
+    assert!(!open(h.state()), "the modal closed with its document");
+    page_says(&mut h, AssistIn::AiResult { id: id.clone(), text: "The cat sat.".into() });
+    assert!(!open(h.state()));
+    assert_eq!(h.state_mut().assist_take_answer(&id), None, "the answer is not kept");
+    assert!(body(h.state()).trim().is_empty(), "nothing went into the new document");
+}

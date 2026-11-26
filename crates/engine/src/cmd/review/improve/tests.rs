@@ -480,3 +480,40 @@ fn a_moved_range_whose_text_is_there_twice_is_refused() {
     assert_eq!(failed(r), TEXT_CHANGED);
     assert!(s.doc.same_content(&before));
 }
+
+/// Fix 2, F1: a moved range is found again only as whole words. A deleted "cat" whose text is
+/// left only inside "category" is refused, never written into that word.
+#[test]
+fn a_moved_range_is_found_again_only_as_whole_words() {
+    let mut s = session(&["Intro.", "The cat sat.", "A category."]);
+    select(&mut s, (1, 4), (1, 7));
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    assert_eq!(src["text"], "cat");
+    s.doc.body.remove(1);
+    let before = s.doc.clone();
+    let r = s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "kitten"}));
+    assert_eq!(failed(r), TEXT_CHANGED);
+    assert!(s.doc.same_content(&before), "\"category\" is left alone");
+    // As a whole word elsewhere, once, it is found again.
+    let mut s = session(&["Intro.", "The cat sat.", "A cat."]);
+    select(&mut s, (2, 2), (2, 5));
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    s.doc.body.remove(1);
+    s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "kitten"})).unwrap();
+    assert_eq!(para(&s, 1).text, "A kitten.");
+}
+
+/// Fix 2, F2: overlapping copies count as two, so the text is not taken as unique.
+#[test]
+fn overlapping_copies_of_a_moved_range_are_counted() {
+    let mut s = session(&["Intro.", "ha ha"]);
+    select(&mut s, (1, 0), (1, 0));
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    assert_eq!(src["text"], "ha ha");
+    s.doc.body[1] = para_block(Paragraph::with_text("ha ha ha", CharProps::default()));
+    s.doc.body.insert(0, para_block(Paragraph::with_text("Zero.", CharProps::default())));
+    let before = s.doc.clone();
+    let r = s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "Ha, ha."}));
+    assert_eq!(failed(r), TEXT_CHANGED);
+    assert!(s.doc.same_content(&before));
+}
