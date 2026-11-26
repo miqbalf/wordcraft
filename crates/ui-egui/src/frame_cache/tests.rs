@@ -339,7 +339,7 @@ fn focus_frame(ctx: &Context, time: f64, inside: bool, ran: &Cell<u32>) {
                 ran.set(ran.get() + 1);
                 if inside {
                     let mut text = String::from("x");
-                    let r = ui.add(egui::TextEdit::singleline(&mut text).id(Id::new("field")));
+                    let r = ui.add(egui::TextEdit::singleline(&mut text).id(Id::unique("field")));
                     r.request_focus();
                 } else {
                     ui.label("Home");
@@ -348,7 +348,11 @@ fn focus_frame(ctx: &Context, time: f64, inside: bool, ran: &Cell<u32>) {
         });
         if !inside {
             let page = ui.max_rect();
-            let r = ui.interact(page.union(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))), Id::new("page"), egui::Sense::focusable_noninteractive());
+            let r = ui.interact(
+                page.union(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                Id::unique("page"),
+                egui::Sense::focusable_noninteractive(),
+            );
             r.request_focus();
         }
     });
