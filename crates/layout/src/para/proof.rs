@@ -57,7 +57,7 @@ pub fn paragraph_issues(
 /// The byte ranges of the runs left unchecked, in order, those that overlap merged: their
 /// starts and ends both rise, so [`overlaps`] finds an issue's by binary search instead of
 /// looking at every run for every issue.
-fn skipped_ranges(runs: &[ProofRun]) -> Vec<(usize, usize)> {
+pub(super) fn skipped_ranges(runs: &[ProofRun]) -> Vec<(usize, usize)> {
     let mut ranges: Vec<(usize, usize)> = runs.iter().filter(|r| r.skip).map(|r| (r.range.start, r.range.end)).collect();
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
@@ -73,7 +73,7 @@ fn skipped_ranges(runs: &[ProofRun]) -> Vec<(usize, usize)> {
 
 /// Whether bytes `a..b` overlap one of `skipped` ([`skipped_ranges`]): the first range ending
 /// after `a` is the only one that can, as every later one starts no earlier.
-fn overlaps(skipped: &[(usize, usize)], a: usize, b: usize) -> bool {
+pub(super) fn overlaps(skipped: &[(usize, usize)], a: usize, b: usize) -> bool {
     crate::work::steps(1);
     let k = skipped.partition_point(|&(_, e)| e <= a);
     skipped.get(k).is_some_and(|&(s, _)| s < b)
@@ -84,17 +84,20 @@ pub fn is_list_item(doc: &Document, p: &Paragraph) -> bool {
     p.props.numbering.or_else(|| doc.styles.resolve_para(&p.props).numbering).is_some_and(|n| n.num != 0)
 }
 
-/// Spelling and grammar issues as squiggles (start, end, is grammar), less spelling issues overlapping `typing`.
+/// Spelling and grammar issues as squiggles (start, end, is grammar): the built-in and remote
+/// ones merged ([`super::merged_issues`]), less spelling issues overlapping `typing`.
 pub(super) fn proof_issues(
     p: &Paragraph,
     runs: &[ProofRun],
     opts: &crate::ProofOptions,
     typing: Option<(usize, usize)>,
     list_item: bool,
+    overlay: Option<&super::ProofOverlay>,
+    overlays: Option<&super::ProofOverlays>,
 ) -> Vec<(usize, usize, bool)> {
-    paragraph_issues(p, runs, &opts.spelling, opts.grammar, list_item)
+    super::merged_issues(p, runs, &opts.spelling, opts.grammar, list_item, overlay, overlays)
         .into_iter()
-        .map(|i| (i.start, i.end, i.kind == wordcraft_proof::IssueKind::Grammar))
+        .map(|m| (m.issue.start, m.issue.end, m.issue.kind == wordcraft_proof::IssueKind::Grammar))
         .filter(|&(a, b, grammar)| grammar || !typing.is_some_and(|(s, e)| a < e && s < b))
         .collect()
 }

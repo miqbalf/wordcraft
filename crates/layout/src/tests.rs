@@ -18,6 +18,7 @@ mod nbsp;
 mod nested_cant_split;
 mod numeral;
 mod pages;
+mod proof_overlay;
 mod styleref;
 mod table_contact;
 mod textbox;

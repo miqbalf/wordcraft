@@ -153,6 +153,8 @@ impl Session {
             merge,
             ui_requests: Vec::new(),
             math,
+            proof_overlays: None,
+            proof_remote: Default::default(),
             math_latex: false,
             math_normal_text: false,
             also_selected,

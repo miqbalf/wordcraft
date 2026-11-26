@@ -28,8 +28,9 @@ impl Session {
         let outline = (mode == ViewMode::Outline).then(|| self.view.outline.view());
         let shown = (self.view.marks || self.prefs.marks.hidden, self.view.field_codes);
         // A dictionary or Language pack installed, removed or edited (in this document's window or
-        // any other) proofs it again, open or parked.
-        let rev = (self.rev, wordcraft_proof::dictionary_generation());
+        // any other) proofs it again, open or parked. So do new remote proofing results or ignores.
+        let overlays = self.proof_overlays.as_ref().map_or(0, |o| o.key());
+        let rev = (self.rev, wordcraft_proof::dictionary_generation(), overlays);
         let (proofing, numeral) = (self.view.proofing, self.view.numeral);
         let fits = |e: &Option<LayoutEntry>| {
             e.as_ref().is_some_and(|(r, w, h, m, sp, _, pf, o, hd, n, t, sh)| {
@@ -72,6 +73,7 @@ impl Session {
             outline: outline.clone(),
             proof: wordcraft_layout::ProofOptions { grammar: self.prefs.mark_grammar, spelling: self.prefs.spelling() },
             typing_word: typing,
+            proof_overlays: self.proof_overlays.clone(),
             filename: filename.clone(),
             filepath: filepath.clone(),
             // The editor shows a body page reference as stored until fields are updated.
@@ -145,6 +147,7 @@ impl Session {
         copy.last_highlight = self.last_highlight;
         copy.system_region = self.system_region.clone();
         copy.editing_lang = self.editing_lang.clone();
+        copy.proof_overlays = self.proof_overlays.clone();
         // The copy shares the paragraph layouts, so only what the command changed is laid out.
         std::mem::swap(&mut copy.cache, &mut self.cache);
         let layout = copy.run(id, params).is_ok().then(|| {

@@ -700,7 +700,10 @@ pub fn layout_para(p: &Paragraph, env: &ParaEnv) -> ParaLayout {
         joined_cluster_starts,
         has_page_fields,
         notes,
-        issues: env.proofing.map(|o| proof_issues(p, &runs, &o, env.typing_word, is_list_item(doc, p))).unwrap_or_default(),
+        issues: env
+            .proofing
+            .map(|o| proof_issues(p, &runs, &o, env.typing_word, is_list_item(doc, p), env.overlay, env.overlays))
+            .unwrap_or_default(),
         drop_cap,
         hyph_after: Vec::new(),
         bidi_levels: b.levels,

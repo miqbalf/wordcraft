@@ -1027,6 +1027,8 @@ fn next_first_line(ctx: &mut Ctx, block: usize, width: f32, depth: usize, counte
                         table: None,
                         proofing: None,
                         typing_word: None,
+                        overlay: None,
+                        overlays: None,
                         numeral: ctx.opts.numeral,
                         exclusions: &[],
                         eq_number: ctx.eq_count,

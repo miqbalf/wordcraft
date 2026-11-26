@@ -1,3 +1,5 @@
+use wordcraft_layout::para::ProofIssue;
+
 use super::{CmdError, CmdResult, Pos, Selection, Session, StoryRef, Value, json, p, pos_json};
 
 pub(super) fn word_count(s: &mut Session, v: &Value) -> CmdResult {
@@ -39,18 +41,22 @@ pub(super) fn word_count(s: &mut Session, v: &Value) -> CmdResult {
 }
 
 /// Issues (spelling + grammar) in one paragraph as positions, each in its run's language and
-/// skipping text left unchecked — the same issues the layout underlines.
-fn para_issues(s: &Session, story: StoryRef, path: &wordcraft_doc::Path) -> Vec<(Pos, Pos, wordcraft_proof::Issue)> {
+/// skipping text left unchecked, with the remote ones merged in
+/// ([`wordcraft_layout::para::merged_issues`]) — the same issues the layout underlines.
+fn para_issues(s: &Session, story: StoryRef, path: &wordcraft_doc::Path) -> Vec<(Pos, Pos, ProofIssue)> {
     let Some(p) = s.doc.para(story, path) else { return Vec::new() };
     let runs = wordcraft_layout::para::proof_runs(&s.doc, p, None);
-    wordcraft_layout::para::paragraph_issues(p, &runs, &s.prefs.spelling(), true, wordcraft_layout::para::is_list_item(&s.doc, p))
+    let overlays = s.proof_overlays.as_deref();
+    let overlay = overlays.and_then(|o| o.get(p.rev)).map(|(_, o)| o);
+    let list_item = wordcraft_layout::para::is_list_item(&s.doc, p);
+    wordcraft_layout::para::merged_issues(p, &runs, &s.prefs.spelling(), true, list_item, overlay, overlays)
         .into_iter()
-        .map(|i| (Pos { story, path: path.clone(), off: i.start }, Pos { story, path: path.clone(), off: i.end }, i))
+        .map(|i| (Pos { story, path: path.clone(), off: i.issue.start }, Pos { story, path: path.clone(), off: i.issue.end }, i))
         .collect()
 }
 
 /// The issue under a position.
-pub(super) fn issue_at(s: &Session, at: &Pos) -> Option<(Pos, Pos, wordcraft_proof::Issue)> {
+pub(super) fn issue_at(s: &Session, at: &Pos) -> Option<(Pos, Pos, ProofIssue)> {
     let issues = para_issues(s, at.story, &at.path);
     let selected = s.sel.ordered();
     // F7 can select a spelling issue inside a larger grammar issue. Keep that
@@ -63,13 +69,21 @@ pub(super) fn issue_at(s: &Session, at: &Pos) -> Option<(Pos, Pos, wordcraft_pro
     issues.into_iter().find(|(a, b, _)| a.off <= at.off && at.off <= b.off)
 }
 
-fn issue_json(s: &Session, a: &Pos, b: &Pos, i: &wordcraft_proof::Issue) -> Value {
+/// An issue as `review.*` answers it. A built-in spelling issue gets the dictionary's
+/// suggestions; any other keeps its own (a remote checker's are its own).
+fn issue_json(s: &Session, a: &Pos, b: &Pos, m: &ProofIssue) -> Value {
+    let i = &m.issue;
     let word = s.doc.para_at(a).and_then(|p| p.text.get(a.off..b.off)).unwrap_or("").to_string();
-    let sugg = if i.kind == wordcraft_proof::IssueKind::Spelling { wordcraft_proof::suggest_in(&word, 6, i.lang) } else { i.suggestions.clone() };
+    let sugg = if i.kind == wordcraft_proof::IssueKind::Spelling && !m.remote {
+        wordcraft_proof::suggest_in(&word, 6, i.lang)
+    } else {
+        i.suggestions.clone()
+    };
     json!({
         "start": pos_json(a), "end": pos_json(b), "text": word,
         "kind": if i.kind == wordcraft_proof::IssueKind::Spelling { "spelling" } else { "grammar" },
         "message": i.message, "suggestions": sugg, "lang": i.lang.tag(),
+        "source": if m.remote { "remote" } else { "builtin" }, "rule": m.rule,
     })
 }
 
