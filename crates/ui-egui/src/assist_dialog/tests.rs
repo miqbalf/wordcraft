@@ -451,3 +451,31 @@ fn the_modal_closes_when_another_document_is_shown() {
     assert_eq!(h.state_mut().assist_take_answer(&id), None, "the answer is not kept");
     assert!(body(h.state()).trim().is_empty(), "nothing went into the new document");
 }
+
+/// Fix 2 review F2: an Insert at Cursor the document refuses puts the selection back where the
+/// user left it, and changes nothing.
+#[test]
+fn a_refused_insert_at_cursor_restores_the_selection() {
+    let (mut app, _) = app_on("Some text here.", true);
+    app.run("review.restrict", json!({"mode": "readOnly"})).unwrap();
+    select(&mut app, (0, 2), (0, 7));
+    let (sel, before) = (app.session.sel.clone(), app.session.doc.clone());
+    assert!(insert_paragraphs(&mut app, "A point.").is_err(), "the protected document refuses the insert");
+    assert_eq!(app.session.sel, sel, "the selection is back");
+    assert!(app.session.doc.same_content(&before), "nothing was inserted");
+}
+
+/// Fix 1 review F5: wherever Replace could not apply, Improve says so with one sentence that is
+/// true for each case (a viewer, a protected document, a paused live link), and sends nothing.
+#[test]
+fn improve_where_the_text_cant_change_says_why_and_sends_nothing() {
+    assert_eq!(READ_ONLY, "Improve with AI is off here because this text can't be changed now.");
+    let (mut app, sent) = app_on("Some text here.", true);
+    app.run("review.restrict", json!({"mode": "readOnly"})).unwrap();
+    app.status_msg = None;
+    let why = app.run("ui.improve", json!({})).unwrap_err();
+    assert_eq!(why, tl!(READ_ONLY));
+    assert_eq!(app.status_msg.as_ref().map(|(m, _)| m.as_str()), Some(why.as_str()), "said on the status bar too");
+    assert!(asked(&sent).is_empty(), "nothing is sent");
+    assert!(!open(&app));
+}

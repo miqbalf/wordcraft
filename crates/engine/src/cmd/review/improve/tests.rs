@@ -541,3 +541,55 @@ fn a_short_moved_original_is_refused() {
         assert!(s.doc.same_content(&before));
     }
 }
+
+/// Replace after the original's paragraph is deleted, with `rest` after it: each copy in `rest`
+/// sits elsewhere than the original did, so only relocation can find it. A refusal changes
+/// nothing.
+fn relocate(original_para: &str, original: &str, rest: &[&str]) -> Result<Value, CmdError> {
+    let mut paras = vec!["Intro.", original_para];
+    paras.extend_from_slice(rest);
+    let mut s = session(&paras);
+    let from = original_para.find(original).expect("the original is in its paragraph");
+    assert!(rest.iter().all(|r| r.get(from..from + original.len()) != Some(original)), "no copy at the old place");
+    select(&mut s, (1, from), (1, from + original.len()));
+    let src = s.run("review.improveSource", &json!({})).unwrap();
+    assert_eq!(src["text"], original);
+    s.doc.body.remove(1);
+    let before = s.doc.clone();
+    let r = s.run("review.improveApply", &json!({"anchor": src["anchor"], "focus": src["focus"], "original": src["text"], "proposal": "Changed."}));
+    if r.is_err() {
+        assert!(s.doc.same_content(&before), "a refusal changes nothing");
+    }
+    r
+}
+
+/// Fix 2 review F1: an original long enough to be relocated (2 words and 12 characters) whose
+/// only other copy is glued to a letter or a digit, before or after, is refused: the boundary
+/// check alone refuses it.
+#[test]
+fn a_long_moved_original_inside_longer_words_is_refused() {
+    let original = "fat cat sat here";
+    for glued in ["A defat cat sat here.", "The fat cat sat herein.", "Room 9fat cat sat here.", "And a fat cat sat here7 times."] {
+        assert_eq!(failed(relocate("A fat cat sat here.", original, &[glued])), TEXT_CHANGED, "{glued}");
+    }
+    // The same text standing alone is found again.
+    relocate("A fat cat sat here.", original, &["Then a fat cat sat here, too."]).unwrap();
+}
+
+/// Fix 2 review F3: an apostrophe or a hyphen between letters joins a word ("we'll", "co-op"),
+/// so a moved original that stops at one is not found there.
+#[test]
+fn an_apostrophe_or_hyphen_inside_a_word_is_not_a_word_boundary() {
+    for (original, glued) in [
+        ("then they said we", "And then they said we'll go."),
+        ("then they said we", "And then they said we\u{2019}ll go."),
+        ("we joined the co", "Last year we joined the co-op."),
+        ("op members voted", "The co-op members voted."),
+        ("ll go home soon", "Then we'll go home soon."),
+    ] {
+        assert_eq!(failed(relocate(&format!("So {original}."), original, &[glued])), TEXT_CHANGED, "{glued}");
+    }
+    // A hyphen or an apostrophe with a space beside it is still a boundary.
+    relocate("So then they said we.", "then they said we", &["And then they said we - twice."]).unwrap();
+    relocate("So then they said we.", "then they said we", &["'And then they said we' twice."]).unwrap();
+}
