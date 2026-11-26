@@ -741,4 +741,60 @@ fn improve_replace_reaches_the_other_peer() {
     let alice = alice_text(&mut h);
     assert!(alice.contains("Hello, wide world"), "{alice}");
     assert_eq!(bob.text(), alice, "Bob's body equals Alice's");
+    // One undo takes it back for both.
+    h.state_mut().run("edit.undo", json!({})).unwrap();
+    settle(&relay, &mut h, &mut bob);
+    let alice = alice_text(&mut h);
+    assert!(alice.starts_with("Hello world"), "{alice}");
+    assert_eq!(bob.text(), alice, "the undo reached Bob");
+}
+
+/// I1: a viewer is not offered Improve with AI or Insert at Cursor, and nothing of the document
+/// is sent for an action that could never apply.
+#[test]
+fn a_viewer_is_not_offered_improve_and_sends_nothing() {
+    use wordcraft_ui_egui::assist::{AssistHost, AssistIn, AssistInbox, AssistOut};
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let sent: Rc<RefCell<Vec<AssistOut>>> = Rc::default();
+    let log = sent.clone();
+    let inbox = AssistInbox::default();
+    inbox.borrow_mut().push(AssistIn::Enabled { proof: false, ai: true });
+    let host = AssistHost {
+        send: Box::new(move |out| {
+            log.borrow_mut().push(out.clone());
+            Ok(())
+        }),
+        inbox: inbox.clone(),
+    };
+    let (mut h, _hub) = alice_with(&relay, Access::Read, false, Services { assist: Some(host), ..Services::default() });
+    settle(&relay, &mut h, &mut bob);
+    assert!(!wordcraft_ui_egui::widgets::enabled(h.state(), "ui.improve"), "Improve is greyed out for a viewer");
+    assert!(h.state_mut().run("ui.improve", json!({})).is_err(), "and refused");
+    h.step();
+    assert!(sent.borrow().is_empty(), "nothing was sent: {:?}", sent.borrow());
+    // Summarize still works for a viewer (Copy), but Insert at Cursor is greyed out.
+    assert!(wordcraft_ui_egui::widgets::enabled(h.state(), "ui.summarize"));
+    h.state_mut().run("ui.tab", json!({"tab": "Review"})).unwrap();
+    h.state_mut().run("ui.summarize", json!({})).unwrap();
+    h.step();
+    let id = sent
+        .borrow()
+        .iter()
+        .find_map(|o| match o {
+            AssistOut::Ai { id, .. } => Some(id.clone()),
+            AssistOut::ProofCheck { .. } => None,
+        })
+        .expect("the summary was asked for");
+    inbox.borrow_mut().push(AssistIn::AiResult { id, text: "A point.".into() });
+    for _ in 0..4 {
+        h.step();
+    }
+    let insert = h
+        .query_all_by_label("Insert at Cursor")
+        .find(|n| n.accesskit_node().role() == Role::Button)
+        .expect("Insert at Cursor");
+    assert!(insert.accesskit_node().is_disabled(), "a viewer can't insert");
+    let copy = h.query_all_by_label("Copy").find(|n| n.accesskit_node().role() == Role::Button && !n.accesskit_node().is_disabled());
+    assert!(copy.is_some(), "but can copy");
 }

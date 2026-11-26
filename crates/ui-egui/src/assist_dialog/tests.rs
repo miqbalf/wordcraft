@@ -173,7 +173,8 @@ fn improve_shows_spinner_then_original_and_proposal_and_replace_applies_once() {
     assert_eq!(box_value(&h, "Original").as_deref(), Some("Teh cat sat."));
     assert!(box_value(&h, "Proposal").is_none(), "no proposal yet");
 
-    page_says(&mut h, AssistIn::AiResult { id: id.clone(), text: "The cat sat.".into() });
+    // A reply wrapped at a fixed width: the box shows it as it will be applied (M2).
+    page_says(&mut h, AssistIn::AiResult { id: id.clone(), text: "The cat\nsat.".into() });
     assert!(!says(&h, ASKING), "the spinner goes when the answer comes");
     assert_eq!(box_value(&h, "Original").as_deref(), Some("Teh cat sat."));
     assert_eq!(box_value(&h, "Proposal").as_deref(), Some("The cat sat."));
@@ -225,6 +226,7 @@ fn refusal_shows_in_the_modal_and_sends_nothing() {
     assert!(asked(&sent).is_empty(), "nothing is sent");
     let replace = button(&h, "Replace");
     assert!(replace.is_none_or(|b| b.accesskit_node().is_disabled()), "nothing to replace");
+    assert!(button(&h, "Cancel").expect("Cancel").is_focused(), "the keyboard is in the modal (M3)");
     h.key_press(egui::Key::Escape);
     h.run_steps(3);
     assert!(!open(h.state()));
@@ -290,14 +292,24 @@ fn summarize_copy_and_insert_at_cursor() {
     assert!(open(h.state()), "Copy leaves the modal open");
     assert_eq!(body(h.state()), before);
 
+    // Keyboard order: Copy, Insert at Cursor, Close.
+    button(&h, "Copy").expect("Copy").focus();
+    h.run_steps(2);
+    h.key_press(egui::Key::Tab);
+    h.run_steps(2);
+    assert!(button(&h, "Insert at Cursor").expect("Insert at Cursor").is_focused(), "Tab moves from Copy to Insert at Cursor");
+    h.key_press(egui::Key::Tab);
+    h.run_steps(2);
+    assert!(button(&h, "Close").expect("Close").is_focused(), "then to Close");
+
+    // The caret at the start of "Intro.": the lines go in as whole paragraphs after it (M1).
     button(&h, "Insert at Cursor").expect("Insert at Cursor").click();
     h.run_steps(3);
     assert!(!open(h.state()), "Insert at Cursor closes the modal");
     let doc = &h.state().session.doc;
-    assert_eq!(doc.paragraph_count(), paras + 1, "two lines: one paragraph more");
+    assert_eq!(doc.paragraph_count(), paras + 2, "two lines: two paragraphs more");
     let texts: Vec<String> = doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.text.clone()).collect();
-    assert!(texts.iter().any(|t| t == "First point."), "{texts:?}");
-    assert!(texts.iter().any(|t| t.starts_with("Second point.")), "{texts:?}");
+    assert_eq!(texts, ["Intro.", "First point.", "Second point.", "End."], "no line glued to the text around the caret");
     h.state_mut().run("edit.undo", json!({})).unwrap();
     assert_eq!(body(h.state()), before, "one undo removes them");
 
@@ -315,6 +327,12 @@ fn modal_is_keyboard_reachable_and_labelled() {
     h.run_steps(3);
     let (id, _, _) = asked(&sent).remove(0);
     assert!(h.state().modal_open(), "the rest of the window waits");
+    let r = modal_rect(&h).expect("the modal");
+    let dialog = h
+        .query_all_by_label("Improve with AI")
+        .any(|n| n.accesskit_node().role() == Role::Dialog && r.contains_rect(n.rect().shrink(1.0)));
+    assert!(dialog, "the modal is a dialog named by its title (M4)");
+    assert!(button(&h, "Cancel").expect("Cancel").is_focused(), "while it waits, the keyboard is on Cancel (M3)");
     page_says(&mut h, AssistIn::AiResult { id, text: "The cat sat.".into() });
     // Every control has a name and a role.
     for label in ["Replace", "Cancel"] {
@@ -339,4 +357,79 @@ fn modal_is_keyboard_reachable_and_labelled() {
     h.run_steps(3);
     assert!(!open(h.state()), "Esc is Cancel");
     assert_eq!(body(h.state()).trim(), "Teh cat sat.");
+}
+
+/// A co-editor (or the user, through a command) changed the selected text while the AI worked:
+/// Replace is refused in the modal and changes nothing.
+#[test]
+fn a_stale_selection_is_refused_in_the_modal() {
+    let (app, sent) = app_on("Teh cat sat.", true);
+    let mut h = harness(app);
+    h.state_mut().run("ui.improve", json!({})).unwrap();
+    h.run_steps(3);
+    let (id, _, _) = asked(&sent).remove(0);
+    page_says(&mut h, AssistIn::AiResult { id, text: "The cat sat.".into() });
+    select(h.state_mut(), (0, 4), (0, 4));
+    h.state_mut().session.run("text.insert", &json!({"text": "big "})).unwrap();
+    button(&h, "Replace").expect("Replace").click();
+    h.run_steps(3);
+    assert!(open(h.state()), "the refusal stays in the modal");
+    assert!(says(&h, wordcraft_engine::cmd::review::TEXT_CHANGED));
+    assert_eq!(body(h.state()).trim(), "Teh big cat sat.", "nothing was replaced");
+}
+
+/// M8: an edit above the selection moves it, but the same text is found again.
+#[test]
+fn an_edit_above_the_selection_does_not_refuse_replace() {
+    let (mut app, sent) = app_on("Intro.\nTeh cat sat.", true);
+    select(&mut app, (1, 0), (1, 0));
+    let mut h = harness(app);
+    h.state_mut().run("ui.improve", json!({})).unwrap();
+    h.run_steps(3);
+    let (id, _, text) = asked(&sent).remove(0);
+    assert_eq!(text, "Teh cat sat.");
+    page_says(&mut h, AssistIn::AiResult { id, text: "The cat sat.".into() });
+    // A new paragraph above moves the selected paragraph down.
+    select(h.state_mut(), (0, 0), (0, 0));
+    h.state_mut().session.run("text.insert", &json!({"text": "Zero."})).unwrap();
+    h.state_mut().session.run("text.newParagraph", &json!({})).unwrap();
+    button(&h, "Replace").expect("Replace").click();
+    h.run_steps(3);
+    assert!(!open(h.state()));
+    let texts: Vec<String> = h.state().session.doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.text.clone()).collect();
+    assert_eq!(texts, ["Zero.", "Intro.", "The cat sat."]);
+}
+
+/// M7: with AI help off, the command (a keytip, a script) says why, on the status bar too.
+#[test]
+fn ai_off_refusal_is_said() {
+    let (mut app, _) = app_on("Some text.", false);
+    for id in ["ui.summarize", "ui.improve"] {
+        app.status_msg = None;
+        let why = app.run(id, json!({})).unwrap_err();
+        assert!(!why.is_empty());
+        assert_eq!(app.status_msg.as_ref().map(|(m, _)| m.as_str()), Some(why.as_str()), "{id} says it on the status bar");
+        assert!(!open(&app));
+    }
+}
+
+/// M5: once the answer is there, a click beside the modal does not throw it away.
+#[test]
+fn a_click_beside_a_ready_modal_keeps_the_answer() {
+    let (app, sent) = app_on("Some text.", true);
+    let mut h = harness(app);
+    h.state_mut().run("ui.summarize", json!({})).unwrap();
+    h.run_steps(3);
+    let (id, _, _) = asked(&sent).remove(0);
+    page_says(&mut h, AssistIn::AiResult { id, text: "A point.".into() });
+    let r = modal_rect(&h).expect("the modal");
+    let beside = egui::pos2(r.min.x - 40.0, r.min.y - 40.0);
+    assert!(!r.contains(beside));
+    h.event(egui::Event::PointerMoved(beside));
+    h.event(egui::Event::PointerButton { pos: beside, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.step();
+    h.event(egui::Event::PointerButton { pos: beside, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(3);
+    assert!(open(h.state()), "the summary is still there");
+    assert_eq!(box_value(&h, "Summary").as_deref(), Some("A point."));
 }
