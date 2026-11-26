@@ -510,6 +510,9 @@ impl WordApp {
         }
         let pump = if link.woken { SAFETY_MS } else { PUMP_MS };
         for n in notices {
+            // In the log too, so a browser test (and a person reading the console) can tell
+            // which notices a session showed.
+            log::info!("live: notice shown: {n}");
             self.status_long(n);
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(pump));
