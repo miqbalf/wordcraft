@@ -735,10 +735,7 @@ fn improve_replace_reaches_the_other_peer() {
     for _ in 0..4 {
         h.step();
     }
-    let replace = h
-        .query_all_by_label("Replace")
-        .find(|n| n.accesskit_node().role() == Role::Button)
-        .expect("the modal's Replace button");
+    let replace = h.query_all_by_label("Replace").find(|n| n.accesskit_node().role() == Role::Button).expect("the modal's Replace button");
     replace.click();
     settle(&relay, &mut h, &mut bob);
     let alice = alice_text(&mut h);

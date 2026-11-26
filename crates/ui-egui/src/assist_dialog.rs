@@ -48,7 +48,9 @@ struct Source {
 enum Kind {
     /// Improve: the source, or `None` when the selection was refused before asking.
     Improve(Option<Source>),
-    Summary { truncated: bool },
+    Summary {
+        truncated: bool,
+    },
 }
 
 enum Phase {
@@ -101,12 +103,14 @@ impl WordApp {
         };
         let text = source.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
         let language = source.get("language").and_then(Value::as_str).unwrap_or("auto").to_string();
-        let kind = Kind::Improve(Some(Source {
+        let src = || Source {
             anchor: source.get("anchor").cloned().unwrap_or(Value::Null),
             focus: source.get("focus").cloned().unwrap_or(Value::Null),
             original: text.clone(),
-        }));
-        self.assist_open(kind, AiTask::Improve, language, text, "improve")
+        };
+        let (ready, failed) = (Kind::Improve(Some(src())), Kind::Improve(Some(src())));
+        let waiting = |id| AssistDialog { kind: ready, phase: Phase::Waiting(id), focus_answer: false };
+        self.assist_open(AiTask::Improve, language, text.clone(), "improve", waiting, failed)
     }
 
     /// `ui.summarize`: ask the AI to summarize the document.
@@ -125,14 +129,23 @@ impl WordApp {
         let text = source.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
         let language = source.get("language").and_then(Value::as_str).unwrap_or("auto").to_string();
         let truncated = source.get("truncated").and_then(Value::as_bool).unwrap_or(false);
-        self.assist_open(Kind::Summary { truncated }, AiTask::Summarize, language, text, "summary")
+        let waiting = |id| AssistDialog::summary(&source, id);
+        self.assist_open(AiTask::Summarize, language, text, "summary", waiting, Kind::Summary { truncated })
     }
 
     /// Sends the request and opens the modal waiting for it (or showing why it was not sent).
-    fn assist_open(&mut self, kind: Kind, task: AiTask, language: String, text: String, name: &str) -> Result<Value, String> {
+    fn assist_open(
+        &mut self,
+        task: AiTask,
+        language: String,
+        text: String,
+        name: &str,
+        waiting: impl FnOnce(String) -> AssistDialog,
+        kind: Kind,
+    ) -> Result<Value, String> {
         match self.assist_ask(task, language, text) {
             Ok(id) => {
-                self.assist.dialog = Some(AssistDialog { kind, phase: Phase::Waiting(id.clone()), focus_answer: false });
+                self.assist.dialog = Some(waiting(id.clone()));
                 Ok(json!({"dialog": name, "id": id}))
             }
             Err(e) => {
@@ -169,7 +182,7 @@ fn poll(app: &mut WordApp, d: &mut AssistDialog) {
 pub(crate) fn show(app: &mut WordApp, ctx: &Context) {
     let Some(mut d) = app.assist.dialog.take() else { return };
     poll(app, &mut d);
-    let resp = egui::Modal::new(Id::new(MODAL_ID)).show(ctx, |ui| body(ui, &mut d));
+    let resp = egui::Modal::new(Id::unique(MODAL_ID)).show(ctx, |ui| body(ui, &mut d));
     // egui's Modal blocks the window behind it, but not the document's keyboard.
     crate::dialogs::release_keyboard(app, ctx);
     let closing = resp.should_close();
@@ -189,10 +202,9 @@ pub(crate) fn show(app: &mut WordApp, ctx: &Context) {
         }
         Some(Choice::Replace) => {
             let applied = match (&d.kind, &d.phase) {
-                (Kind::Improve(Some(src)), Phase::Ready(proposal)) => Some(app.run(
-                    "review.improveApply",
-                    json!({"anchor": src.anchor, "focus": src.focus, "original": src.original, "proposal": proposal}),
-                )),
+                (Kind::Improve(Some(src)), Phase::Ready(proposal)) => Some(
+                    app.run("review.improveApply", json!({"anchor": src.anchor, "focus": src.focus, "original": src.original, "proposal": proposal})),
+                ),
                 _ => None,
             };
             match applied {

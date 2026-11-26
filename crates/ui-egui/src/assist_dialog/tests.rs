@@ -77,7 +77,7 @@ fn open(app: &WordApp) -> bool {
 
 /// The modal's area on screen.
 fn modal_rect(h: &Harness<'static, WordApp>) -> Option<egui::Rect> {
-    h.ctx.memory(|m| m.area_rect(egui::Id::new(MODAL_ID)))
+    h.ctx.memory(|m| m.area_rect(egui::Id::unique(MODAL_ID)))
 }
 
 /// Nodes inside the modal whose label is exactly `label` (trimmed) and whose role is `role`.
