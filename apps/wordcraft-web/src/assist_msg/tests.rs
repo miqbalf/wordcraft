@@ -176,9 +176,13 @@ fn an_emoji_reply_lands_on_the_right_word_in_each_unit() {
 fn ai_result_text_is_capped_at_the_pages_summarize_limit() {
     let at = |n: usize| p(json!({"type": "wordcraft:ai-result", "id": "a", "text": "x".repeat(n)}));
     assert!(matches!(at(204_800), Some(AssistIn::AiResult { .. })));
-    assert_eq!(at(204_801), None);
+    // Over the cap the request fails as too large, so the modal that waits for it stops waiting.
+    let too_large = Some(AssistIn::AiFailed { id: "a".into(), error: "too_large".into() });
+    assert_eq!(at(204_801), too_large);
     // The cap counts UTF-8 bytes, not characters.
-    assert_eq!(p(json!({"type": "wordcraft:ai-result", "id": "a", "text": "é".repeat(102_401)})), None);
+    assert_eq!(p(json!({"type": "wordcraft:ai-result", "id": "a", "text": "é".repeat(102_401)})), too_large);
+    // With no usable id there is nothing to fail.
+    assert_eq!(p(json!({"type": "wordcraft:ai-result", "id": "a b", "text": "x".repeat(204_801)})), None);
 }
 
 /// M4: a host error code is one the app knows; anything else is "unavailable".

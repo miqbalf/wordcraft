@@ -59,6 +59,8 @@ pub struct AssistState {
     waiting: Option<String>,
     /// The answer to the waiting request, until it is taken.
     answer: Option<(String, Result<String, String>)>,
+    /// The Improve with AI or Summary modal, while it is open.
+    pub(crate) dialog: Option<crate::assist_dialog::AssistDialog>,
 }
 
 impl WordApp {

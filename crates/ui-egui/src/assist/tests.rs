@@ -262,12 +262,23 @@ fn a_failed_proof_send_backs_off_and_is_not_stuck() {
 /// that waited before it.
 #[test]
 fn a_failed_ai_send_is_an_error_and_leaves_nothing_waiting() {
-    let (host, _sent) = broken();
+    let (host, sent) = broken();
     let mut app = app_with(Some(host), "x");
     tell(&mut app, AssistIn::Enabled { proof: false, ai: true });
     frame(&mut app, 0.0);
     assert_eq!(app.assist_ask(AiTask::Improve, "auto".into(), "Hi.".into()), Err("no parent".to_string()));
-    assert_eq!(app.assist_take_answer("ai-1"), None);
+    // The id it tried to send is not waiting: its answer, if the page still sent one, is dropped.
+    let tried = sent
+        .borrow()
+        .iter()
+        .find_map(|o| match o {
+            AssistOut::Ai { id, .. } => Some(id.clone()),
+            AssistOut::ProofCheck { .. } => None,
+        })
+        .expect("the send was tried");
+    tell(&mut app, AssistIn::AiResult { id: tried.clone(), text: "Hello.".into() });
+    frame(&mut app, 50.0);
+    assert_eq!(app.assist_take_answer(&tried), None);
     // An older request is replaced even when the newer one never left.
     let (host, _) = fake();
     let mut app = app_with(Some(host), "x");

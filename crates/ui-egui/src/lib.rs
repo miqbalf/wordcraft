@@ -25,6 +25,7 @@ macro_rules! tl {
 pub mod a11y;
 pub mod a11y_pane;
 pub mod assist;
+mod assist_dialog;
 pub mod async_saves;
 pub mod autoscroll;
 pub mod backstage;

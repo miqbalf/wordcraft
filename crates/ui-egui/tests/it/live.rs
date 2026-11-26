@@ -697,3 +697,51 @@ fn ignoring_a_proofing_issue_is_allowed_while_live() {
         assert!(wordcraft_ui_egui::widgets::enabled(h.state(), id), "{id} is a per-viewer command, so live editing allows it");
     }
 }
+
+/// Improve with AI while live: the page's answer, put in by Replace, reaches the other peer as
+/// one ordinary edit.
+#[test]
+fn improve_replace_reaches_the_other_peer() {
+    use wordcraft_ui_egui::assist::{AssistHost, AssistIn, AssistInbox, AssistOut};
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let sent: Rc<RefCell<Vec<AssistOut>>> = Rc::default();
+    let log = sent.clone();
+    let inbox = AssistInbox::default();
+    inbox.borrow_mut().push(AssistIn::Enabled { proof: false, ai: true });
+    let host = AssistHost {
+        send: Box::new(move |out| {
+            log.borrow_mut().push(out.clone());
+            Ok(())
+        }),
+        inbox: inbox.clone(),
+    };
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, true, Services { assist: Some(host), ..Services::default() });
+    settle(&relay, &mut h, &mut bob);
+    // The Review tab: no other Replace button on the ribbon.
+    h.state_mut().run("ui.tab", json!({"tab": "Review"})).unwrap();
+    h.state_mut().run("ui.improve", json!({})).unwrap();
+    h.step();
+    let (id, text) = sent
+        .borrow()
+        .iter()
+        .find_map(|o| match o {
+            AssistOut::Ai { id, text, .. } => Some((id.clone(), text.clone())),
+            AssistOut::ProofCheck { .. } => None,
+        })
+        .expect("the AI was asked");
+    assert_eq!(text, "Hello world", "the caret's paragraph is sent");
+    inbox.borrow_mut().push(AssistIn::AiResult { id, text: "Hello, wide world".into() });
+    for _ in 0..4 {
+        h.step();
+    }
+    let replace = h
+        .query_all_by_label("Replace")
+        .find(|n| n.accesskit_node().role() == Role::Button)
+        .expect("the modal's Replace button");
+    replace.click();
+    settle(&relay, &mut h, &mut bob);
+    let alice = alice_text(&mut h);
+    assert!(alice.contains("Hello, wide world"), "{alice}");
+    assert_eq!(bob.text(), alice, "Bob's body equals Alice's");
+}
