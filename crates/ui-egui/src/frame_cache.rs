@@ -15,8 +15,11 @@
 //! - a popup or menu is open, or a widget inside the part has the keyboard focus;
 //! - a screen reader asked for the accessibility tree (a replay has no widgets to describe);
 //! - the part's rectangle or layer moved;
-//! - the recording is older than [`MAX_AGE`], a bound on how long anything the key misses can
-//!   stay stale;
+//! - the fonts changed, or egui cleared its font atlas: recorded text points into the old atlas
+//!   (a probe galley laid out every frame is a new one then);
+//! - the recording is older than [`MAX_AGE`]. A replay asks for a frame when that age is
+//!   reached, so anything the key misses is shown at most [`MAX_AGE`] late, even in a window
+//!   that would otherwise draw no further frame;
 //! - the last two runs painted different shapes: the part is still settling or animating (a tab
 //!   sliding in, a group re-planned for the width), which asks for frames the replay would not.
 //!
@@ -25,7 +28,7 @@
 
 use std::sync::Arc;
 
-use egui::epaint::ClippedShape;
+use egui::epaint::{ClippedShape, Galley};
 use egui::{Id, LayerId, Rect, Ui};
 
 /// The oldest recording [`show`] replays, in seconds.
@@ -44,6 +47,8 @@ struct Recording {
     busy: bool,
     /// It painted the same shapes as the run before it.
     stable: bool,
+    /// The font probe when it was made ([`fonts_probe`]).
+    fonts: Arc<Galley>,
 }
 
 /// Per-part bookkeeping kept between frames.
@@ -104,6 +109,13 @@ fn commanding(ctx: &egui::Context) -> bool {
     })
 }
 
+/// A short text laid out through egui's galley cache. The cache hands back the same galley each
+/// frame until the fonts change or the font atlas is cleared, which empty the cache: then the
+/// recorded text, whose glyphs point into the old atlas, must not be replayed.
+fn fonts_probe(ctx: &egui::Context) -> Arc<Galley> {
+    ctx.fonts_mut(|f| f.layout_no_wrap("frame_cache fonts probe".to_owned(), egui::FontId::default(), egui::Color32::WHITE))
+}
+
 /// Run `build` in `ui` on a frame that may change what it shows, and otherwise paint what it
 /// painted last time. `id` names the part; `key` fingerprints what it shows.
 pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
@@ -122,6 +134,7 @@ pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
     let recent_input = state.input_frame.is_some_and(|f| frame.saturating_sub(f) <= 1);
     let hovered = ctx.pointer_hover_pos().is_some_and(|p| rect.contains(p));
     let screen_reader = ctx.accesskit_node_builder(ui.scope_id(), |_| ()).is_some();
+    let fonts = fonts_probe(&ctx);
     let replay = !recent_input
         && !hovered
         && !screen_reader
@@ -129,7 +142,15 @@ pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
         && state
             .rec
             .as_ref()
-            .is_some_and(|r| !r.busy && r.stable && r.key == key && r.rect == rect && r.layer == layer && (0.0..MAX_AGE).contains(&(now - r.at)));
+            .is_some_and(|r| {
+                !r.busy
+                    && r.stable
+                    && r.key == key
+                    && r.rect == rect
+                    && r.layer == layer
+                    && Arc::ptr_eq(&r.fonts, &fonts)
+                    && (0.0..MAX_AGE).contains(&(now - r.at))
+            });
     if replay && let Some(rec) = &state.rec {
         ctx.graphics_mut(|g| {
             let list = g.entry(layer);
@@ -138,6 +159,9 @@ pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
             }
         });
         ui.expand_to_include_rect(rect);
+        // Run for real once the recording is MAX_AGE old, even if nothing else draws a frame.
+        let wait = (rec.at + MAX_AGE - now).max(0.0);
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         state.replayed += 1;
         ctx.data_mut(|d| d.insert_temp(id, state));
         return;
@@ -147,7 +171,7 @@ pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
     let shapes: Vec<ClippedShape> = ctx.graphics(|g| g.get(layer).map(|l| l.all_entries().skip(start).cloned().collect()).unwrap_or_default());
     let focus_inside = ctx.memory(|m| m.focused()).and_then(|f| ctx.read_response(f)).is_some_and(|r| rect.intersects(r.rect));
     let stable = state.rec.as_ref().is_some_and(|r| r.rect == rect && r.layer == layer && *r.shapes == shapes);
-    state.rec = Some(Recording { key, rect, layer, shapes: Arc::new(shapes), at: now, busy: hovered || focus_inside, stable });
+    state.rec = Some(Recording { key, rect, layer, shapes: Arc::new(shapes), at: now, busy: hovered || focus_inside, stable, fonts });
     state.built += 1;
     ctx.data_mut(|d| d.insert_temp(id, state));
 }

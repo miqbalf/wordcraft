@@ -975,7 +975,8 @@ pub fn status_bar(app: &mut WordApp, ui: &mut Ui) {
                             status_count_text(unit, counts.in_unit(unit), None)
                         } else {
                             let selected = crate::count_in_unit(&app.session.selected_text(), unit);
-                            status_count_text(unit, counts.in_unit(unit), Some(selected))
+                            // A debounced total can lag a paste: never show more selected than in all.
+                            status_count_text(unit, counts.in_unit(unit).max(selected), Some(selected))
                         };
                         let counted = st(ui, &wtxt);
                         if let Some(counted) = &counted {
@@ -1214,14 +1215,21 @@ pub fn status_bar(app: &mut WordApp, ui: &mut Ui) {
 fn status_key(app: &mut WordApp, ui: &Ui) -> u64 {
     let ctx = ui.ctx();
     let counts = app.status_bar_counts(ctx);
+    let t = Tokens::get(ctx);
+    let layout = app.session.layout();
+    let missing_fonts = app.cached_missing_fonts(&layout).0.len();
+    let dictionary = (crate::ribbon::caret_missing_dictionary(app).is_some(), crate::ribbon::caret_unreadable_dictionary(app).is_some());
     let message = app.status_msg.as_ref().filter(|(_, at)| crate::now_ms() - at < crate::app::STATUS_MS).map(|(m, _)| m.clone());
     let peers = app.live_link().map(|l| l.peers().iter().map(|p| (p.id.clone(), p.display.clone())).collect::<Vec<_>>());
     crate::frame_cache::hash((
         (app.session.rev(), &app.session.sel.anchor, &app.session.sel.focus, app.canvas.viewed_page, app.session.page_hint),
         (app.ui.status_count.code(), counts.words, counts.chars, counts.chars_no_spaces),
         (app.live_status_line(), peers, message),
-        (app.canvas.scale.to_bits(), app.session.view.read_zoom.to_bits(), app.session.view.read_mode),
+        (app.canvas.scale.to_bits(), app.session.view.read_zoom.to_bits(), app.session.view.read_mode, format!("{:?}", app.session.view.mode)),
         (crate::i18n::current().code(), ctx.pixels_per_point().to_bits(), ui.visuals().dark_mode, crate::rtl::on()),
+        // Fixed in round 1 of the review: what the bar shows besides the document.
+        (app.session.doc.settings.track_changes, app.session.prefs.overtype, missing_fonts, dictionary),
+        (t.status_bar, t.border, t.text_dim, t.accent_text, t.icon),
     ))
 }
 
@@ -1307,8 +1315,10 @@ impl WordApp {
     /// document keeps changing, recounted at most every [`COUNT_DEBOUNCE_SECS`] (PERF2): counting
     /// walks the whole document, which typing in a long one paid on every key.
     pub fn status_bar_counts(&mut self, ctx: &egui::Context) -> StatusCounts {
-        if cfg!(target_arch = "wasm32") && self.status_counts.0 != self.status_counts_key() {
-            let id = egui::Id::unique("status_counted_at");
+        // Never counted (a document just opened or switched): count now, never show a stale 0.
+        let counted = self.status_counts.0 != crate::window_ui::NOT_COUNTED.0;
+        if cfg!(target_arch = "wasm32") && counted && self.status_counts.0 != self.status_counts_key() {
+            let id = self.window_id("status_counted_at");
             let now = ctx.input(|i| i.time);
             let last = ctx.data(|d| d.get_temp::<f64>(id));
             if let Some(wait) = recount_wait(last, now) {

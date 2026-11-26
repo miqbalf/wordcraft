@@ -12,25 +12,29 @@
     // The page renderer is built for WebAssembly SIMD, which every current browser has. A browser
     // without it cannot load the module at all: say so, rather than stay on "Loading" (PERF2).
     (function () {
-      var simd = false;
+      var wasm = typeof WebAssembly === "object", simd = false;
       try {
         // A function that returns i8x16.popcnt(i8x16.splat(0)).
-        simd = typeof WebAssembly === "object" && WebAssembly.validate(new Uint8Array([
+        simd = wasm && WebAssembly.validate(new Uint8Array([
           0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]));
       } catch (e) {}
       if (simd) return;
-      window.wordcraftUnsupported = true;
-      var text = /^id\b/i.test(navigator.language || "")
-        ? "Peramban ini tidak dapat menjalankan WordCraft karena tidak mendukung WebAssembly SIMD. Perbarui peramban, atau buka berkas di peramban lain."
-        : "This browser cannot run WordCraft because it does not support WebAssembly SIMD. Update the browser, or open the file in another browser.";
+      var id = /^id\b/i.test(navigator.language || "");
+      // WebAssembly switched off (a lockdown or "safest" mode) is a setting, not an old browser.
+      var text = !wasm
+        ? (id ? "WebAssembly dinonaktifkan di peramban ini, jadi WordCraft tidak dapat berjalan. Aktifkan WebAssembly di pengaturan keamanan peramban, atau buka berkas di peramban lain."
+              : "WebAssembly is turned off in this browser, so WordCraft cannot run. Turn WebAssembly on in the browser's security settings, or open the file in another browser.")
+        : (id ? "Peramban ini tidak dapat menjalankan WordCraft karena tidak mendukung WebAssembly SIMD. Perbarui peramban, atau buka berkas di peramban lain."
+              : "This browser cannot run WordCraft because it does not support WebAssembly SIMD. Update the browser, or open the file in another browser.");
       document.addEventListener("DOMContentLoaded", function () {
         var loading = document.getElementById("wordcraft_loading");
-        if (loading) {
-          loading.textContent = text;
-          loading.setAttribute("role", "alert");
-          loading.style.padding = "0 24px";
-          loading.style.textAlign = "center";
-        }
+        if (!loading) return;
+        // The live region first, then the text, so screen readers announce it.
+        loading.setAttribute("role", "alert");
+        loading.setAttribute("aria-live", "assertive");
+        loading.style.padding = "0 24px";
+        loading.style.textAlign = "center";
+        loading.textContent = text;
       });
     })();
   </script>

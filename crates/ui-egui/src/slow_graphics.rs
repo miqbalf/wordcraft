@@ -27,10 +27,11 @@ fn id() -> Id {
     Id::unique("slow_graphics_notice")
 }
 
-/// Whether a renderer's name is a software renderer's.
+/// Whether a renderer's name is a software renderer's (Windows' WARP is the "Microsoft Basic
+/// Render Driver").
 pub fn is_software(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    ["swiftshader", "llvmpipe", "software"].iter().any(|s| name.contains(s))
+    ["swiftshader", "llvmpipe", "software", "basic render driver"].iter().any(|s| name.contains(s))
 }
 
 /// The browser draws with `name` (`cpu`: the graphics API itself says it is a CPU device). Only

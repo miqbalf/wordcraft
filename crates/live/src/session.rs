@@ -190,6 +190,15 @@ impl LiveApp<Word> for App<'_> {
     }
 }
 
+/// With a clock ([`LiveEditing::set_clock`]), how long between two checks of the window's body
+/// against the shared copy, in milliseconds. A browser window whose hub wakes it pumps only a
+/// few times a second when idle, so a pump count would stretch the 30 s to minutes (PERF2 fix 1).
+pub const VERIFY_EVERY_MS: f64 = 30_000.0;
+
+/// With a clock, how long the session and the shared copy must stay unchanged before a due
+/// check runs, in milliseconds (a pause in the typing).
+pub const VERIFY_QUIET_MS: f64 = 3_000.0;
+
 /// How many pumps pass between two checks of the window's body against the shared copy
 /// ([`LiveEditing::verify`]): about 5 s while frames run at 60 a second, about 30 s at a host's
 /// idle pump of 100 ms. A check finds nothing changed since the last clean one most of the time,
@@ -223,7 +232,18 @@ pub struct LiveEditing<H: Hub> {
     /// many pumps since they have not moved.
     seen: (u64, u64),
     quiet: u32,
+    /// The clock the check's time cadence runs on (the caret limit's, shared), in milliseconds.
+    clock: Option<SharedClock>,
+    /// On that clock: when the last check ran (or the link started), and since when the
+    /// session and the shared copy have not moved.
+    verified_at: Option<f64>,
+    quiet_since: Option<f64>,
+    /// How many checks ran ([`LiveEditing::verify`]), for the host's report and the tests.
+    checks: u64,
 }
+
+/// A clock both this link and its core read.
+type SharedClock = Arc<std::sync::Mutex<Box<dyn FnMut() -> f64 + Send>>>;
 
 impl<H: Hub> LiveEditing<H> {
     /// Start editing `file_bytes` (named `file_name`, for its format) live in room `room`,
@@ -256,6 +276,10 @@ impl<H: Hub> LiveEditing<H> {
             repairs: 0,
             seen: (0, 0),
             quiet: 0,
+            clock: None,
+            verified_at: None,
+            quiet_since: None,
+            checks: 0,
         })
     }
 
@@ -264,13 +288,18 @@ impl<H: Hub> LiveEditing<H> {
     pub fn pump(&mut self, session: &mut Session) -> Vec<Peer> {
         let peers = self.core.pump(&mut App { session, map: &mut self.map, pending: &mut self.pending });
         self.since_verify = self.since_verify.saturating_add(1);
+        let at = self.now();
         let now = (session.rev(), self.core.newest_seq());
         if now == self.seen {
             self.quiet = self.quiet.saturating_add(1);
         } else {
-            (self.seen, self.quiet) = (now, 0);
+            (self.seen, self.quiet, self.quiet_since) = (now, 0, at);
         }
-        if self.verify_every > 0 && self.since_verify >= self.verify_every && self.quiet >= VERIFY_QUIET {
+        if let Some(t) = at {
+            self.verified_at.get_or_insert(t);
+            self.quiet_since.get_or_insert(t);
+        }
+        if self.verify_due(at) {
             self.verify(session);
         }
         peers
@@ -304,6 +333,9 @@ impl<H: Hub> LiveEditing<H> {
     /// last clean check. Returns whether it had drifted.
     pub fn verify(&mut self, session: &mut Session) -> bool {
         self.since_verify = 0;
+        self.verified_at = self.now().or(self.verified_at);
+        self.checks = self.checks.saturating_add(1);
+        log::info!("live: drift check {}", self.checks);
         self.flush(session);
         let now = (session.rev(), self.core.newest_seq());
         if self.clean_at == Some(now) {
@@ -326,6 +358,31 @@ impl<H: Hub> LiveEditing<H> {
             log::warn!("live: the rebuild from the shared copy did not land: {e}");
         }
         true
+    }
+
+    /// Whether the periodic check is due: [`VERIFY_EVERY`] pumps after the last one, at a pause
+    /// of [`VERIFY_QUIET`] pumps, or with a clock [`VERIFY_EVERY_MS`] after it, at a pause of
+    /// [`VERIFY_QUIET_MS`], whichever comes first.
+    fn verify_due(&self, at: Option<f64>) -> bool {
+        if self.verify_every == 0 {
+            return false;
+        }
+        let by_pumps = self.since_verify >= self.verify_every && self.quiet >= VERIFY_QUIET;
+        let by_time = match (at, self.verified_at, self.quiet_since) {
+            (Some(now), Some(last), Some(still)) => now - last >= VERIFY_EVERY_MS && now - still >= VERIFY_QUIET_MS,
+            _ => false,
+        };
+        by_pumps || by_time
+    }
+
+    /// The clock's time, if the link has one.
+    fn now(&self) -> Option<f64> {
+        self.clock.as_ref().map(|c| (c.lock().unwrap_or_else(std::sync::PoisonError::into_inner))())
+    }
+
+    /// How many periodic or explicit checks ran ([`LiveEditing::verify`]).
+    pub fn checks(&self) -> u64 {
+        self.checks
     }
 
     /// Check every `pumps` pumps ([`LiveEditing::verify`]); 0 turns the periodic check off (a
@@ -461,8 +518,13 @@ impl<H: Hub> LiveEditing<H> {
 
     /// The clock the caret limit runs on, in milliseconds. Native builds have one; a browser
     /// host passes the page's.
+    /// The drift check's time cadence runs on it too ([`VERIFY_EVERY_MS`]).
     pub fn set_clock(&mut self, clock: Box<dyn FnMut() -> f64 + Send>) {
-        self.core.set_clock(clock);
+        let shared: SharedClock = Arc::new(std::sync::Mutex::new(clock));
+        let core = Arc::clone(&shared);
+        self.core.set_clock(Box::new(move || (core.lock().unwrap_or_else(std::sync::PoisonError::into_inner))()));
+        self.clock = Some(shared);
+        (self.verified_at, self.quiet_since) = (None, None);
     }
 
     /// The link, for reading its state.

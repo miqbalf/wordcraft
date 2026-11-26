@@ -578,8 +578,11 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
 /// selection (the format the buttons show), the tab, the language, the scale and the theme.
 /// Anything else it shows changes through a command, whose input runs the body anyway, or shows
 /// within [`crate::frame_cache::MAX_AGE`].
-fn body_key(app: &WordApp, ui: &Ui) -> u64 {
+pub(crate) fn body_key(app: &mut WordApp, ui: &Ui) -> u64 {
     let ctx = ui.ctx();
+    let t = crate::theme::Tokens::get(ctx);
+    let layout = app.session.layout();
+    let missing_fonts = app.cached_missing_fonts(&layout).0.len();
     // Keytip badges are placed over the buttons as they are laid out: run every frame while shown.
     let keytips = (app.ui.keytips != crate::keytips::Phase::Off).then(|| ctx.cumulative_frame_nr());
     crate::frame_cache::hash((
@@ -594,6 +597,16 @@ fn body_key(app: &WordApp, ui: &Ui) -> u64 {
         crate::rtl::on(),
         keytips,
         app.session.math.is_some(),
+        // Fixed in round 1 of the review: state that greys or marks commands besides the document.
+        (
+            app.live_status_line(),
+            app.recipient_list_pending,
+            app.session.doc.settings.track_changes,
+            app.session.prefs.overtype,
+            format!("{:?}", app.session.view.mode),
+            missing_fonts,
+            (t.ribbon, t.border, t.text, t.accent, t.icon),
+        ),
     ))
 }
 
