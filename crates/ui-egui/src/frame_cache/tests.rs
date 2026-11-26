@@ -2,7 +2,7 @@ use std::cell::Cell;
 
 use egui::{Context, Event, Id, RawInput, pos2, vec2};
 
-use super::{MAX_AGE, counts, set_enabled, show};
+use super::{BACKSTOP_GRACE, MAX_AGE, counts, hold_presses, set_enabled, show};
 
 /// One frame at `time` with `events`: a panel at the top holding the part, which paints a label
 /// (`text`) and counts its runs in `ran`. Returns the frame's shape count.
@@ -145,9 +145,10 @@ fn a_replay_asks_for_a_frame_when_its_recording_is_max_age_old() {
     assert_eq!(ran.get(), 2);
     let delay = repaint_delay(&ctx, 1.5, &ran);
     assert_eq!(ran.get(), 2, "replayed");
-    // Recorded at 1.2: the next frame is due at 2.2, 0.7 s after this one.
-    assert!(delay <= std::time::Duration::from_secs_f64(MAX_AGE - 0.3 + 0.01), "{delay:?}");
-    assert!(delay >= std::time::Duration::from_secs_f64(MAX_AGE - 0.3 - 0.01), "{delay:?}");
+    // Recorded at 1.2: the backstop is due MAX_AGE + BACKSTOP_GRACE after that, 0.3 s from now.
+    let want = MAX_AGE + BACKSTOP_GRACE - 0.3;
+    assert!(delay <= std::time::Duration::from_secs_f64(want + 0.01), "{delay:?}");
+    assert!(delay >= std::time::Duration::from_secs_f64(want - 0.01), "{delay:?}");
 }
 
 #[test]
@@ -167,16 +168,16 @@ fn new_fonts_run_the_part_again() {
 }
 
 #[test]
-fn a_recording_half_max_age_old_runs_on_the_next_frame() {
+fn a_recording_older_than_the_caret_blink_is_still_replayed() {
     let (ctx, ran) = (on(), Cell::new(0));
     for t in [1.0, 1.1, 1.2] {
         frame(&ctx, t, vec![], 7, "Home", &ran);
     }
     assert_eq!(ran.get(), 2, "settled and replayed");
-    // Recorded at 1.1: a frame that comes anyway once it is MAX_AGE / 2 old runs the part, so the
-    // refresh rides on that frame and the backstop frame at MAX_AGE is not needed.
-    frame(&ctx, 1.1 + MAX_AGE / 2.0 + 0.01, vec![], 7, "Home", &ran);
-    assert_eq!(ran.get(), 3);
+    // Recorded at 1.1: the next caret edge comes 0.53 s later. It must replay, or the bars are
+    // rebuilt at every edge of an idle window (PERF2 fix round 2 review, F1).
+    frame(&ctx, 1.1 + 0.53, vec![], 7, "Home", &ran);
+    assert_eq!(ran.get(), 2, "replayed");
 }
 
 #[test]
@@ -196,4 +197,133 @@ fn a_blinking_caret_gets_no_extra_frames_from_the_cache() {
         }
     }
     assert!(extra.is_empty(), "frames asked for before the next caret edge: {extra:?}");
+    // And the bars do not run at every edge: with the cache off this part runs 12 times
+    // (PERF2 fix round 2 review, F2).
+    assert!(ran.get() <= 7, "the part ran {} times over 12 caret edges", ran.get());
+}
+
+// ---- LI3: a press that arrives with the pointer must still click a replayed part ----
+
+/// One frame through [`hold_presses`], as the app's `raw_input_hook` runs it: a top panel holding a
+/// cached part with a "Copy" button. `clicks` counts its clicks, `button` its rectangle.
+fn hooked(ctx: &Context, time: f64, events: Vec<Event>, clicks: &Cell<u32>, button: &Cell<egui::Rect>, ran: &Cell<u32>) {
+    let mut input =
+        RawInput { time: Some(time), screen_rect: Some(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))), events, ..Default::default() };
+    hold_presses(ctx, &mut input);
+    let out = ctx.run_ui(input, |ui| {
+        egui::Panel::top("part").exact_size(40.0).show(ui, |ui| {
+            show(ui, id(), 7, |ui| {
+                ran.set(ran.get() + 1);
+                let r = ui.button("Copy");
+                button.set(r.rect);
+                if r.clicked() {
+                    clicks.set(clicks.get() + 1);
+                }
+            });
+        });
+    });
+    out.drop_without_applying_deltas();
+}
+
+type Rig = (Context, Cell<u32>, Cell<egui::Rect>, Cell<u32>, f64);
+
+/// A context whose part has settled and is replayed, and where its button is.
+fn replaying() -> Rig {
+    let (ctx, clicks, button, ran) = (on(), Cell::new(0), Cell::new(egui::Rect::NOTHING), Cell::new(0));
+    // The pointer starts in the page, away from the part.
+    let mut t = 1.0;
+    hooked(&ctx, t, vec![Event::PointerMoved(pos2(400.0, 300.0))], &clicks, &button, &ran);
+    for _ in 0..4 {
+        t += 0.05;
+        hooked(&ctx, t, vec![], &clicks, &button, &ran);
+    }
+    assert!(counts(&ctx, id()).1 >= 2, "the part is replayed before the click: {:?}", counts(&ctx, id()));
+    (ctx, clicks, button, ran, t)
+}
+
+fn press(pos: egui::Pos2) -> Event {
+    Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() }
+}
+
+fn release(pos: egui::Pos2) -> Event {
+    Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }
+}
+
+#[test]
+fn a_click_that_arrives_with_the_pointer_still_clicks_a_replayed_button() {
+    let (ctx, clicks, button, ran, mut t) = replaying();
+    let at = button.get().center();
+    t += 0.05;
+    hooked(&ctx, t, vec![Event::PointerMoved(at), press(at), release(at)], &clicks, &button, &ran);
+    for _ in 0..2 {
+        t += 0.05;
+        hooked(&ctx, t, vec![], &clicks, &button, &ran);
+    }
+    assert_eq!(clicks.get(), 1, "the click was lost");
+}
+
+#[test]
+fn a_tap_that_arrives_with_the_finger_still_clicks_a_replayed_button() {
+    let (ctx, clicks, button, ran, mut t) = replaying();
+    let at = button.get().center();
+    let touch = |phase| Event::Touch { device_id: egui::TouchDeviceId(1), id: egui::TouchId(1), phase, pos: at, force: None };
+    t += 0.05;
+    let events = vec![touch(egui::TouchPhase::Start), press(at), touch(egui::TouchPhase::End), release(at), Event::PointerGone];
+    hooked(&ctx, t, events, &clicks, &button, &ran);
+    for _ in 0..2 {
+        t += 0.05;
+        hooked(&ctx, t, vec![], &clicks, &button, &ran);
+    }
+    assert_eq!(clicks.get(), 1, "the tap was lost");
+}
+
+#[test]
+fn a_press_with_the_pointer_already_over_the_button_is_not_delayed() {
+    let (ctx, clicks, button, ran, mut t) = replaying();
+    let at = button.get().center();
+    t += 0.05;
+    hooked(&ctx, t, vec![Event::PointerMoved(at)], &clicks, &button, &ran);
+    t += 0.05;
+    hooked(&ctx, t, vec![press(at), release(at)], &clicks, &button, &ran);
+    t += 0.05;
+    hooked(&ctx, t, vec![], &clicks, &button, &ran);
+    assert_eq!(clicks.get(), 1, "a hovered part took the click as before");
+}
+
+#[test]
+fn a_press_outside_every_replayed_part_is_passed_on_at_once() {
+    let (ctx, ..) = replaying();
+    let away = pos2(500.0, 400.0);
+    let mut input = RawInput { events: vec![Event::PointerMoved(away), press(away), release(away)], ..Default::default() };
+    hold_presses(&ctx, &mut input);
+    assert_eq!(input.events, vec![Event::PointerMoved(away), press(away), release(away)]);
+}
+
+#[test]
+fn a_held_press_keeps_the_order_of_the_events_and_is_let_go_one_frame_later() {
+    let (ctx, clicks, button, ran, mut t) = replaying();
+    let at = button.get().center();
+    let (before, key) = (Event::Text("a".into()), Event::Text("b".into()));
+    let mut input = RawInput { events: vec![before.clone(), press(at), release(at), key.clone()], ..Default::default() };
+    hold_presses(&ctx, &mut input);
+    assert_eq!(input.events, vec![before, Event::PointerMoved(at)], "the pointer moves through, the press waits");
+    t += 0.05;
+    hooked(&ctx, t, input.events, &clicks, &button, &ran);
+    let mut next = RawInput::default();
+    hold_presses(&ctx, &mut next);
+    assert_eq!(next.events, vec![press(at), release(at), key], "the held events come back in order");
+    let mut later = RawInput::default();
+    hold_presses(&ctx, &mut later);
+    assert!(later.events.is_empty(), "and only once");
+}
+
+#[test]
+fn quiet_frames_and_pointer_moves_elsewhere_still_replay_with_the_hook_on() {
+    let (ctx, clicks, button, ran, mut t) = replaying();
+    let before = ran.get();
+    for _ in 0..6 {
+        t += 0.05;
+        hooked(&ctx, t, vec![Event::PointerMoved(pos2(400.0, 300.0))], &clicks, &button, &ran);
+    }
+    assert_eq!(ran.get(), before, "no frame ran the part");
 }

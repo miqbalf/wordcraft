@@ -17,16 +17,21 @@
 //! - the part's rectangle or layer moved;
 //! - the fonts changed, or egui cleared its font atlas: recorded text points into the old atlas
 //!   (a probe galley laid out every frame is a new one then);
-//! - the recording is [`MAX_AGE`] / 2 old or older, so anything the key misses is shown on the
-//!   next frame that comes anyway (a caret blink, a live tick) and costs no frame of its own. A
-//!   replay also asks for a frame at [`MAX_AGE`], as a backstop for a window that would otherwise
-//!   draw no further frame: a frame that comes first clears that request, so anything the key
-//!   misses is shown at most [`MAX_AGE`] late;
+//! - the recording is [`MAX_AGE`] old or older. The window is longer than the longest period of
+//!   the frames that come anyway (the caret blinks every 0.53 s), so a blinking window replays at
+//!   most one frame in three and its bars run about once a second. A replay asks for a frame only
+//!   as a backstop, [`BACKSTOP_GRACE`] after [`MAX_AGE`], for a window that would otherwise draw no
+//!   further frame: a frame that comes first clears that request, and a run asks for none, so
+//!   anything the key misses is shown at most [`MAX_AGE`] + [`BACKSTOP_GRACE`] late;
 //! - the last two runs painted different shapes: the part is still settling or animating (a tab
 //!   sliding in, a group re-planned for the width), which asks for frames the replay would not.
 //!
 //! A replay registers no widgets, so it takes no clicks: that is why the pointer over the part,
-//! or any click, makes it run for real.
+//! or any click, makes it run for real. That is too late for a press that arrives with the pointer
+//! in one frame (a tap, a scripted click, a fast flick): egui hit-tests it against the widgets of
+//! the frame before, and that frame was a replay. [`hold_presses`] (called from the app's
+//! `raw_input_hook`) holds such a press, and what follows it, for one frame and lets the pointer
+//! move through: the part runs on that frame, and the press then finds its widgets (LI3).
 
 use std::sync::Arc;
 
@@ -35,6 +40,10 @@ use egui::{Id, LayerId, Rect, Ui};
 
 /// The oldest recording [`show`] replays, in seconds.
 pub const MAX_AGE: f64 = 1.0;
+
+/// How long past [`MAX_AGE`] a replay waits for a frame to come anyway before it asks for one: more
+/// than the caret's blink period, so in a window that blinks the request is always cleared first.
+pub const BACKSTOP_GRACE: f64 = 0.25;
 
 /// What a part painted on the last frame it ran.
 #[derive(Clone)]
@@ -51,6 +60,25 @@ struct Recording {
     stable: bool,
     /// The font probe when it was made ([`fonts_probe`]).
     fonts: Arc<Galley>,
+}
+
+/// The parts replayed on a frame, with the frame's number and the part's rectangle.
+#[derive(Clone, Default)]
+struct Replayed(std::collections::HashMap<Id, (u64, Rect)>);
+
+/// Input held back by [`hold_presses`]: the cumulative frame number when it was held, and the events.
+#[derive(Clone)]
+struct Held {
+    at: u64,
+    events: Vec<egui::Event>,
+}
+
+fn replayed_id() -> Id {
+    Id::unique("frame_cache_replayed")
+}
+
+fn held_id() -> Id {
+    Id::unique("frame_cache_held")
 }
 
 /// Per-part bookkeeping kept between frames.
@@ -148,7 +176,7 @@ pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
                 && r.rect == rect
                 && r.layer == layer
                 && Arc::ptr_eq(&r.fonts, &fonts)
-                && (0.0..MAX_AGE / 2.0).contains(&(now - r.at))
+                && (0.0..MAX_AGE).contains(&(now - r.at))
         });
     if replay && let Some(rec) = &state.rec {
         ctx.graphics_mut(|g| {
@@ -158,13 +186,16 @@ pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
             }
         });
         ui.expand_to_include_rect(rect);
-        // The backstop: run for real once the recording is MAX_AGE old even if nothing else draws
-        // a frame. A frame that comes first runs the part (it is MAX_AGE / 2 old by then, or this
-        // replay's request is renewed), and the browser runner drops this request when it draws.
-        let wait = (rec.at + MAX_AGE - now).max(0.0);
+        // The backstop: run for real once the recording is MAX_AGE old even if no frame comes. A
+        // frame that comes first runs the part (it is MAX_AGE old by then) and the browser runner
+        // drops this request when it draws; the grace keeps the request behind a caret's edges.
+        let wait = (rec.at + MAX_AGE + BACKSTOP_GRACE - now).max(0.0);
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         state.replayed += 1;
-        ctx.data_mut(|d| d.insert_temp(id, state));
+        ctx.data_mut(|d| {
+            d.get_temp_mut_or_default::<Replayed>(replayed_id()).0.insert(id, (frame, rect));
+            d.insert_temp(id, state);
+        });
         return;
     }
     let start = ctx.graphics(|g| g.get(layer).map_or(0, |l| l.next_idx().0));
@@ -174,7 +205,59 @@ pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
     let stable = state.rec.as_ref().is_some_and(|r| r.rect == rect && r.layer == layer && *r.shapes == shapes);
     state.rec = Some(Recording { key, rect, layer, shapes: Arc::new(shapes), at: now, busy: hovered || focus_inside, stable, fonts });
     state.built += 1;
-    ctx.data_mut(|d| d.insert_temp(id, state));
+    let held = ctx.data_mut(|d| {
+        d.get_temp_mut_or_default::<Replayed>(replayed_id()).0.remove(&id);
+        d.insert_temp(id, state);
+        d.get_temp::<Held>(held_id()).is_some()
+    });
+    if held {
+        // A press waits for this frame's widgets: the next frame lets it go.
+        ctx.request_repaint();
+    }
+}
+
+/// Hold a press that lands on a part which was replayed last frame, and what follows it, for one
+/// frame. Call it from the app's `raw_input_hook` with the frame's input, before anything reads it.
+///
+/// egui hit-tests a press against the widgets of the frame before, and a replay registers none, so
+/// a press that arrives with the pointer (a tap, a scripted click, a fast flick) would find no
+/// button. The press and the events after it wait; a pointer move to the press's position takes
+/// their place, so the part runs on this frame ([`show`] runs a part the pointer is over) and
+/// registers its widgets. The next frame gets the held events first, in their order, and asks for
+/// it now. A press that lands anywhere else, or on a part that ran last frame, passes at once.
+pub fn hold_presses(ctx: &egui::Context, raw: &mut egui::RawInput) {
+    if !enabled(ctx) || raw.viewport_id != egui::ViewportId::ROOT {
+        return;
+    }
+    let frame = ctx.cumulative_frame_nr();
+    if let Some(held) = ctx.data(|d| d.get_temp::<Held>(held_id())) {
+        if frame <= held.at {
+            // The same input offered again (a tick that drew nothing): keep holding.
+            return;
+        }
+        ctx.data_mut(|d| d.remove::<Held>(held_id()));
+        raw.events.splice(0..0, held.events);
+        return;
+    }
+    let rects: Vec<Rect> = ctx.data(|d| d.get_temp::<Replayed>(replayed_id())).map_or_else(Vec::new, |r| {
+        r.0.values().filter(|(at, _)| at + 1 == frame).map(|(_, rect)| *rect).collect()
+    });
+    if rects.is_empty() {
+        return;
+    }
+    let landing = raw.events.iter().enumerate().find_map(|(i, e)| match e {
+        egui::Event::PointerButton { pos, pressed: true, .. } | egui::Event::Touch { pos, phase: egui::TouchPhase::Start, .. }
+            if rects.iter().any(|r| r.contains(*pos)) =>
+        {
+            Some((i, *pos))
+        }
+        _ => None,
+    });
+    let Some((i, pos)) = landing else { return };
+    let events = raw.events.split_off(i);
+    raw.events.push(egui::Event::PointerMoved(pos));
+    ctx.data_mut(|d| d.insert_temp(held_id(), Held { at: frame, events }));
+    ctx.request_repaint();
 }
 
 /// A fingerprint of `value` for a key.
