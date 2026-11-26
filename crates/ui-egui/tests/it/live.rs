@@ -687,3 +687,13 @@ fn hosted_live_file_shown_again_after_another_document_still_refuses_save() {
     h.state_mut().run("file.saveAs", json!({"path": "plan.odt"})).unwrap();
     assert_eq!(copies.borrow().last().map(String::as_str), Some("plan.odt"), "a copy still downloads");
 }
+
+#[test]
+fn ignoring_a_proofing_issue_is_allowed_while_live() {
+    let relay = MemRelay::new();
+    let _bob = Bob::join(&relay);
+    let (h, _hub) = alice(&relay, Access::Edit, true);
+    for id in ["review.ignoreIssue", "review.ignoreRule", "review.ignoreAll"] {
+        assert!(wordcraft_ui_egui::widgets::enabled(h.state(), id), "{id} is a per-viewer command, so live editing allows it");
+    }
+}

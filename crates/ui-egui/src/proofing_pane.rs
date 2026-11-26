@@ -221,9 +221,16 @@ fn body(app: &mut WordApp, ui: &mut Ui, form: &mut SpellingForm) {
         return;
     }
     ui.add_space(6.0);
-    if action_link(ui, "Ignore Once") {
+    if crate::canvas::shows_ignore(&form.issue) {
+        if action_link(ui, "Ignore") {
+            form.act(app, Some("review.ignoreIssue"));
+        } else if action_link(ui, "Ignore Rule") {
+            form.act(app, Some("review.ignoreRule"));
+        }
+    } else if action_link(ui, "Ignore Once") {
         form.act(app, None);
-    } else if spelling && action_link(ui, "Ignore All") {
+    }
+    if spelling && action_link(ui, "Ignore All") {
         form.act(app, Some("review.ignoreAll"));
     } else if spelling && action_link(ui, "Add to Dictionary") {
         form.act(app, Some("review.addToDictionary"));
@@ -272,6 +279,34 @@ mod tests {
         let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(frame, app);
         h.run_steps(6);
         h
+    }
+
+    /// A window on `text` where the remote checker flagged each `(word, kind, rule)`.
+    fn remote_app(text: &str, flags: &[(&str, wordcraft_engine::proof_remote::RemoteKind, &str)]) -> WordApp {
+        use wordcraft_engine::proof_remote::{ProofReply, RemoteMatch};
+        let mut app = WordApp::new(Session::new(wordcraft_doc::Document::from_text(text)), crate::Services::default());
+        app.session.proof_remote.set_enabled(true);
+        let mut at = 0.0;
+        let request = loop {
+            if let Some(r) = app.session.proof_poll(at).send.into_iter().next() {
+                break r;
+            }
+            at += 250.0;
+            assert!(at < 10_000.0, "nothing was sent");
+        };
+        let matches = flags
+            .iter()
+            .map(|(word, kind, rule)| RemoteMatch {
+                offset: request.text.find(word).map_or(0, |b| request.text[..b].chars().count()),
+                length: word.chars().count(),
+                kind: *kind,
+                message: "Remote message".into(),
+                replacements: vec!["rug".into()],
+                rule: rule.to_string(),
+            })
+            .collect();
+        app.session.proof_receive(&request.id, Ok(ProofReply { matches, ..Default::default() }), at + 20_000.0);
+        app
     }
 
     fn form(app: &WordApp) -> &SpellingForm {
@@ -395,5 +430,28 @@ mod tests {
         assert_eq!(form(&a).issue["text"], "brwn");
         a.run("file.new", json!({})).unwrap();
         assert!(a.spelling_review.is_none());
+    }
+
+    #[test]
+    fn pane_ignore_moves_to_the_next_issue_and_the_ignored_one_is_gone() {
+        use wordcraft_engine::proof_remote::RemoteKind::Grammar;
+        let text = "The cat sat on the mat today.";
+        let mut app = remote_app(text, &[("cat", Grammar, "R_X"), ("mat", Grammar, "R_Y")]);
+        app.run("review.spelling", json!({})).unwrap();
+        assert_eq!(form(&app).issue["text"], "cat");
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(frame, app);
+        h.run_steps(6);
+        assert_eq!(h.query_all_by_label("Ignore Once").count(), 0, "a grammar issue shows Ignore, not Ignore Once");
+        assert_eq!(h.query_all_by_label("Ignore All").count(), 0);
+        assert_eq!(h.query_all_by_label("Ignore Rule").count(), 1);
+        h.get_by_label("Ignore").click();
+        h.run_steps(3);
+        assert_eq!(form(h.state()).issue["text"], "mat", "on to the next issue");
+        let issues = h.state_mut().session.run("review.issues", &json!({})).unwrap();
+        assert!(issues.as_array().unwrap().iter().all(|i| i["text"] != "cat"), "the ignored issue is gone: {issues}");
+        h.get_by_label("Ignore Rule").click();
+        h.run_steps(3);
+        assert!(form(h.state()).done());
+        assert_eq!(h.state().session.doc.plain_text(StoryRef::Body), text, "ignoring never edits the text");
     }
 }

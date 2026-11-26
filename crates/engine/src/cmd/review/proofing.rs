@@ -129,13 +129,43 @@ pub(super) fn all_issues(s: &mut Session, _: &Value) -> CmdResult {
     Ok(Value::Array(out))
 }
 
-pub(super) fn suggestions(s: &mut Session, v: &Value) -> CmdResult {
-    // Explicit positions are point lookups, even when they equal the selection focus.
-    // Only an implicit or unparseable position keeps the exact selected issue.
-    let issue = match v.get("pos").and_then(crate::cmd::parse_pos) {
+/// The issue `v`'s `pos` names, else the one at the selection. Explicit positions are point
+/// lookups, even when they equal the selection focus; only an implicit or unparseable position
+/// keeps the exact selected issue.
+fn issue_for(s: &Session, v: &Value) -> Option<(Pos, Pos, ProofIssue)> {
+    match v.get("pos").and_then(crate::cmd::parse_pos) {
         Some(at) => para_issues(s, at.story, &at.path).into_iter().find(|(a, b, _)| a.off <= at.off && at.off <= b.off),
         None => issue_at(s, &s.sel.focus),
+    }
+}
+
+/// Ignore this issue: it stays hidden while its paragraph has this text, in this document. The
+/// ignore belongs to the viewer: no edit, no undo step, nothing shared.
+pub(super) fn ignore_issue(s: &mut Session, v: &Value) -> CmdResult {
+    let Some((a, b, issue)) = issue_for(s, v) else { return Err(CmdError::Params("no issue here".into())) };
+    let Some(para) = s.doc.para_at(&a).cloned() else { return Err(CmdError::Params("no issue here".into())) };
+    let document = s.document_id();
+    s.proof_remote.ignore_occurrence(document, &para, a.off, b.off, &issue.rule);
+    s.proof_refresh();
+    s.relayout();
+    Ok(json!({"ignored": issue.rule}))
+}
+
+/// Ignore a rule (named, else the issue's) in this document, for this viewer.
+pub(super) fn ignore_rule(s: &mut Session, v: &Value) -> CmdResult {
+    let rule = match p::str(v, "rule").filter(|r| !r.is_empty()) {
+        Some(rule) => rule.to_string(),
+        None => issue_for(s, v).map(|(_, _, i)| i.rule).ok_or_else(|| CmdError::Params("no issue here".into()))?,
     };
+    let document = s.document_id();
+    s.proof_remote.ignore_rule(document, &rule);
+    s.proof_refresh();
+    s.relayout();
+    Ok(json!({"ignoredRule": rule}))
+}
+
+pub(super) fn suggestions(s: &mut Session, v: &Value) -> CmdResult {
+    let issue = issue_for(s, v);
     match issue {
         Some((a, b, i)) => Ok(issue_json(s, &a, &b, &i)),
         None => Ok(Value::Null),

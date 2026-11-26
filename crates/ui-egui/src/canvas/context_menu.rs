@@ -59,6 +59,13 @@ pub(crate) fn issue_heading(issue: &serde_json::Value) -> String {
     tl!(issue.get("message").and_then(|m| m.as_str()).unwrap_or("")).to_string()
 }
 
+/// Whether an issue (as `review.suggestions` answers it) gets Ignore and Ignore Rule: every
+/// grammar issue and a remote checker's spelling issue. A built-in spelling issue keeps
+/// Ignore All and Add to Dictionary.
+pub(crate) fn shows_ignore(issue: &serde_json::Value) -> bool {
+    issue.get("kind").and_then(|k| k.as_str()) != Some("spelling") || issue.get("source").and_then(|k| k.as_str()) == Some("remote")
+}
+
 pub(super) fn context_menu(app: &mut WordApp, ui: &mut Ui) {
     if app.session.math.is_some() {
         return equation_menu(app, ui);
@@ -87,6 +94,11 @@ pub(super) fn context_menu(app: &mut WordApp, ui: &mut Ui) {
                 let _ = app.run("review.applySuggestion", json!({"text": sgt}));
                 ui.close();
             }
+        }
+        // Ignore and Ignore Rule (this viewer only): grammar, and a remote checker's spelling.
+        if shows_ignore(&issue) {
+            item(ui, app, "Ignore", "review.ignoreIssue", json!({}));
+            item(ui, app, "Ignore Rule", "review.ignoreRule", json!({}));
         }
         if issue.get("kind").and_then(|k| k.as_str()) == Some("spelling") {
             item(ui, app, "Ignore All", "review.ignoreAll", json!({}));
