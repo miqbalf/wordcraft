@@ -479,7 +479,7 @@ impl Live {
                 // old ticket's expiry never drops the link (LP2). It is opened as this one was,
                 // resuming where this link stands; the kept id space is set on it by `Handover`.
                 let url = message.relay_url.clone();
-                let hub = craft_collab::Handover::new(hub, move |r: &craft_collab::Reopen<'_>| {
+                let mut hub = craft_collab::Handover::new(hub, move |r: &craft_collab::Reopen<'_>| {
                     craft_collab::web::WebHub::connect(&url, r.ticket, r.applied)
                 });
                 // The socket handlers of every link draw a frame as soon as a message is in,

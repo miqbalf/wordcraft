@@ -532,6 +532,16 @@ pub(crate) fn fixture_lang(code: &'static str, source: &'static str) -> Lang {
     Lang { lang, catalogs: Some(i18n) }
 }
 
+/// A language from the embedded catalogs by its craft-i18n locale, also one the interface does
+/// not offer in [`LANGUAGES`] (Indonesian), for a test of those catalogs' rows. `None` when it is
+/// not embedded.
+#[cfg(test)]
+pub(crate) fn embedded_lang(code: &'static str) -> Option<Lang> {
+    let (i18n, _) = I18n::new(CRAFT_I18N, &[code]);
+    let i18n: &'static I18n = Box::leak(Box::new(i18n));
+    i18n.from_code(code).map(|lang| Lang { lang, catalogs: Some(i18n) })
+}
+
 /// For a test that needs the embedded catalogs: `false`, with a note, when none were embedded
 /// (`CRAFT_I18N_DIR` unset), so the test can skip; the interface is then English only.
 #[cfg(test)]

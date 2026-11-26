@@ -690,7 +690,10 @@ mod paste_notice_tests {
         assert_eq!(live_notice_text(&paste(PASTE_REFUSED, &[])), PASTE_REFUSED);
         assert_eq!(live_notice_text(&LiveNotice::Text("Reconnecting…".into())), "Reconnecting…");
 
-        set_current(Lang::from_code("id").expect("the Indonesian interface"));
+        if !crate::i18n::catalogs_embedded() {
+            return;
+        }
+        set_current(crate::i18n::embedded_lang("id").expect("the Indonesian catalogs"));
         assert_eq!(
             live_notice_text(&paste(PASTED_ITEMS, &["pictures", "tables", "some formatting"])),
             "Ditempel sebagai teks: gambar, tabel dan sebagian format tidak dapat dibagikan saat orang lain sedang menyunting."
