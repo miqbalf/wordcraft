@@ -1684,3 +1684,43 @@ fn with_a_clock_the_drift_check_runs_every_30_seconds_at_a_3_second_pause() {
     a.pump();
     assert_eq!(a.le.checks(), before + 2, "at the pause");
 }
+
+#[test]
+fn with_a_clock_the_pump_count_starts_no_drift_check() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use wordcraft_live::session::{VERIFY_EVERY, VERIFY_QUIET};
+    let relay = relay(None);
+    let bytes = file(&["One", "Two"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    let ms = Arc::new(AtomicU64::new(1_000));
+    let clock = Arc::clone(&ms);
+    a.le.set_clock(Box::new(move || clock.load(Ordering::SeqCst) as f64));
+    a.pump();
+    let before = a.le.checks();
+    // A window drawing 60 frames a second (typing, scrolling) pumps VERIFY_EVERY times in 5 s.
+    // With a clock only the 30 s cadence and its 3 s pause decide (review N2).
+    for _ in 0..(VERIFY_EVERY + VERIFY_QUIET + 10) {
+        a.pump();
+    }
+    assert_eq!(a.le.checks(), before, "the pump count starts no check while a clock is set");
+}
+
+#[test]
+fn a_check_with_nothing_changed_since_the_last_clean_one_compares_nothing() {
+    let relay = relay(None);
+    let bytes = file(&["One", "Two"]);
+    let mut a = Ed::open(&relay, "alice", Access::Edit, &bytes);
+    let mut b = Ed::open(&relay, "bob", Access::Edit, &bytes);
+    settle(&relay, &mut [&mut a, &mut b]);
+    a.end_of(0);
+    assert!(a.run("text.insert", json!({"text": "x"})));
+    settle(&relay, &mut [&mut a, &mut b]);
+    let (checks, compared) = (a.le.checks(), a.le.compared());
+    assert!(!a.le.verify(&mut a.s), "nothing to repair");
+    assert_eq!((a.le.checks(), a.le.compared()), (checks + 1, compared + 1), "a change since the last check: compared");
+    assert!(!a.le.verify(&mut a.s), "nothing to repair");
+    assert_eq!((a.le.checks(), a.le.compared()), (checks + 2, compared + 1), "nothing changed: checked, but nothing compared (review N3)");
+}

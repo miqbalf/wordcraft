@@ -165,3 +165,35 @@ fn new_fonts_run_the_part_again() {
     frame(&ctx, 1.3, vec![], 7, "Home", &ran);
     assert_eq!(ran.get(), 3, "the part ran with the new fonts");
 }
+
+#[test]
+fn a_recording_half_max_age_old_runs_on_the_next_frame() {
+    let (ctx, ran) = (on(), Cell::new(0));
+    for t in [1.0, 1.1, 1.2] {
+        frame(&ctx, t, vec![], 7, "Home", &ran);
+    }
+    assert_eq!(ran.get(), 2, "settled and replayed");
+    // Recorded at 1.1: a frame that comes anyway once it is MAX_AGE / 2 old runs the part, so the
+    // refresh rides on that frame and the backstop frame at MAX_AGE is not needed.
+    frame(&ctx, 1.1 + MAX_AGE / 2.0 + 0.01, vec![], 7, "Home", &ran);
+    assert_eq!(ran.get(), 3);
+}
+
+#[test]
+fn a_blinking_caret_gets_no_extra_frames_from_the_cache() {
+    // The caret draws a frame at each blink edge, every 0.53 s, and asks for the next edge. The
+    // cache must not ask for a frame before that one: it would add about one frame a second to
+    // every idle window (PERF2 fix round 1 review, N1).
+    const EDGE: f64 = 0.53;
+    let (ctx, ran) = (on(), Cell::new(0));
+    let mut extra = vec![];
+    for i in 0..12 {
+        let t = 1.0 + f64::from(i) * EDGE;
+        let delay = repaint_delay(&ctx, t, &ran);
+        // A new context asks for frames of its own while it lays out its first two frames.
+        if i >= 2 && delay < std::time::Duration::from_secs_f64(EDGE - 0.01) {
+            extra.push((t, delay));
+        }
+    }
+    assert!(extra.is_empty(), "frames asked for before the next caret edge: {extra:?}");
+}

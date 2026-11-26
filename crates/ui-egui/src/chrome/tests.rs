@@ -887,3 +887,15 @@ fn the_cached_bars_rerun_when_state_beside_the_document_changes() {
     crate::theme::apply(&ctx, crate::theme::Appearance::Dark);
     assert_ne!(keys(&ctx, &mut a), before, "and after a theme change");
 }
+
+#[test]
+fn the_cached_bars_rerun_when_a_theme_colour_changes_in_the_same_mode() {
+    let ctx = ctx();
+    let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("One two")), crate::Services::default());
+    let before = keys(&ctx, &mut a);
+    // An accent or high-contrast option would change colours without flipping dark mode (review N4).
+    ctx.all_styles_mut(|s| s.visuals.selection.bg_fill = egui::Color32::from_rgb(1, 2, 3));
+    let after = keys(&ctx, &mut a);
+    assert_ne!(before.0, after.0, "the status bar reruns");
+    assert_ne!(before.1, after.1, "the ribbon reruns");
+}

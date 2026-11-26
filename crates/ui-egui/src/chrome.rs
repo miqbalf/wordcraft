@@ -1219,7 +1219,6 @@ pub fn status_bar(app: &mut WordApp, ui: &mut Ui) {
 fn status_key(app: &mut WordApp, ui: &Ui) -> u64 {
     let ctx = ui.ctx();
     let counts = app.status_bar_counts(ctx);
-    let t = Tokens::get(ctx);
     let layout = app.session.layout();
     let missing_fonts = app.cached_missing_fonts(&layout).0.len();
     let dictionary = (crate::ribbon::caret_missing_dictionary(app).is_some(), crate::ribbon::caret_unreadable_dictionary(app).is_some());
@@ -1233,7 +1232,7 @@ fn status_key(app: &mut WordApp, ui: &Ui) -> u64 {
         (crate::i18n::current().code(), ctx.pixels_per_point().to_bits(), ui.visuals().dark_mode, crate::rtl::on()),
         // Fixed in round 1 of the review: what the bar shows besides the document.
         (app.session.doc.settings.track_changes, app.session.prefs.overtype, missing_fonts, dictionary),
-        (t.status_bar, t.border, t.text_dim, t.accent_text, t.icon),
+        crate::theme::colours_key(ui),
     ))
 }
 

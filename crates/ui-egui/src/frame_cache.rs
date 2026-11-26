@@ -17,9 +17,11 @@
 //! - the part's rectangle or layer moved;
 //! - the fonts changed, or egui cleared its font atlas: recorded text points into the old atlas
 //!   (a probe galley laid out every frame is a new one then);
-//! - the recording is older than [`MAX_AGE`]. A replay asks for a frame when that age is
-//!   reached, so anything the key misses is shown at most [`MAX_AGE`] late, even in a window
-//!   that would otherwise draw no further frame;
+//! - the recording is [`MAX_AGE`] / 2 old or older, so anything the key misses is shown on the
+//!   next frame that comes anyway (a caret blink, a live tick) and costs no frame of its own. A
+//!   replay also asks for a frame at [`MAX_AGE`], as a backstop for a window that would otherwise
+//!   draw no further frame: a frame that comes first clears that request, so anything the key
+//!   misses is shown at most [`MAX_AGE`] late;
 //! - the last two runs painted different shapes: the part is still settling or animating (a tab
 //!   sliding in, a group re-planned for the width), which asks for frames the replay would not.
 //!
@@ -146,7 +148,7 @@ pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
                 && r.rect == rect
                 && r.layer == layer
                 && Arc::ptr_eq(&r.fonts, &fonts)
-                && (0.0..MAX_AGE).contains(&(now - r.at))
+                && (0.0..MAX_AGE / 2.0).contains(&(now - r.at))
         });
     if replay && let Some(rec) = &state.rec {
         ctx.graphics_mut(|g| {
@@ -156,7 +158,9 @@ pub fn show(ui: &mut Ui, id: Id, key: u64, build: impl FnOnce(&mut Ui)) {
             }
         });
         ui.expand_to_include_rect(rect);
-        // Run for real once the recording is MAX_AGE old, even if nothing else draws a frame.
+        // The backstop: run for real once the recording is MAX_AGE old even if nothing else draws
+        // a frame. A frame that comes first runs the part (it is MAX_AGE / 2 old by then, or this
+        // replay's request is renewed), and the browser runner drops this request when it draws.
         let wait = (rec.at + MAX_AGE - now).max(0.0);
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         state.replayed += 1;

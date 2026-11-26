@@ -302,14 +302,14 @@ pub const VERIFY_EVERY_MS: f64 = 30_000.0;
 /// check runs, in milliseconds (a pause in the typing).
 pub const VERIFY_QUIET_MS: f64 = 3_000.0;
 
-/// How many pumps pass between two checks of the window's body against the shared copy
-/// ([`LiveEditing::verify`]): about 5 s while frames run at 60 a second, about 30 s at a host's
+/// Without a clock, how many pumps pass between two checks of the window's body against the
+/// shared copy ([`LiveEditing::verify`]); with one, only [`VERIFY_EVERY_MS`] counts. About 5 s while frames run at 60 a second, about 30 s at a host's
 /// idle pump of 100 ms. A check finds nothing changed since the last clean one most of the time,
 /// and then costs nothing.
 pub const VERIFY_EVERY: u32 = 300;
 
-/// How many pumps in a row the session and the shared copy must stay unchanged before a due
-/// check runs. A full check costs about 10 ms for 2,000 paragraphs and 30 ms for 10,000
+/// Without a clock, how many pumps in a row the session and the shared copy must stay unchanged
+/// before a due check runs. A full check costs about 10 ms for 2,000 paragraphs and 30 ms for 10,000
 /// (native, `examples/verify_bench`), so it waits for a pause in the typing instead of taking a
 /// frame in the middle of it.
 pub const VERIFY_QUIET: u32 = 30;
@@ -354,6 +354,8 @@ pub struct LiveEditing<H: Hub> {
     checks: u64,
     /// Paste notices not taken yet ([`LiveEditing::take_live_notices`]).
     pastes: Vec<PasteNotice>,
+    /// How many of them compared the body with the shared copy ([`LiveEditing::compared`]).
+    compared: u64,
 }
 
 /// A clock both this link and its core read.
@@ -400,6 +402,7 @@ impl<H: Hub> LiveEditing<H> {
             quiet_since: None,
             checks: 0,
             pastes: Vec::new(),
+            compared: 0,
         })
     }
 
@@ -473,6 +476,8 @@ impl<H: Hub> LiveEditing<H> {
         if !self.can_compare(session) {
             return false;
         }
+        self.compared = self.compared.saturating_add(1);
+        log::info!("live: drift compare {} (check {})", self.compared, self.checks);
         let Some(why) = self.drift(session) else {
             self.clean_at = Some(now);
             return false;
@@ -489,14 +494,15 @@ impl<H: Hub> LiveEditing<H> {
         true
     }
 
-    /// Whether the periodic check is due: [`VERIFY_EVERY`] pumps after the last one, at a pause
-    /// of [`VERIFY_QUIET`] pumps, or with a clock [`VERIFY_EVERY_MS`] after it, at a pause of
-    /// [`VERIFY_QUIET_MS`], whichever comes first.
+    /// Whether the periodic check is due. With a clock: [`VERIFY_EVERY_MS`] after the last one, at
+    /// a pause of [`VERIFY_QUIET_MS`]; the pump count plays no part, as a window drawing 60
+    /// frames a second would reach it every few seconds. Without a clock: [`VERIFY_EVERY`] pumps
+    /// after the last one, at a pause of [`VERIFY_QUIET`] pumps.
     fn verify_due(&self, at: Option<f64>) -> bool {
         if self.verify_every == 0 {
             return false;
         }
-        let by_pumps = self.since_verify >= self.verify_every && self.quiet >= VERIFY_QUIET;
+        let by_pumps = self.clock.is_none() && self.since_verify >= self.verify_every && self.quiet >= VERIFY_QUIET;
         let by_time = match (at, self.verified_at, self.quiet_since) {
             (Some(now), Some(last), Some(still)) => now - last >= VERIFY_EVERY_MS && now - still >= VERIFY_QUIET_MS,
             _ => false,
@@ -512,6 +518,13 @@ impl<H: Hub> LiveEditing<H> {
     /// How many periodic or explicit checks ran ([`LiveEditing::verify`]).
     pub fn checks(&self) -> u64 {
         self.checks
+    }
+
+    /// How many checks compared the window's body with the shared copy: a check returns early,
+    /// comparing nothing, when nothing changed since the last clean one, or while it cannot
+    /// compare (another document is active, or the link is not live).
+    pub fn compared(&self) -> u64 {
+        self.compared
     }
 
     /// Check every `pumps` pumps ([`LiveEditing::verify`]); 0 turns the periodic check off (a

@@ -580,7 +580,6 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
 /// within [`crate::frame_cache::MAX_AGE`].
 pub(crate) fn body_key(app: &mut WordApp, ui: &Ui) -> u64 {
     let ctx = ui.ctx();
-    let t = crate::theme::Tokens::get(ctx);
     let layout = app.session.layout();
     let missing_fonts = app.cached_missing_fonts(&layout).0.len();
     // Keytip badges are placed over the buttons as they are laid out: run every frame while shown.
@@ -605,7 +604,7 @@ pub(crate) fn body_key(app: &mut WordApp, ui: &Ui) -> u64 {
             app.session.prefs.overtype,
             format!("{:?}", app.session.view.mode),
             missing_fonts,
-            (t.ribbon, t.border, t.text, t.accent, t.icon),
+            crate::theme::colours_key(ui),
         ),
     ))
 }

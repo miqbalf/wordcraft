@@ -270,7 +270,7 @@ impl From<Animations> for String {
 }
 
 /// Every colour the UI uses; widgets never hard-code colours.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Hash)]
 pub struct Tokens {
     pub dark: bool,
     pub title_bar: Color32,
@@ -896,6 +896,23 @@ pub fn paint_text(painter: &egui::Painter, pos: egui::Pos2, anchor: Align2, text
 fn tracked_job(text: &str, font: &FontId, tracking: f32, color: Color32) -> egui::text::LayoutJob {
     let format = egui::text::TextFormat { font_id: font.clone(), extra_letter_spacing: tracking, line_height: None, color, ..Default::default() };
     egui::text::LayoutJob::single_section(text.to_string(), format)
+}
+
+/// A fingerprint of every colour a cached part can paint with: all the [`Tokens`], and the
+/// colours of egui's current visuals that its widgets use. A part's cache key holds it, so the
+/// part runs again when any colour changes, not only when dark mode flips.
+pub fn colours_key(ui: &egui::Ui) -> u64 {
+    let v = ui.visuals();
+    let w = |s: &egui::style::WidgetVisuals| (s.bg_fill, s.weak_bg_fill, s.bg_stroke.color, s.fg_stroke.color);
+    let ws = &v.widgets;
+    crate::frame_cache::hash((
+        Tokens::get(ui.ctx()),
+        v.dark_mode,
+        v.override_text_color,
+        (v.panel_fill, v.window_fill, v.extreme_bg_color, v.faint_bg_color, v.code_bg_color),
+        (v.hyperlink_color, v.warn_fg_color, v.error_fg_color, v.selection.bg_fill, v.selection.stroke.color),
+        (w(&ws.noninteractive), w(&ws.inactive), w(&ws.hovered), w(&ws.active), w(&ws.open)),
+    ))
 }
 
 /// Apply the interface theme setting to egui. Both palettes go in, our light one as egui's light
