@@ -190,7 +190,8 @@ fn a_blinking_caret_gets_no_extra_frames_from_the_cache() {
     for i in 0..12 {
         let t = 1.0 + f64::from(i) * EDGE;
         let delay = repaint_delay(&ctx, t, &ran);
-        if delay < std::time::Duration::from_secs_f64(EDGE - 0.01) {
+        // A new context asks for frames of its own while it lays out its first two frames.
+        if i >= 2 && delay < std::time::Duration::from_secs_f64(EDGE - 0.01) {
             extra.push((t, delay));
         }
     }
