@@ -479,3 +479,96 @@ fn improve_where_the_text_cant_change_says_why_and_sends_nothing() {
     assert!(asked(&sent).is_empty(), "nothing is sent");
     assert!(!open(&app));
 }
+
+/// A real click at the centre of a rect `ui.inspect` reported.
+fn click_rect(h: &mut Harness<'static, WordApp>, rect: &serde_json::Value) {
+    let n = |i: usize| rect[i].as_f64().unwrap_or(f64::NAN) as f32;
+    let at = egui::pos2(n(0) + n(2) / 2.0, n(1) + n(3) / 2.0);
+    assert!(at.x.is_finite() && at.y.is_finite(), "a rect [x, y, w, h]: {rect}");
+    h.event(egui::Event::PointerMoved(at));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        h.step();
+    }
+    h.run_steps(3);
+}
+
+fn inspect(h: &mut Harness<'static, WordApp>) -> serde_json::Value {
+    let ctx = h.ctx.clone();
+    crate::control::inspect(h.state_mut(), &ctx)
+}
+
+/// E1: a page script finds the modal's text and buttons in `ui.inspect`, and a click at a
+/// button's rect does what the button does. Nothing is reported when the modal is closed.
+#[test]
+fn inspect_reports_the_modal_text_and_buttons_where_a_click_lands() {
+    let (app, sent) = app_on("Teh cat sat.", true);
+    let mut h = harness(app);
+    assert!(inspect(&mut h)["assist"].is_null(), "no modal, nothing reported");
+    h.state_mut().run("ui.improve", json!({})).unwrap();
+    h.run_steps(3);
+    let v = inspect(&mut h);
+    assert_eq!(v["assist"]["kind"], "improve", "{v}");
+    assert_eq!(v["assist"]["phase"], "waiting", "{v}");
+    assert_eq!(v["assist"]["original"], "Teh cat sat.", "{v}");
+    let (id, _, _) = asked(&sent).remove(0);
+    page_says(&mut h, AssistIn::AiResult { id, text: "The cat sat.".into() });
+    let v = inspect(&mut h);
+    assert_eq!(v["assist"]["phase"], "ready", "{v}");
+    assert_eq!(v["assist"]["text"], "The cat sat.", "the proposal as Replace puts it in: {v}");
+    let buttons = v["assist"]["buttons"].as_array().cloned().unwrap_or_default();
+    let labels: Vec<&str> = buttons.iter().filter_map(|b| b["label"].as_str()).collect();
+    assert_eq!(labels, ["Replace", "Cancel"], "{v}");
+    let modal = modal_rect(&h).expect("the modal is on screen");
+    for b in &buttons {
+        let r = &b["rect"];
+        let c = egui::pos2((r[0].as_f64().unwrap_or(-1.0) + r[2].as_f64().unwrap_or(0.0) / 2.0) as f32, (r[1].as_f64().unwrap_or(-1.0) + r[3].as_f64().unwrap_or(0.0) / 2.0) as f32);
+        assert!(modal.contains(c), "{b} lies inside the modal {modal:?}");
+        assert_eq!(b["enabled"], true, "{b}");
+    }
+    click_rect(&mut h, &buttons[0]["rect"]);
+    assert!(!open(h.state()), "the click on Replace's rect closes the modal");
+    assert_eq!(body(h.state()).trim(), "The cat sat.", "and replaces");
+    assert!(inspect(&mut h)["assist"].is_null());
+}
+
+/// E1: `ui.inspect` lists the open context menu's items (suggestions and commands) with their
+/// rects on screen, and a click at an item's rect runs that item. A closed menu lists nothing.
+#[test]
+fn inspect_lists_the_context_menu_items_where_a_click_lands() {
+    let (mut app, _) = app_on("The cat sat on the mat.", true);
+    app.run("select.text", json!({"text": "cat"})).unwrap();
+    let mut h = harness(app);
+    assert!(inspect(&mut h)["contextMenu"].is_null(), "no menu, nothing reported");
+    h.state_mut().run("ui.contextMenu", json!({})).unwrap();
+    h.run_steps(3);
+    let v = inspect(&mut h);
+    let items = v["contextMenu"].as_array().cloned().unwrap_or_default();
+    let find = |label: &str| items.iter().find(|i| i["label"].as_str().is_some_and(|l| l == label)).cloned();
+    let improve = find("Improve with AI").unwrap_or_else(|| panic!("Improve with AI is listed: {v}"));
+    assert_eq!(improve["command"], "ui.improve", "{improve}");
+    let cut = find("Cut").unwrap_or_else(|| panic!("Cut is listed: {v}"));
+    let (a, b) = (&improve["rect"], &cut["rect"]);
+    assert!(a[1].as_f64() < b[1].as_f64(), "Improve with AI is above Cut: {a} {b}");
+    click_rect(&mut h, &improve["rect"]);
+    assert!(open(h.state()), "the click on Improve with AI's rect opens the modal");
+    assert!(inspect(&mut h)["contextMenu"].is_null(), "the menu closed");
+}
+
+/// E1: a remote issue's suggestions are listed as items that apply them.
+#[test]
+fn inspect_lists_an_issues_suggestion_that_a_click_applies() {
+    let (mut app, _) = app_on("She go home.", true);
+    app.session.sel = wordcraft_engine::Selection { anchor: Pos::body(0, 4), focus: Pos::body(0, 4) };
+    // A suggestion the issue offers: as the context menu takes it from `review.suggestions`.
+    let mut h = harness(app);
+    h.state_mut().run("ui.contextMenu", json!({})).unwrap();
+    h.run_steps(1);
+    h.state_mut().canvas.context_issue = Some(json!({"kind": "grammar", "source": "remote", "rule": "HE_VERB_AGR", "message": "Agreement", "suggestions": ["goes"], "text": "go"}));
+    h.run_steps(3);
+    let v = inspect(&mut h);
+    let items = v["contextMenu"].as_array().cloned().unwrap_or_default();
+    let first = items.first().cloned().unwrap_or_default();
+    assert_eq!(first["label"], "goes", "the first item is the first suggestion: {v}");
+    assert_eq!(first["command"], "review.applySuggestion", "{first}");
+}
