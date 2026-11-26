@@ -80,6 +80,12 @@ pub fn start() {
                     if let Some(bridge) = &app_bridge {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone(), dirty.clone(), saves.clone(), host_events.clone());
                         bridge.listen_live(live_events.clone(), live.joining(), cc.egui_ctx.clone());
+                        // Grammar check and AI help: only a framing page (`?host=parent`) can offer them.
+                        if bridge.mode() == craft_web_host::Mode::Parent {
+                            let assist_inbox = wordcraft_ui_egui::assist::AssistInbox::default();
+                            services.assist = crate::assist::connect(assist_inbox.clone(), cc.egui_ctx.clone())
+                                .map(|send| wordcraft_ui_egui::assist::AssistHost { send, inbox: assist_inbox });
+                        }
                     }
                     let control = crate::api::install(cc.egui_ctx.clone());
                     let mut app = WordApp::new(session, services).with_control(control);
