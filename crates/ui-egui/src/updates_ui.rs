@@ -29,7 +29,7 @@ impl Default for Runtime {
     fn default() -> Self {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
-            updater: Updater::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION")).with_translator(translate),
+            updater: Updater::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION")).with_translator(translate).with_source(crate::fork_update_source()),
             #[cfg(not(target_arch = "wasm32"))]
             result_dialog: CheckResultDialog::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION")).with_translator(translate),
             #[cfg(not(target_arch = "wasm32"))]
@@ -67,6 +67,16 @@ impl WordApp {
         let rt = &mut self.updates_rt;
         rt.startup_check = false;
         rt.updater = Updater::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION")).with_translator(translate).with_source(refused_check());
+    }
+
+    /// udinCraft: no check at start, and Help ▸ Check for Updates gives the fork's reason
+    /// ([`crate::FORK_UPDATES_OFF`]) in the interface language the preferences chose. Call it
+    /// after the preferences are loaded.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn use_fork_update_source(&mut self) {
+        let rt = &mut self.updates_rt;
+        rt.startup_check = false;
+        rt.updater = Updater::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION")).with_translator(translate).with_source(crate::fork_update_source());
     }
 
     /// Starts the helper of an update that is ready, so that it installs once the process has
