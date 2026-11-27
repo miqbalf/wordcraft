@@ -287,6 +287,12 @@ jobs:
             echo "Linux x86_64 (glibc 2.35 or later). The tarball's \`./install.sh\` installs it for your user into \`~/.local\`, without sudo (\`./install.sh --uninstall\` removes it):"
             files '*-linux-*'
             echo
+            echo "The apps load libxkbcommon, libxkbcommon-x11 and libxcb-xkb from the system; \`install.sh\` warns if they are missing. Install them from your distro, so the pair matches (a hand-copied libxkbcommon-x11 that does not match libxkbcommon crashes the apps):"
+            echo
+            echo "- Arch, CachyOS: \`sudo pacman -S --needed libxkbcommon libxkbcommon-x11 libxcb\`"
+            echo "- Debian, Ubuntu: \`sudo apt install libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1\`"
+            echo "- Fedora: \`sudo dnf install libxkbcommon libxkbcommon-x11 libxcb\`"
+            echo
             echo "Windows x86_64:"
             files '*-windows-*'
             echo

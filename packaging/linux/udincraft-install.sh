@@ -6,7 +6,8 @@
 #
 # Binaries go to $PREFIX/bin; the desktop file (with absolute Exec and TryExec), MIME types,
 # AppStream metadata, icons and any data under share/ go to $PREFIX/share. Run it from the
-# unpacked tarball. Make sure $PREFIX/bin is on your PATH for the command-line tools.
+# unpacked tarball. Make sure $PREFIX/bin is on your PATH for the command-line tools. It warns,
+# with the distro's install command, when the keyboard libraries the apps load are missing.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,11 +16,39 @@ UNINSTALL=0
 case "${1:-}" in
   "") ;;
   --uninstall) UNINSTALL=1 ;;
-  -h | --help) sed -n '2,10p' "$0"; exit 0 ;;
+  -h | --help) sed -n '2,12p' "$0"; exit 0 ;;
   *) echo "unknown argument: $1" >&2; exit 2 ;;
 esac
 
 [[ -d "$HERE/bin" && -d "$HERE/share" ]] || { echo "error: run this from the unpacked tarball (bin/ and share/ missing)" >&2; exit 1; }
+
+# The window toolkit loads the keyboard libraries at run time: libxkbcommon always, and
+# libxkbcommon-x11 with libxcb-xkb on X11. They are not in this tarball. Take all of them from the
+# distro, so libxkbcommon-x11 matches libxkbcommon (a mismatched pair crashes the apps).
+check_libraries() {
+  local missing=() lib id_like
+  for lib in libxkbcommon.so.0 libxkbcommon-x11.so.0 libxcb-xkb.so.1; do
+    if command -v ldconfig >/dev/null && ldconfig -p 2>/dev/null | grep -q "$lib"; then continue; fi
+    if command -v /sbin/ldconfig >/dev/null && /sbin/ldconfig -p 2>/dev/null | grep -q "$lib"; then continue; fi
+    if compgen -G "/usr/lib*/$lib" >/dev/null || compgen -G "/usr/lib*/*/$lib" >/dev/null || compgen -G "/lib*/*/$lib" >/dev/null; then continue; fi
+    missing+=("$lib")
+  done
+  [[ ${#missing[@]} -eq 0 ]] && return 0
+  echo "warning: missing system libraries: ${missing[*]}" >&2
+  echo "  The apps need libxkbcommon, libxkbcommon-x11 and libxcb-xkb from your distro (a matching pair; do not copy them in by hand). Install them with:" >&2
+  id_like="$( (. /etc/os-release 2>/dev/null && echo "${ID:-} ${ID_LIKE:-}") || true)"
+  case " $id_like " in
+    *" arch "* | *" cachyos "* | *" manjaro "* | *" endeavouros "*) echo "    sudo pacman -S --needed libxkbcommon libxkbcommon-x11 libxcb" >&2 ;;
+    *" debian "* | *" ubuntu "*) echo "    sudo apt install libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1" >&2 ;;
+    *" fedora "* | *" rhel "*) echo "    sudo dnf install libxkbcommon libxkbcommon-x11 libxcb" >&2 ;;
+    *)
+      echo "    Arch, CachyOS:  sudo pacman -S --needed libxkbcommon libxkbcommon-x11 libxcb" >&2
+      echo "    Debian, Ubuntu: sudo apt install libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1" >&2
+      echo "    Fedora:         sudo dnf install libxkbcommon libxkbcommon-x11 libxcb" >&2
+      ;;
+  esac
+  return 0
+}
 
 refresh_caches() {
   if command -v update-mime-database >/dev/null; then update-mime-database "$PREFIX/share/mime" || true; fi
@@ -51,6 +80,7 @@ for desktop in "$HERE"/share/applications/*.desktop; do
 done
 refresh_caches
 
+check_libraries
 echo "installed into $PREFIX:"
 for f in "$HERE"/bin/*; do echo "  $PREFIX/bin/$(basename "$f")"; done
 case ":$PATH:" in
