@@ -12,6 +12,11 @@
 name: udinCraft release
 
 on:
+  # A push of this file only registers the workflow, so that it can be dispatched from a branch
+  # before it is on main; every job skips on push.
+  push:
+    branches: [ci/fork-release]
+    paths: [.github/workflows/udincraft-release.yml]
   workflow_dispatch:
     inputs:
       publish:
@@ -39,7 +44,7 @@ env:
 jobs:
   macos:
     name: macOS universal
-    if: github.repository_owner == 'miqbalf'
+    if: github.repository_owner == 'miqbalf' && github.event_name == 'workflow_dispatch'
     runs-on: macos-15-intel
     timeout-minutes: 180
     outputs:
@@ -104,7 +109,7 @@ jobs:
 
   linux:
     name: Linux x86_64
-    if: github.repository_owner == 'miqbalf'
+    if: github.repository_owner == 'miqbalf' && github.event_name == 'workflow_dispatch'
     # The oldest supported runner (glibc 2.35), so the binaries run on newer distros.
     runs-on: ubuntu-22.04
     timeout-minutes: 120
@@ -179,7 +184,7 @@ jobs:
 
   windows:
     name: Windows x86_64
-    if: github.repository_owner == 'miqbalf'
+    if: github.repository_owner == 'miqbalf' && github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 150
     steps:
@@ -237,7 +242,7 @@ jobs:
   # SHA256SUMS.txt and the release notes, from the three platform builds. Read-only.
   notes:
     name: Checksums and release notes
-    if: github.repository_owner == 'miqbalf'
+    if: github.repository_owner == 'miqbalf' && github.event_name == 'workflow_dispatch'
     needs: [macos, linux, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -316,7 +321,7 @@ jobs:
   # Only with publish: true on main. The only job with write access.
   publish:
     name: Tag and publish the GitHub Release
-    if: github.repository_owner == 'miqbalf' && inputs.publish && github.ref == 'refs/heads/main'
+    if: github.repository_owner == 'miqbalf' && github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
     needs: [notes]
     runs-on: ubuntu-latest
     timeout-minutes: 30
