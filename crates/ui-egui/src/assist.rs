@@ -1,7 +1,9 @@
 //! Grammar check and AI writing help through the page that hosts WordCraft (`wordcraft:proof-check`,
 //! `wordcraft:ai`): the types of the messages, the per-frame pump and the state of the one AI
-//! request that waits. The page holds the keys and the routes; the desktop app sets no
-//! [`AssistHost`], so everything here stays off there (Ruling R10).
+//! request that waits. On the web the page holds the keys and the routes. The desktop app sets
+//! its own [`AssistHost`] (`apps/wordcraft`'s `assist_net`), which calls craft_office's token routes
+//! with the udinCraft launcher's assist token (DG1: Ruling R10 lifted by the owner, 2026-11-27);
+//! without a token it says [`AssistIn::SignedOut`]. Both read the routes' answers with [`wire`].
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,6 +13,11 @@ use egui::Context;
 use wordcraft_engine::proof_remote::{ProofFailure, ProofReply};
 
 use super::WordApp;
+
+pub mod wire;
+
+/// The desktop app's assist token is missing, expired or refused: only the launcher can sign in.
+pub const SIGN_IN: &str = "Sign in through udinCraft Launcher to use grammar and AI";
 
 /// What an AI request asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,11 +36,29 @@ pub enum AssistOut {
 /// A message from the page, already checked by the host's parser.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AssistIn {
-    Enabled { proof: bool, ai: bool },
-    ProofResult { id: String, reply: ProofReply },
-    ProofFailed { id: String, error: String },
-    AiResult { id: String, text: String },
-    AiFailed { id: String, error: String },
+    Enabled {
+        proof: bool,
+        ai: bool,
+    },
+    ProofResult {
+        id: String,
+        reply: ProofReply,
+    },
+    ProofFailed {
+        id: String,
+        error: String,
+    },
+    AiResult {
+        id: String,
+        text: String,
+    },
+    AiFailed {
+        id: String,
+        error: String,
+    },
+    /// The desktop host has no usable assist token (never from the page): everything is off, and
+    /// the status line says to sign in through the launcher, once until it is back.
+    SignedOut,
 }
 
 /// What the page's messages leave for the next frame.
@@ -59,6 +84,8 @@ pub struct AssistState {
     waiting: Option<String>,
     /// The answer to the waiting request, until it is taken.
     answer: Option<(String, Result<String, String>)>,
+    /// The host said [`AssistIn::SignedOut`] and nothing has turned assist on since.
+    pub signed_out: bool,
     /// The Improve with AI or Summary modal, while it is open.
     pub(crate) dialog: Option<crate::assist_dialog::AssistDialog>,
 }
@@ -95,7 +122,17 @@ impl WordApp {
     /// One message from the page.
     fn assist_take(&mut self, message: AssistIn, now: f64) {
         match message {
+            AssistIn::SignedOut => {
+                self.assist_take(AssistIn::Enabled { proof: false, ai: false }, now);
+                if !self.assist.signed_out {
+                    self.assist.signed_out = true;
+                    self.status_long(tl!(SIGN_IN));
+                }
+            }
             AssistIn::Enabled { proof, ai } => {
+                if proof || ai {
+                    self.assist.signed_out = false;
+                }
                 self.assist.proof = proof;
                 self.assist.ai = ai;
                 let was = self.session.proof_remote.enabled();
@@ -132,7 +169,7 @@ impl WordApp {
         self.assist_frame_at(ctx, super::clock::now_ms());
     }
 
-    /// The page offers AI writing help (and this is not the desktop app).
+    /// The host offers AI writing help (the page, or the desktop app with a token).
     pub fn assist_ai_on(&self) -> bool {
         self.services.assist.is_some() && self.assist.ai
     }

@@ -30,6 +30,9 @@ serde = { workspace = true }
 tempfile = "3"
 log = { workspace = true }
 chrono = { workspace = true }
+# Grammar check and AI help (DG1): the craft_office token routes over HTTPS. Already in the build
+# through craft-update and craft-font-store, at this version (rustls).
+ureq = "3.5"
 
 [build-dependencies]
 # Icon + VERSIONINFO for wordcraft.exe; build.rs only uses it when the target is Windows.

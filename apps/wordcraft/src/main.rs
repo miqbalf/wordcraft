@@ -14,6 +14,7 @@ mod animations;
 mod appimage_env;
 #[cfg(target_os = "macos")]
 mod apple_events;
+mod assist_net;
 mod clipboard;
 mod control_server;
 mod default_apps;
@@ -52,6 +53,8 @@ struct App(
     // a hidden logic tick.
     RawWindowState,
     Option<live_session::LiveSession>,
+    // Grammar check and AI help with the launcher's assist token (DG1).
+    assist_net::AssistNet,
     #[cfg(target_os = "macos")] fmv_macos_events::Inbox,
 );
 
@@ -61,10 +64,11 @@ impl eframe::App for App {
     /// on unsaved changes and active printing.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(target_os = "macos")]
-        apple_events::poll(&self.6, &mut self.0, ctx);
+        apple_events::poll(&self.7, &mut self.0, ctx);
         if let Some(live) = &mut self.5 {
             live.frame(&mut self.0, std::time::Instant::now());
         }
+        self.6.frame(std::time::Instant::now());
         self.0.logic(ctx);
         self.3.show(frame);
         let mut window = self.4;
@@ -782,6 +786,10 @@ fn main() -> eframe::Result {
             // Live: the first file is the working copy the session starts from; it does not
             // also open as a document of its own.
             let (mut files, mut other_files) = (files, other_files);
+            // The live session file's token first (a cloud file opened live), then the
+            // launcher's account-wide one (every other file, local ones too).
+            let assist = assist_net::AssistNet::new(live.iter().cloned().chain(assist_net::account_file()).collect(), cc.egui_ctx.clone());
+            app.services.assist = Some(assist.host());
             let live = live.and_then(|session| {
                 let copy = live_session::take_working_copy(&mut files, &mut other_files);
                 live_session::LiveSession::start(&mut app, &session, copy.as_deref())
@@ -802,6 +810,7 @@ fn main() -> eframe::Result {
                 dialogs,
                 RawWindowState::default(),
                 live,
+                assist,
                 #[cfg(target_os = "macos")]
                 apple_events.connect(&cc.egui_ctx),
             )))

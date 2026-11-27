@@ -38,6 +38,7 @@ pub(crate) fn error_sentence(code: &str) -> &'static str {
         "too_large" => TOO_LARGE,
         "disabled" => DISABLED,
         "bad_request" => BAD_REQUEST,
+        super::assist::wire::SIGNED_OUT => super::assist::SIGN_IN,
         _ => UNAVAILABLE,
     }
 }
@@ -134,7 +135,7 @@ impl WordApp {
     /// Replace could apply, so a viewer sends nothing and uses none of the AI's rate limit.
     pub(crate) fn assist_improve(&mut self) -> Result<Value, String> {
         if !self.assist_ai_on() {
-            return self.assist_refused(OFF);
+            return self.assist_refused(if self.assist.signed_out { crate::assist::SIGN_IN } else { OFF });
         }
         if !crate::widgets::enabled(self, "review.improveApply") {
             return self.assist_refused(READ_ONLY);
@@ -161,7 +162,7 @@ impl WordApp {
     /// `ui.summarize`: ask the AI to summarize the document.
     pub(crate) fn assist_summarize(&mut self) -> Result<Value, String> {
         if !self.assist_ai_on() {
-            return self.assist_refused(OFF);
+            return self.assist_refused(if self.assist.signed_out { crate::assist::SIGN_IN } else { OFF });
         }
         let document = self.session.document_id();
         let source = match self.session.run("review.summarySource", &json!({})) {
