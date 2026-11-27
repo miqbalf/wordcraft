@@ -89,6 +89,8 @@
 //! is not recovered.
 
 mod check;
+#[cfg(feature = "native-hub")]
+pub mod desktop;
 mod diff;
 mod local;
 pub mod map;

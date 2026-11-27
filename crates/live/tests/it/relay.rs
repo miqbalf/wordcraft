@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use craft_collab::Hub;
 use craft_collab::native::NativeHub;
+use craft_collab::{ClientMsg, Hub, ServerMsg};
 use hmac::digest::KeyInit;
 use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
@@ -19,6 +19,7 @@ use sha2::Sha256;
 use wordcraft_doc::{Document, Pos};
 use wordcraft_engine::io::save_bytes;
 use wordcraft_engine::{Selection, Session};
+use wordcraft_live::desktop::{self, SessionChange, SessionWatch};
 use wordcraft_live::{LiveEditing, LiveStatus};
 
 use super::{Rng, plain, texts};
@@ -33,7 +34,12 @@ fn now() -> u64 {
 
 /// A join ticket as the relay's signer makes it: `base64url(claims).base64url(HMAC-SHA256)`.
 fn ticket(secret: &str, room: &str, uid: &str, pid: &str) -> String {
-    let claims = json!({"rm": room, "uid": uid, "dsp": uid, "perm": 3, "exp": now() + 900, "pid": pid});
+    ticket_for(secret, room, uid, pid, 900)
+}
+
+/// [`ticket`], expiring in `secs`.
+fn ticket_for(secret: &str, room: &str, uid: &str, pid: &str, secs: u64) -> String {
+    let claims = json!({"rm": room, "uid": uid, "dsp": uid, "perm": 3, "exp": now() + secs, "pid": pid});
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(payload.as_bytes());
@@ -45,18 +51,46 @@ fn fresh_room() -> String {
     format!("it-{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
 }
 
+/// Any hub: a plain native one, or the desktop window's ([`desktop::connect`]).
+struct AnyHub(Box<dyn Hub>);
+
+impl Hub for AnyHub {
+    fn send(&mut self, msg: ClientMsg) -> craft_collab::Result<()> {
+        self.0.send(msg)
+    }
+    fn poll(&mut self) -> Vec<ServerMsg> {
+        self.0.poll()
+    }
+    fn connected(&self) -> bool {
+        self.0.connected()
+    }
+    fn set_token(&mut self, token: String) {
+        self.0.set_token(token);
+    }
+    fn set_space(&mut self, space: u32) {
+        self.0.set_space(space);
+    }
+    fn close(&mut self) {
+        self.0.close();
+    }
+}
+
 struct Client {
     name: String,
     s: Session,
-    le: LiveEditing<NativeHub>,
+    le: LiveEditing<AnyHub>,
 }
 
 impl Client {
     async fn join(relay: &str, secret: &str, room: &str, uid: &str, file: &[u8]) -> Client {
         let token = ticket(secret, room, uid, &format!("{uid}-{}", now()));
         let hub = NativeHub::connect(relay, &token, None).await.expect("connect");
+        Client::start(uid, AnyHub(Box::new(hub)), &format!("doc:{room}"), file, "plan.docx")
+    }
+
+    fn start(uid: &str, hub: AnyHub, room: &str, file: &[u8], name: &str) -> Client {
         let mut s = Session::new(Document::new());
-        let le = LiveEditing::start(hub, &format!("doc:{room}"), file, "plan.docx", &mut s).unwrap();
+        let le = LiveEditing::start(hub, room, file, name, &mut s).unwrap();
         Client { name: uid.to_owned(), s, le }
     }
 
@@ -415,4 +449,83 @@ async fn five_clients_typing_remote_apply_p95() {
         slowest_loop.as_secs_f64() * 1000.0
     );
     assert!(at(0.95) < 200.0, "p95 remote apply {:.1} ms is over the 200 ms target", at(0.95));
+}
+
+/// The launcher's session file for `room`, as the desktop window reads it: the server and the
+/// relay as `ws://` on the same host.
+fn session_file(relay: &str, room: &str, ticket: &str) -> Vec<u8> {
+    let (scheme, rest) = relay.split_once("://").unwrap();
+    let host = rest.split('/').next().unwrap();
+    let path = &rest[host.len()..];
+    let ws = if scheme == "https" { "wss" } else { "ws" };
+    serde_json::to_vec(&json!({
+        "v": 1, "server": format!("{scheme}://{host}"), "fileId": 1, "path": "/Docs/plan.docx",
+        "ticket": ticket, "relayUrl": format!("{ws}://{host}{path}"), "room": room,
+        "expiresAt": "2026-11-27T12:00:00Z", "readOnly": false, "displayName": "Desk", "later": {"field": true}
+    }))
+    .unwrap()
+}
+
+/// DJ-W: a desktop window joins from the launcher's session file over its background-opened
+/// hub, next to a client on the web app's protocol, and both converge. Its first ticket expires
+/// during the test; the launcher's rewrite of the file brings a fresh one, so the link outlives
+/// it and edits keep converging. With `CRAFT_TEST_RESTART_CMD` the relay is also restarted after
+/// the expiry, so the window must join again, which the relay allows only with the fresh ticket.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs relay"]
+async fn a_desktop_window_joins_from_its_session_file_and_outlives_its_first_ticket() {
+    let (relay, secret, room, file) = setup();
+    let live_room = format!("doc:{room}");
+    let web = Client::join(&relay, &secret, &room, "web", &file).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.json");
+    let short = 12;
+    std::fs::write(&path, session_file(&relay, &live_room, &ticket_for(&secret, &room, "desk", &format!("desk-{}", now()), short))).unwrap();
+    let session = desktop::read(&path).unwrap();
+    let hub = desktop::connect(&tokio::runtime::Handle::current(), &session);
+    let desk = Client::start("desk", AnyHub(Box::new(hub)), &session.room, &file, &session.file_name(&path));
+    let mut watch = SessionWatch::new(&path, session);
+    let mut cs = vec![web, desk];
+    until(&mut cs, 20, "both Live", all_live).await;
+
+    let mut rng = Rng(23);
+    for step in 0..60 {
+        let k = rng.below(2);
+        type_somewhere(&mut cs[k], &mut rng);
+        if step % 3 == 0 {
+            pump_all(&mut cs);
+        }
+    }
+    converge(&mut cs, "web and desktop edits").await;
+
+    // The launcher's refresh: a fresh ticket, renamed over the file.
+    let fresh = ticket_for(&secret, &room, "desk", &format!("desk-{}", now()), 900);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, session_file(&relay, &live_room, &fresh)).unwrap();
+    std::fs::File::options().write(true).open(&tmp).unwrap().set_modified(SystemTime::now() + Duration::from_secs(2)).unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    let got = watch.poll(Instant::now());
+    assert!(matches!(got, Some(SessionChange::Ticket(ref t)) if *t == fresh), "the rewrite brought the fresh ticket: {got:?}");
+    cs[1].le.hub_mut().set_token(fresh);
+
+    // Past the first ticket's expiry, the window still edits with the room.
+    let expired = Instant::now() + Duration::from_secs(short + 3);
+    while Instant::now() < expired {
+        pump_all(&mut cs);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if let Ok(restart) = std::env::var("CRAFT_TEST_RESTART_CMD") {
+        let out = std::process::Command::new("sh").arg("-c").arg(restart).output().unwrap();
+        assert!(out.status.success(), "the relay restarted");
+        until(&mut cs, 30, "both Live again after the restart", all_live).await;
+    }
+    for k in [0, 1, 1, 0, 1] {
+        cs[k].end_of(0);
+        assert!(cs[k].run("text.insert", json!({"text": format!("<after{k}>")})), "{} types after the expiry", cs[k].name);
+        pump_all(&mut cs);
+    }
+    converge(&mut cs, "after the first ticket expired").await;
+    let text = texts(&cs[0].s.doc).concat();
+    assert!(text.contains("<after0>") && text.contains("<after1>"), "both editors' marks are in: {text}");
 }
