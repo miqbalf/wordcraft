@@ -76,7 +76,7 @@ struct WordcraftTools {
 impl Tools for WordcraftTools {
     fn instructions(&self) -> String {
         format!(
-            "{INSTRUCTIONS} Backend: {}. Community: https://discord.gg/artcraft · https://getartcraft.com/apps/wordcraft · https://github.com/storytold/wordcraft",
+            "{INSTRUCTIONS} Backend: {}. Project: https://github.com/miqbalf/wordcraft (udinCraft build). Based on WordCraft by the ArtCraft team: https://github.com/storytold/wordcraft · upstream community: https://discord.gg/artcraft",
             self.backend.describe()
         )
     }
@@ -122,7 +122,7 @@ impl Server {
     pub fn new(backend: Box<dyn Backend>) -> Self {
         let info = Info { name: "wordcraft", title: "WordCraft", version: env!("CARGO_PKG_VERSION"), max_line: MAX_REQUEST_LINE };
         let options = Options {
-            website_url: Some("https://getartcraft.com/apps/wordcraft".into()),
+            website_url: Some("https://github.com/miqbalf/wordcraft".into()),
             // Clients read every tool failure from the result, as before the shared core.
             tool_errors_as_results: true,
             strict_request_ids: true,

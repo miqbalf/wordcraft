@@ -1,8 +1,8 @@
 <p align="center">
-  <a href="https://getartcraft.com/">
+  <a href="https://github.com/miqbalf/wordcraft">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
+      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/udincraft-logo-white.svg">
+      <img alt="udinCraft" src="docs/brand/udincraft-logo.svg" width="200">
     </picture>
   </a>
 </p>
@@ -21,7 +21,7 @@
   A fast, open-source word processor with a familiar workflow: the ribbon, styles,
   tables, track changes, references and mail merge. It reads and writes .docx, runs natively on
   macOS, Windows, Linux and BSD, and in the browser via WebAssembly.<br>
-  <i>By the ArtCraft team.</i>
+  <i>A udinCraft build. Based on WordCraft by the ArtCraft team: <a href="https://github.com/storytold/wordcraft">github.com/storytold/wordcraft</a>.</i>
 </p>
 
 <p align="center">
@@ -35,13 +35,8 @@
 </p>
 
 <p align="center">
-  <a href="https://discord.gg/artcraft"><img alt="Join the ArtCraft community on Discord" src="https://img.shields.io/badge/Join%20us%20on%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" height="40"></a>
-</p>
-
-<p align="center">
-  <a href="https://getartcraft.com/apps/wordcraft"><b>WordCraft on getartcraft.com</b></a> ·
-  <a href="https://getartcraft.com/">ArtCraft</a> ·
-  <a href="https://getartcraft.com/apps">All Crafting Apps</a>
+  <a href="https://github.com/miqbalf/wordcraft"><b>udinCraft WordCraft on GitHub</b></a> ·
+  <a href="https://github.com/storytold/wordcraft">Based on WordCraft by the ArtCraft team</a>
 </p>
 
 <br>
@@ -50,11 +45,6 @@
   <img src="docs/images/hero.png" alt="WordCraft with the Home tab of the ribbon open over a two-page document titled The Open Studio Handbook. The Navigation pane on the left lists the document's headings, the Styles gallery shows live previews of Normal, Heading 1, Title and Subtitle, and a word in the first paragraph is selected." width="100%">
   <br><sub><b>The Open Studio Handbook</b>, WordCraft's built-in sample: the ribbon, live Styles gallery, rulers and the Navigation pane.</sub>
 </p>
-
-> [!NOTE]
-> **ArtCraft is a community of artists from all walks of life.** Painters, photographers,
-> filmmakers, illustrators, designers, animators, hobbyists, and people who picked up a pencil
-> last week. If you make things, you're one of us. **[Come say hi on Discord](https://discord.gg/artcraft).**
 
 <p align="center">
   <a href="#a-tour">A tour</a> ·
@@ -407,7 +397,7 @@ emerge --ask app-office/wordcraft-bin
 
 ## The Crafting Apps
 
-WordCraft is one of the **Crafting Apps**: free, open-source creative tools from the
+Upstream WordCraft is one of the **Crafting Apps**: free, open-source creative tools from the
 [ArtCraft](https://getartcraft.com/) team, each written from scratch in Rust and each able to
 stand on its own.
 
@@ -430,34 +420,14 @@ stand on its own.
 | <img src="https://raw.githubusercontent.com/storytold/craft-anything/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.craft-anything.png" alt="" width="32" height="32"> | **Craft Anything** | See how any software works, then build your own | [GitHub](https://github.com/storytold/craft-anything) | [Website](https://getartcraft.com/apps/craft-anything) |
 | <img src="https://raw.githubusercontent.com/tangency-labs/solidcraft/main/assets/icons/app/linux/exports/hicolor/64x64/apps/io.tangencylabs.solidcraft.png" alt="" width="32" height="32"> | **SolidCraft** | Parametric 3D CAD by Tangency Labs (community app) | [GitHub](https://github.com/tangency-labs/solidcraft) | |
 
-And [**ArtCraft**](https://getartcraft.com/) itself, our AI image and video studio for artists who want real control.
+The ArtCraft team also makes [**ArtCraft**](https://getartcraft.com/) itself, an AI image and video studio. udinCraft is an independent build of some of these apps; it is not an ArtCraft product.
 
 <br>
-
-<p align="center">
-  <a href="https://discord.gg/artcraft"><img alt="Join the ArtCraft community on Discord" src="https://img.shields.io/badge/Join%20us%20on%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" height="40"></a>
-</p>
-
-<h3 align="center">Come make things with us</h3>
-
-<p align="center">
-  Our Discord is where artists of every kind hang out: people who paint, shoot, draw, cut film,
-  set type, and people still figuring out what they like to make. Share what you're working on,
-  ask for help, tell us what's broken, or tell us what you wish these tools could do.
-  Whatever your medium and however long you've been at it, you're welcome here.
-</p>
-
-<p align="center">
-  <a href="https://discord.gg/artcraft"><b>discord.gg/artcraft</b></a> ·
-  <a href="https://getartcraft.com/">getartcraft.com</a> ·
-  <a href="https://getartcraft.com/apps">The Crafting Apps</a> ·
-  <a href="https://getartcraft.com/apps/wordcraft">WordCraft</a>
-</p>
 
 ## License and credits
 
 WordCraft is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
-Copyright (c) 2026 ArtCraft Team and the WordCraft contributors. Required notices are in [NOTICE](NOTICE).
+Copyright (c) 2026 ArtCraft Team and the WordCraft contributors. udinCraft changes: Copyright (c) 2026 miqbalf. Required notices are in [NOTICE](NOTICE).
 
 Bundled fonts, icons, images and other assets keep their own open licenses; each one is listed
 with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md).
@@ -471,12 +441,12 @@ do Russian, Portuguese, Czech, Italian, Croatian and Turkish spelling (how to in
 Polish hyphenation the TeX patterns by Hanna Kołodziejska, Bogusław Jackowski and Marek Ryćko (MIT
 option). The sample documents and templates are original text written for WordCraft.
 
-The ArtCraft name, wordmark and logos in [`docs/brand/`](docs/brand/) are trademarks of the
-ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as
-part of this repository and WordCraft, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
-Forks and modified versions must remove them.
+The udinCraft name, wordmark and mark in [`docs/brand/`](docs/brand/) belong to miqbalf and are not
+covered by this license; their terms are in [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
+Forks and modified versions must replace them with their own. This repository does not use the
+ArtCraft marks: udinCraft is not an ArtCraft product. It is based on [WordCraft](https://github.com/storytold/wordcraft) by the ArtCraft team.
 
 <p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
-  <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
+  <a href="https://github.com/miqbalf/wordcraft"><img alt="udinCraft" src="docs/brand/udincraft-mark.svg" width="28"></a><br>
+  <sub>udinCraft WordCraft, based on <a href="https://github.com/storytold/wordcraft">WordCraft</a> by the ArtCraft team and community.</sub>
 </p>

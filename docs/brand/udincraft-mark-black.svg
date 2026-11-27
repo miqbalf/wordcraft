@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="udinCraft">
+  <title>udinCraft</title>
+  <rect width="128" height="128" rx="28" fill="#16181D"/>
+  <path d="M30 36V68a21 21 0 0 0 42 0V36" fill="none" stroke="#FFFFFF" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M96 23L107 34L96 45L85 34Z" fill="#FFFFFF"/>
+</svg>

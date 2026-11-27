@@ -1,11 +1,15 @@
 WordCraft
 Copyright (c) 2026 ArtCraft Team and the WordCraft contributors.
+udinCraft changes: Copyright (c) 2026 miqbalf.
 Licensed under the MIT License or the Apache License, Version 2.0, at your option
 (LICENSE-MIT, LICENSE-APACHE).
 
-The ArtCraft name, wordmark and logos in docs/brand/ are trademarks of the ArtCraft Team. They are
-not open source and are not covered by the license above; their terms are in
-docs/brand/LICENSE-brand.txt.
+This is udinCraft WordCraft, a modified version of WordCraft by the ArtCraft team
+(https://github.com/storytold/wordcraft). It is not an ArtCraft product and does not carry the
+ArtCraft marks.
+
+The udinCraft name, wordmark and mark in docs/brand/ belong to miqbalf. They are not open
+source and are not covered by the license above; their terms are in docs/brand/LICENSE-brand.txt.
 
 Third-party material
 
