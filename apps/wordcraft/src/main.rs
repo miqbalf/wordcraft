@@ -63,7 +63,7 @@ impl eframe::App for App {
         #[cfg(target_os = "macos")]
         apple_events::poll(&self.6, &mut self.0, ctx);
         if let Some(live) = &mut self.5 {
-            live.frame(&mut self.0);
+            live.frame(&mut self.0, std::time::Instant::now());
         }
         self.0.logic(ctx);
         self.3.show(frame);

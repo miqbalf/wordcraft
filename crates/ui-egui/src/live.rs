@@ -280,6 +280,20 @@ impl WordApp {
         }
     }
 
+    /// Stop the link and leave live editing without a word on the status bar: the host shows
+    /// something else in its place and says why itself (the desktop's fallback to a local copy
+    /// when the room was never joined). Edits the room never got are kept for Save As, as when
+    /// any link stops. False when nothing is linked.
+    pub fn live_stop(&mut self) -> bool {
+        if !matches!(self.live, Some(LiveMode::Linked(_))) {
+            return false;
+        }
+        let Some(LiveMode::Linked(old)) = self.live.take() else { return false };
+        let copies = old.editing.stop(&mut self.session);
+        self.keep_live_copies(copies);
+        true
+    }
+
     /// A fresh ticket from the host: the hub uses it for its next (re)connect, and a hub the
     /// relay refused (an expired ticket) connects again with it. False when nothing is linked.
     pub fn live_refresh_ticket(&mut self, ticket: String) -> bool {
