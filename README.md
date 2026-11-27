@@ -69,6 +69,17 @@
   <a href="#license-and-credits">License and credits</a>
 </p>
 
+## Fork notes
+
+This fork adds, on top of upstream WordCraft:
+
+- Hosting inside a web page of a self-hosted file server: the page opens, saves and shares the document, and the app hands Save, Save As and Share to the page.
+- Live co-editing of one document by several people, through the collab-craft relay, with notices for reconnects, paste while others edit, and copies of changes that could not be shared.
+- Grammar checking and writing help served by the host page, off unless the host turns them on.
+- Browser performance work: fewer repaints, and notices when the browser lacks SIMD or graphics acceleration.
+
+The server app that hosts these builds is not part of this repository.
+
 ## A tour
 
 Every screenshot below is WordCraft itself, rendered offscreen by its own UI test harness
