@@ -721,9 +721,6 @@ fn main() -> eframe::Result {
             // After the preferences, so the reason it gives is in the interface language.
             if updates_unsafe {
                 app.disable_self_update();
-            } else {
-                // udinCraft: upstream releases would replace this fork (crate::FORK_UPDATES_OFF).
-                app.use_fork_update_source();
             }
             // Language packs from the suite's font store; an Install click is the person's own.
             wordcraft_engine::packs::use_font_store(true);
