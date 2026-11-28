@@ -304,3 +304,37 @@ fn ai_ids_fit_the_contract_and_do_not_restart_at_one() {
     assert!(!id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'), "{id}");
     assert_ne!(id, "ai-1", "a reloaded page must not reuse the first id");
 }
+
+/// DG1: the desktop host without a usable token turns grammar and AI off, drops the remote marks
+/// and says once to sign in through the launcher; a token that comes back turns them on again.
+#[test]
+fn signed_out_turns_assist_off_and_says_to_sign_in_once() {
+    let (host, sent) = fake();
+    let text = "The cat sat on the mat today.";
+    let mut app = app_with(Some(host), text);
+    tell(&mut app, AssistIn::Enabled { proof: true, ai: true });
+    frame(&mut app, 0.0);
+    frame(&mut app, IDLE_MS);
+    let (id, checked) = checks(&sent)[0].clone();
+    tell(&mut app, AssistIn::ProofResult { id, reply: on_word(&checked, "mat") });
+    frame(&mut app, IDLE_MS + 100.0);
+    assert!(!remote_rules(&mut app).is_empty());
+    app.status_msg = None;
+    tell(&mut app, AssistIn::SignedOut);
+    frame(&mut app, IDLE_MS + 200.0);
+    assert!(!app.assist_ai_on(), "AI is off");
+    assert!(remote_rules(&mut app).is_empty(), "the remote marks go");
+    let said = app.status_msg.clone().map(|(s, _)| s).unwrap_or_default();
+    assert!(said.contains("udinCraft Launcher"), "{said}");
+    app.status_msg = None;
+    tell(&mut app, AssistIn::SignedOut);
+    frame(&mut app, IDLE_MS + 300.0);
+    assert!(app.status_msg.is_none(), "said once, not every renewal");
+    let before = checks(&sent).len();
+    app.run("text.insert", json!({"text": " More words here."})).expect("insert");
+    frame(&mut app, IDLE_MS * 4.0);
+    assert_eq!(checks(&sent).len(), before, "nothing is sent while signed out");
+    tell(&mut app, AssistIn::Enabled { proof: true, ai: true });
+    frame(&mut app, IDLE_MS * 5.0);
+    assert!(app.assist_ai_on() && !app.assist.signed_out, "a fresh token turns it back on");
+}

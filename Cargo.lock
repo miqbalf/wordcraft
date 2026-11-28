@@ -7873,6 +7873,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "ureq",
  "windows",
  "winit",
  "winresource",
