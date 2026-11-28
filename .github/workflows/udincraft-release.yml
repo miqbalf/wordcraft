@@ -1,0 +1,360 @@
+# Fork-only (miqbalf): udinCraft downloads of WordCraft for macOS (universal, ad-hoc signed),
+# Linux x86_64 and Windows x86_64, built with this repo's own packaging scripts, unsigned and with
+# no secrets. Not for upstream; drop this file before any upstream PR. Upstream's release.yml
+# (signed, upstream secrets) is untouched.
+#
+# publish: false (the default) builds every platform and keeps the files as run artifacts only.
+# publish: true, on main only, also tags udincraft-v<version>-<YYYYMMDD> and creates the GitHub
+# Release with SHA256SUMS.txt.
+#
+# macOS runs on the Intel runner (macos-15-intel): arm64 runners were never assigned to this
+# account's jobs (DL1). The app is still universal: the arm64 half is cross-compiled.
+name: udinCraft release
+
+on:
+  # A push of this file only registers the workflow, so that it can be dispatched from a branch
+  # before it is on main; every job skips on push.
+  push:
+    branches: [ci/fork-release]
+    paths: [.github/workflows/udincraft-release.yml]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Tag and publish a GitHub Release (main only); false keeps the builds as run artifacts"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: udincraft-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP: wordcraft
+  APP_TITLE: "WordCraft"
+  UPSTREAM_TITLE: "WordCraft"
+  # storytold/craft-fonts commit, checked out as ../craft-fonts (empty: the app embeds none).
+  CRAFT_FONTS_REF: "b076417b5880bd4154bd22f00695b1d28c6bea83"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  macos:
+    name: macOS universal
+    if: github.repository_owner == 'miqbalf' && github.event_name == 'workflow_dispatch'
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    outputs:
+      bundle: ${{ steps.check.outputs.bundle }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Version
+        run: echo "APP_VERSION=$(awk '/^\[/{p=($0=="[workspace.package]");next} p&&$1=="version"{gsub(/[" ]/,"",$3);print $3;exit}' Cargo.toml)" >>"$GITHUB_ENV"
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: udincraft-macos-universal
+      - name: Fonts and language data
+        shell: bash
+        run: bash .github/scripts/udincraft-build-inputs.sh
+      - name: Build and package (universal, ad-hoc signed, not notarized)
+        run: packaging/macos/package.sh --arch universal
+      - name: Zip the app, check both, the DMG and the zip
+        id: check
+        run: |
+          set -euo pipefail
+          app="$(find target/macos-package -maxdepth 1 -name '*.app' | head -n 1)"
+          [ -n "$app" ] || { echo "no .app in target/macos-package" >&2; exit 1; }
+          bundle="$(basename "$app")"
+          echo "bundle=$bundle" >>"$GITHUB_OUTPUT"
+          zip="dist/release/$APP-$APP_VERSION-macos-universal.app.zip"
+          ditto -c -k --keepParent "$app" "$zip"
+          check_app() {
+            local a="$1" f archs exe
+            for f in "$a"/Contents/MacOS/*; do
+              archs="$(lipo -archs "$f")"
+              echo "lipo -archs $(basename "$f"): $archs"
+              case " $archs " in *" x86_64 "*) ;; *) echo "missing x86_64 in $f" >&2; exit 1 ;; esac
+              case " $archs " in *" arm64 "*) ;; *) echo "missing arm64 in $f" >&2; exit 1 ;; esac
+            done
+            codesign --verify --strict --deep --verbose=2 "$a"
+            exe="$a/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$a/Contents/Info.plist")"
+            perl -e 'alarm 120; exec @ARGV' "$exe" --version
+          }
+          echo "== the built app"; check_app "$app"
+          tmp="$(mktemp -d)"
+          ditto -x -k "$zip" "$tmp/zip"
+          echo "== the app from the .app.zip"; check_app "$tmp/zip/$bundle"
+          dmg="$(ls dist/release/*.dmg)"
+          codesign --verify --strict --verbose=2 "$dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$tmp/mnt" "$dmg"
+          echo "== the app in the DMG"; check_app "$tmp/mnt/$bundle"
+          hdiutil detach "$tmp/mnt"
+          ls -lh dist/release
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: udincraft-macos-universal
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  linux:
+    name: Linux x86_64
+    if: github.repository_owner == 'miqbalf' && github.event_name == 'workflow_dispatch'
+    # The oldest supported runner (glibc 2.35), so the binaries run on newer distros.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Version
+        run: echo "APP_VERSION=$(awk '/^\[/{p=($0=="[workspace.package]");next} p&&$1=="version"{gsub(/[" ]/,"",$3);print $3;exit}' Cargo.toml)" >>"$GITHUB_ENV"
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
+            libasound2-dev pkg-config desktop-file-utils appstream zsync
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: udincraft-linux-x86_64
+      - name: Fonts and language data
+        shell: bash
+        run: bash .github/scripts/udincraft-build-inputs.sh
+      - name: Build and package (AppImage, tar.gz)
+        run: packaging/linux/package.sh --formats "appimage tar"
+      - name: Add the user install script to the tarball
+        run: |
+          set -euo pipefail
+          tgz="dist/release/$APP-$APP_VERSION-linux-x86_64.tar.gz"
+          tmp="$(mktemp -d)"
+          tar -C "$tmp" -xzf "$tgz"
+          base="$APP-$APP_VERSION-linux-x86_64"
+          install -m755 packaging/linux/udincraft-install.sh "$tmp/$base/install.sh"
+          tar -C "$tmp" -czf "$tgz" "$base"
+          tar -tzf "$tgz" | sed -n '1,200p'
+      - name: Check the tarball, a user install and the AppImage
+        run: |
+          set -euo pipefail
+          base="$APP-$APP_VERSION-linux-x86_64"
+          tmp="$(mktemp -d)"
+          tar -C "$tmp" -xzf "dist/release/$base.tar.gz"
+          for exe in "$APP" "$APP-cli"; do
+            [ -x "$tmp/$base/bin/$exe" ] || continue
+            echo "== tarball $exe --version"; timeout 120 "$tmp/$base/bin/$exe" --version
+          done
+          home="$(mktemp -d)"
+          (cd "$tmp/$base" && HOME="$home" ./install.sh)
+          for exe in "$APP" "$APP-cli"; do
+            [ -x "$tmp/$base/bin/$exe" ] || continue
+            echo "== installed $exe --version"; timeout 120 "$home/.local/bin/$exe" --version
+          done
+          for d in "$home"/.local/share/applications/*.desktop; do
+            desktop-file-validate "$d"
+            grep -E '^(Try)?Exec=' "$d"
+          done
+          ls "$home/.local/share/icons/hicolor"
+          (cd "$tmp/$base" && HOME="$home" ./install.sh --uninstall)
+          for appimage in dist/release/*.AppImage; do
+            chmod +x "$appimage"
+            echo "== $(basename "$appimage") --version"
+            APPIMAGE_EXTRACT_AND_RUN=1 timeout 120 "$appimage" --version
+          done
+          ls -lh dist/release
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: udincraft-linux-x86_64
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  windows:
+    name: Windows x86_64
+    if: github.repository_owner == 'miqbalf' && github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Version
+        shell: bash
+        run: echo "APP_VERSION=$(awk '/^\[/{p=($0=="[workspace.package]");next} p&&$1=="version"{gsub(/[" ]/,"",$3);print $3;exit}' Cargo.toml)" >>"$GITHUB_ENV"
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: udincraft-windows-x64
+      - name: Fonts and language data
+        shell: bash
+        run: bash .github/scripts/udincraft-build-inputs.sh
+      - name: WiX (the repo's MSI packaging)
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
+      - name: Build and package (unsigned MSI and portable zip)
+        shell: pwsh
+        run: ./packaging/windows/package.ps1 -Arch x64
+      - name: Check the portable zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-Item "dist/release/$env:APP-$env:APP_VERSION-windows-x64-portable.zip"
+          $dir = Join-Path $env:RUNNER_TEMP 'portable'
+          Expand-Archive -Path $zip.FullName -DestinationPath $dir -Force
+          $exes = Get-ChildItem -Path $dir -Recurse -Filter '*.exe'
+          if (-not $exes) { throw "no .exe in $($zip.Name)" }
+          foreach ($exe in $exes) {
+            if ($exe.BaseName -ne $env:APP -and $exe.BaseName -ne "$env:APP-cli") { Write-Output "skip $($exe.Name)"; continue }
+            Write-Output "== $($exe.Name) --version"
+            $out = & $exe.FullName --version 2>&1 | Out-String
+            Write-Output $out
+            if ($LASTEXITCODE -ne 0) { throw "$($exe.Name) --version exited $LASTEXITCODE" }
+            if (-not $out.Trim()) { throw "$($exe.Name) --version printed nothing" }
+          }
+          Get-ChildItem dist/release | Format-Table Name, Length
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: udincraft-windows-x64
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  # SHA256SUMS.txt and the release notes, from the three platform builds. Read-only.
+  notes:
+    name: Checksums and release notes
+    if: github.repository_owner == 'miqbalf' && github.event_name == 'workflow_dispatch'
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.notes.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: udincraft-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums and notes
+        id: notes
+        env:
+          BUNDLE: ${{ needs.macos.outputs.bundle }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          version="$(awk '/^\[/{p=($0=="[workspace.package]");next} p&&$1=="version"{gsub(/[" ]/,"",$3);print $3;exit}' Cargo.toml)"
+          tag="udincraft-v$version-$(date -u +%Y%m%d)"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          (cd dist && sha256sum -- * >../SHA256SUMS.txt) && mv SHA256SUMS.txt dist/
+          files() { (cd dist && ls -1 -- $1 2>/dev/null) | sed 's/^/- `/; s/$/`/' || true; }
+          {
+            case "$APP_TITLE" in
+              udinCraft*) echo "$APP_TITLE, the udinCraft build of $UPSTREAM_TITLE, based on $UPSTREAM_TITLE by the ArtCraft team." ;;
+              *) echo "udinCraft build of $APP_TITLE, based on $UPSTREAM_TITLE by the ArtCraft team." ;;
+            esac
+            echo
+            echo "## What this fork adds"
+            echo
+            awk '/^## Fork notes/{p=1;next} p&&/^## /{exit} p' README.md
+            echo
+            echo "## Downloads"
+            echo
+            echo "macOS 11 or later, Intel and Apple silicon (one universal app):"
+            files '*.dmg *.app.zip *-macos-*.zip' | sort -u
+            echo
+            echo "Linux x86_64 (glibc 2.35 or later). The tarball's \`./install.sh\` installs it for your user into \`~/.local\`, without sudo (\`./install.sh --uninstall\` removes it):"
+            files '*-linux-*'
+            echo
+            echo "The apps load libxkbcommon, libxkbcommon-x11 and libxcb-xkb from the system; \`install.sh\` warns if they are missing. Install them from your distro, so the pair matches (a hand-copied libxkbcommon-x11 that does not match libxkbcommon crashes the apps):"
+            echo
+            echo "- Arch, CachyOS: \`sudo pacman -S --needed libxkbcommon libxkbcommon-x11 libxcb\`"
+            echo "- Debian, Ubuntu: \`sudo apt install libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1\`"
+            echo "- Fedora: \`sudo dnf install libxkbcommon libxkbcommon-x11 libxcb\`"
+            echo
+            echo "Windows x86_64:"
+            files '*-windows-*'
+            echo
+            echo "## These builds are not signed"
+            echo
+            echo "They have no Apple Developer ID, no notarization and no Windows code-signing certificate, and they were built by GitHub Actions from commit \`$GITHUB_SHA\` ([run]($RUN_URL))."
+            echo
+            echo "- **macOS:** the app is ad-hoc signed only, so Gatekeeper blocks the first start. After copying it to Applications, run"
+            echo '  ```'
+            echo "  xattr -dr com.apple.quarantine \"/Applications/$BUNDLE\""
+            echo '  ```'
+            echo "  once, or Control-click the app, choose Open, then Open again."
+            echo "- **Windows:** SmartScreen may say \"Windows protected your PC\". Choose **More info**, then **Run anyway**. The MSI installs for your user by default, without admin rights."
+            echo "- **Linux:** nothing extra; check the download against the sums below."
+            echo
+            echo "## SHA-256"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >release-notes.md
+          cat release-notes.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: |
+            release-notes.md
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  # Only with publish: true on main. The only job with write access.
+  publish:
+    name: Tag and publish the GitHub Release
+    if: github.repository_owner == 'miqbalf' && github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    needs: [notes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: udincraft-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: notes
+      - name: Create the tag and the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.notes.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+             gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::$TAG already exists; nothing was published" >&2
+            exit 1
+          fi
+          cp notes/dist/SHA256SUMS.txt dist/
+          case "$APP_TITLE" in udinCraft*) title="$APP_TITLE ${TAG#udincraft-}" ;; *) title="udinCraft $APP_TITLE ${TAG#udincraft-}" ;; esac
+          gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$title" --notes-file notes/release-notes.md
