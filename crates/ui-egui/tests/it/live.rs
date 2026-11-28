@@ -14,7 +14,8 @@ use wordcraft_engine::Session;
 use wordcraft_live::LiveEditing;
 use wordcraft_live::testing::{MemHub, MemRelay, ROOM};
 use wordcraft_ui_egui::live::{
-    Access, COPY_DOWNLOADED, COPY_FAILED, ENDED, ENDED_UNSAVED, LiveReport, LiveStatus, NEWER, NOT_SAVING, SAVE_COPY, SAVED_FOR_YOU,
+    Access, COPY_DOWNLOADED, COPY_FAILED, ENDED, ENDED_UNSAVED, LEFT_LIVE, LiveReport, LiveStatus, NEWER, NOT_SAVING, SAVE_COPY,
+    SAVED_FOR_YOU,
 };
 use wordcraft_ui_egui::{Services, WordApp};
 
@@ -748,6 +749,36 @@ fn hosted_live_file_shown_again_after_another_document_still_refuses_save() {
     assert_eq!(other.get(), 0, "nothing went to the page");
     h.state_mut().run("file.saveAs", json!({"path": "plan.odt"})).unwrap();
     assert_eq!(copies.borrow().last().map(String::as_str), Some("plan.odt"), "a copy still downloads");
+}
+
+/// Not hosted (the desktop), another document shown in the window just ends the link: nothing else
+/// saves the room's file, so Save is not refused when it is shown again (wordcraft fix/px-minors,
+/// hand-ported onto the live_tick that keeps the room's unmerged copies).
+#[test]
+fn desktop_live_file_shown_again_after_another_document_saves_as_usual() {
+    let relay = MemRelay::new();
+    let mut bob = Bob::join(&relay);
+    let mut service = Bob::join_as(&relay, "craft_office", "Craft Office");
+    let (mut h, _hub) = alice_with(&relay, Access::Edit, true, Services::default());
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    let live = h.state().session.document_id();
+    h.state_mut().session.add_document(Document::from_text("Letters"));
+    settle_all(&relay, &mut h, &mut [&mut bob, &mut service]);
+    assert!(h.state().live_link().is_none(), "the link stopped");
+    assert!(!has_label(&h, LEFT_LIVE), "no hosted notice on the desktop");
+    h.state_mut().session.switch_document(live).unwrap();
+    h.step();
+    assert!(!has_label(&h, LEFT_LIVE), "no hosted status line on the desktop");
+    // Save writes into a temp folder, never into the source tree.
+    let dir = std::env::temp_dir().join(format!("wordcraft-left-live-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("plan.docx");
+    h.state_mut().session.path = Some(path.clone());
+    let saved = h.state_mut().run("file.save", json!({}));
+    let written = path.is_file();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(saved.is_ok(), "Save runs as usual and is not refused as a live room's file: {saved:?}");
+    assert!(written, "Save wrote the file");
 }
 
 /// A hosted frame whose saves to the page are counted.
