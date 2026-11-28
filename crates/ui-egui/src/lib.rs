@@ -11,8 +11,39 @@
 pub const UPDATE_APP: craft_update::app::App = craft_update::app::App {
     icon_png: Some(include_bytes!("../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.wordcraft.png")),
     accent: Some([0x3f, 0x5f, 0xe0]),
+    // udinCraft: the fork's name and releases in the update windows ("by udinCraft", the link to
+    // its releases); the fork never installs a release, see [`fork_update_source`].
+    developer: "udinCraft",
+    repo: "miqbalf/wordcraft",
     ..craft_update::suite::WORDCRAFT
 };
+
+/// Why this build never updates itself. udinCraft is a fork: [`UPDATE_APP`] is upstream's suite
+/// entry, whose releases are ArtCraft's WordCraft, and installing one would replace this build with a
+/// different app. Help ▸ Check for Updates shows this reason; the check at start finds nothing.
+#[cfg(not(target_arch = "wasm32"))]
+pub const FORK_UPDATES_OFF: &str = "Updates are off in this udinCraft build: upstream WordCraft releases would replace it with a different app. Install a newer udinCraft build to update.";
+
+/// The fork's update source: a check that never finds a release and gives [`FORK_UPDATES_OFF`],
+/// in the interface language of the thread that calls it (the UI thread, so Help ▸ Check
+/// for Updates shows it translated).
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+pub fn fork_update_source() -> craft_update::updater::CheckSource {
+    let why = crate::i18n::t("Updates are off in this udinCraft build: upstream WordCraft releases would replace it with a different app. Install a newer udinCraft build to update.").to_string();
+    std::sync::Arc::new(move || Err(why.clone()))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod fork_update_tests {
+    /// A udinCraft build never sees an upstream release, says why, and names the fork.
+    #[test]
+    fn the_fork_never_finds_an_upstream_release() {
+        assert_eq!((super::fork_update_source())().err().as_deref(), Some(super::FORK_UPDATES_OFF));
+        assert_eq!(super::UPDATE_APP.developer, "udinCraft");
+        assert!(super::UPDATE_APP.repo.starts_with("miqbalf/"), "{}", super::UPDATE_APP.repo);
+    }
+}
 
 /// An English UI string in the current interface language ([`i18n::t`]).
 #[macro_export]
