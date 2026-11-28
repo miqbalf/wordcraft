@@ -14,8 +14,7 @@ use wordcraft_engine::Session;
 use wordcraft_live::LiveEditing;
 use wordcraft_live::testing::{MemHub, MemRelay, ROOM};
 use wordcraft_ui_egui::live::{
-    Access, COPY_DOWNLOADED, COPY_FAILED, ENDED, ENDED_UNSAVED, LEFT_LIVE, LiveReport, LiveStatus, NEWER, NOT_SAVING, SAVE_COPY,
-    SAVED_FOR_YOU,
+    Access, COPY_DOWNLOADED, COPY_FAILED, ENDED, ENDED_UNSAVED, LEFT_LIVE, LiveReport, LiveStatus, NEWER, NOT_SAVING, SAVE_COPY, SAVED_FOR_YOU,
 };
 use wordcraft_ui_egui::{Services, WordApp};
 
