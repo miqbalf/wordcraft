@@ -87,7 +87,9 @@ craft-image-codecs = { git = "https://github.com/storytold/craft-libs", rev = "9
 craft-tiff = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 craft-pdf = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0", default-features = false, features = ["write"] }
 # craft-update: app-specific pretend versions apply to startup and manual checks.
-craft-update = { git = "https://github.com/storytold/craft-libs", version = "=0.1.0", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", features = ["egui"] }
+# udinCraft: craft-update comes from the miqbalf fork (feat/udincraft-updates), whose `fork` rules
+# install this fork's unsigned builds from its udincraft-v* releases; the others stay as they were.
+craft-update = { git = "https://github.com/miqbalf/craft-libs", version = "=0.1.0", rev = "66f8a6e6966795fa26445baf2f30d923117a6528", features = ["egui"] }
 craft-wordmodel = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 craft-docx = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 craft-mcp-server = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }

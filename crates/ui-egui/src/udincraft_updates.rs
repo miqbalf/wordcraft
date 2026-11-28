@@ -10,7 +10,8 @@
 //!
 //! Trust: the release is read over HTTPS from github.com/miqbalf and its files are checked
 //! against its sums file. The builds carry no signature (macOS ad hoc, Windows unsigned), as the
-//! release notes say.
+//! release notes say; craft-update's `fork` rules install them (on macOS after `codesign`'s strict
+//! check of the ad-hoc signature and the bundle identifier).
 
 use craft_update::Release;
 use craft_update::Version;
@@ -200,6 +201,12 @@ mod tests {
     fn the_update_windows_name_the_fork() {
         assert_eq!(crate::UPDATE_APP.developer, "udinCraft");
         assert_eq!(crate::UPDATE_APP.repo, REPO);
+        // craft-update installs this fork's unsigned builds from its udincraft-v* releases (macOS ad
+        // hoc, Windows unsigned), after the checksum, and nothing else's.
+        assert!(craft_update::fork::is_fork_app(&crate::UPDATE_APP));
+        let release = Release { tag: "udincraft-v9.1.0-20261128".into(), repo: REPO.into(), ..Release::default() };
+        assert!(craft_update::fork::is_fork_release(&crate::UPDATE_APP, &release));
+        assert!(!craft_update::fork::is_fork_release(&crate::UPDATE_APP, &Release { tag: "v99.0.0".into(), ..release }));
     }
 
     /// Read-only, against the real GitHub: `cargo test -p wordcraft-ui-egui --lib -- --ignored live_`.
