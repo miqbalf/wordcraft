@@ -17,6 +17,8 @@ wordcraft-proof = { workspace = true }
 # Fonts the user added (#582) load from the settings folder at start-up.
 wordcraft-fonts = { workspace = true }
 wordcraft-ui-egui = { workspace = true }
+# `--live-session`: the desktop join to a live room, over the native relay link.
+wordcraft-live = { workspace = true, features = ["native-hub"] }
 # The control key file's location (shared with the MCP bridge).
 wordcraft-control-key = { workspace = true }
 # Share: the Nextcloud desktop client's synced folder that holds the open file.

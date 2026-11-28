@@ -1,6 +1,6 @@
 //! WordCraft desktop app.
 //!
-//! Usage: `wordcraft [--control <port>] [--sample] [files…]`; `--help` prints `USAGE`.
+//! Usage: `wordcraft [--control <port>] [--sample] [--live-session <file>] [files…]`; `--help` prints `USAGE`.
 //!
 //! `--control <port>` (or `WORDCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server:
 //! `{"id":1,"key":"…","method":"engine.execute","params":{"command":"text.insert","params":{"text":"Hi"}}}`.
@@ -22,6 +22,7 @@ mod file_dialogs;
 mod graphics;
 #[cfg(any(target_os = "linux", test))]
 mod linux_gpu;
+mod live_session;
 mod logging;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod portal_save;
@@ -39,8 +40,9 @@ use wordcraft_ui_egui::{
 
 /// The app, the restored window geometry (or, with none, the default: no position) until the
 /// first frame that knows the monitor has checked it, the control server's key file (removed on
-/// exit), the file dialogs the app asked for, this frame's raw host window state and, on macOS,
-/// the documents opened from Finder.
+/// exit), the file dialogs the app asked for, this frame's raw host window state, the live
+/// session the launcher opened the file in (`--live-session`) and, on macOS, the documents
+/// opened from Finder.
 struct App(
     WordApp,
     Option<WindowGeometry>,
@@ -49,6 +51,7 @@ struct App(
     // The host's answer for this frame. `InputState` still describes the last painted frame on
     // a hidden logic tick.
     RawWindowState,
+    Option<live_session::LiveSession>,
     #[cfg(target_os = "macos")] fmv_macos_events::Inbox,
 );
 
@@ -58,7 +61,10 @@ impl eframe::App for App {
     /// on unsaved changes and active printing.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(target_os = "macos")]
-        apple_events::poll(&self.5, &mut self.0, ctx);
+        apple_events::poll(&self.6, &mut self.0, ctx);
+        if let Some(live) = &mut self.5 {
+            live.frame(&mut self.0, std::time::Instant::now());
+        }
         self.0.logic(ctx);
         self.3.show(frame);
         let mut window = self.4;
@@ -495,12 +501,14 @@ const USAGE: &str = "\
 wordcraft — the WordCraft desktop app
 
 USAGE:
-  wordcraft [--sample] [--control PORT] [FILE…]
+  wordcraft [--sample] [--control PORT] [--live-session FILE] [FILE…]
 
 OPTIONS:
   --sample            open the sample document
   --control PORT      start the localhost control server on PORT, for agents and scripts
                       (or set WORDCRAFT_CONTROL_PORT); see docs/control-protocol.md
+  --live-session FILE edit FILE… live with others, joining the session the launcher
+                      described in FILE (the first FILE… is the local working copy)
   --version           print the version
   -h, --help          print this help
 ";
@@ -603,6 +611,8 @@ fn main() -> eframe::Result {
     // Only macOS (Finder / LaunchServices) adds these; elsewhere `-NS…` could be a real file name.
     let args = if cfg!(target_os = "macos") { without_launch_args(args) } else { args };
     let mut bad_control: Option<Option<String>> = None;
+    let mut live: Option<std::path::PathBuf> = None;
+    let mut bad_live = false;
     let mut args = args.into_iter().peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -615,6 +625,10 @@ fn main() -> eframe::Result {
                 }
             }
             "--sample" => sample = true,
+            "--live-session" => match args.next_if(|p| !p.starts_with('-')) {
+                Some(p) => live = Some(p.into()),
+                None => bad_live = true,
+            },
             "--version" => {
                 println!("wordcraft {} ({})", env!("CARGO_PKG_VERSION"), build_sha());
                 return Ok(());
@@ -631,6 +645,10 @@ fn main() -> eframe::Result {
     if let Some(port) = bad_control {
         let got = port.map(|p| format!(", got {p:?}")).unwrap_or_default();
         let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("wordcraft: --control needs a port number from 1 to 65535{got}\n"));
+        std::process::exit(2);
+    }
+    if bad_live {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"wordcraft: --live-session needs the session file's path\n");
         std::process::exit(2);
     }
     // The log file lives in the settings directory, next to the preferences; opened after the
@@ -761,10 +779,16 @@ fn main() -> eframe::Result {
             // Nothing to open (no files, no sample, no control channel driving the editor): start
             // on File › Home, as Word does (#766), unless the Start screen option is off. Files
             // macOS hands over later open on top of it and close it (`apple_events`).
-            if files.is_empty() && other_files.is_empty() && !sample && control_port.is_none() {
+            if files.is_empty() && other_files.is_empty() && !sample && control_port.is_none() && live.is_none() {
                 app.start_screen();
             }
-            // A Word template named here starts a new document based on it (#3433).
+            // Live: the first file is the working copy the session starts from; it does not
+            // also open as a document of its own.
+            let (mut files, mut other_files) = (files, other_files);
+            let live = live.and_then(|session| {
+                let copy = live_session::take_working_copy(&mut files, &mut other_files);
+                live_session::LiveSession::start(&mut app, &session, copy.as_deref())
+            });
             for f in files {
                 if let Err(e) = app.open_from_platform(&f, None) {
                     app.report_open_failure(&f, &e);
@@ -780,6 +804,7 @@ fn main() -> eframe::Result {
                 key_file,
                 dialogs,
                 RawWindowState::default(),
+                live,
                 #[cfg(target_os = "macos")]
                 apple_events.connect(&cc.egui_ctx),
             )))
