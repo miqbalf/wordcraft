@@ -50,9 +50,10 @@ craft-live-worker = { git = "https://github.com/miqbalf/collab-craft", rev = "d0
 craft-codepage = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 craft-metafile = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 # Where Share goes (the Nextcloud page, the Nextcloud desktop client's synced folder, or "No
-# Nextcloud connected"): the miqbalf fork's feat/save-as (adds `export`, Save As = Export), the same rev as craft-web-host in
+# Nextcloud connected") and `export` (Save As = Export): the miqbalf fork's main 3e44705e (it holds
+# feat/save-as), the same rev as craft-update here and craft-web-host in
 # apps/wordcraft-web. std and serde only, so it adds no second copy of a storytold crate.
-craft-share = { git = "https://github.com/miqbalf/craft-libs", rev = "f5a8116c2885800051c06ebb8d466331fa210583", version = "0.1.0" }
+craft-share = { git = "https://github.com/miqbalf/craft-libs", rev = "3e44705e862d2b26bb74dd4d44e492c89fc4bffe", version = "0.1.0" }
 
 # foundation
 kurbo = { version = "0.13", features = ["serde"] }
@@ -87,9 +88,11 @@ craft-image-codecs = { git = "https://github.com/storytold/craft-libs", rev = "9
 craft-tiff = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 craft-pdf = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0", default-features = false, features = ["write"] }
 # craft-update: app-specific pretend versions apply to startup and manual checks.
-# udinCraft: craft-update comes from the miqbalf fork (main, adbb69f0), whose `fork` rules
-# install this fork's unsigned builds from its udincraft-v* releases; the others stay as they were.
-craft-update = { git = "https://github.com/miqbalf/craft-libs", version = "=0.1.0", rev = "adbb69f094e001aa53dbf78e8c0036b9c291d013", features = ["egui"] }
+# udinCraft: craft-update comes from the miqbalf fork (main, 3e44705e), whose `fork` rules
+# install this fork's unsigned builds from its udincraft-v* releases. The storytold 93dac78c pins
+# stay: 93dac78c's line reached that main only as a merge parent whose upstream files were not
+# taken, so moving them is a library rebase, not a pin bump.
+craft-update = { git = "https://github.com/miqbalf/craft-libs", version = "=0.1.0", rev = "3e44705e862d2b26bb74dd4d44e492c89fc4bffe", features = ["egui"] }
 craft-wordmodel = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 craft-docx = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
 craft-mcp-server = { git = "https://github.com/storytold/craft-libs", rev = "93dac78c93a7f1fd66e2022edeb089233b1dc45a", version = "=0.1.0" }
